@@ -41,6 +41,16 @@ typedef enum NvofgQuality {
     NVOFG_QUALITY_HIGH,
 } NvofgQuality;
 
+/* Integration mode. AUTOMATIC (default) fully encapsulates queues, layout
+ * transitions and OFA synchronisation: the app only tells nvofg when the color
+ * frames are ready (via NvofgGenerateInfo.input_*) and waits on the returned
+ * NvofgFrameSync before presenting. EXTERNAL_COMMANDS is reserved for a future
+ * expert mode where an engine drives command buffers / sync itself. */
+typedef enum NvofgMode {
+    NVOFG_MODE_AUTOMATIC = 0,
+    NVOFG_MODE_EXTERNAL_COMMANDS,   /* reserved (not yet implemented)          */
+} NvofgMode;
+
 /* Which synthesis back-end turns flow into pixels (see design: modular interpolator). */
 typedef enum NvofgInterpolator {
     NVOFG_INTERP_WARP = 0,    /* classical occlusion-aware forward/backward warp   */
@@ -90,6 +100,7 @@ typedef struct NvofgCreateInfo {
     uint32_t          width, height;      /* full present resolution               */
     NvofgQuality      quality;
     NvofgInterpolator interpolator;       /* NVOFG_INTERP_WARP for v1              */
+    NvofgMode         mode;               /* NVOFG_MODE_AUTOMATIC for v1           */
     uint32_t          flags;              /* NVOFG_FLAG_*                          */
 } NvofgCreateInfo;
 
@@ -144,16 +155,29 @@ typedef struct NvofgFrameSync {
 } NvofgFrameSync;
 
 typedef struct NvofgGenerateInfo {
-    VkCommandBuffer cmd;             /* app's cmd buffer, in recording state       */
     float           phase;           /* 0..1 position of generated frame (0.5=2x)  */
     float           reproj[16];      /* prevVP_unjittered * inverse(currVP), row-major */
     float           near_plane, far_plane;
     uint32_t        reset;           /* 1 on camera cut/teleport -> duplicate frame */
+
+    /* AUTOMATIC mode: the app signals this timeline value when prev/curr color
+     * (and any aux) are finished rendering; nvofg waits on it before prep.
+     * Pass input_timeline = VK_NULL_HANDLE to skip the wait (already ordered). */
+    VkSemaphore     input_timeline;
+    uint64_t        input_value;
+    VkImageLayout   prev_layout;     /* layout prev color is in when ready         */
+    VkImageLayout   curr_layout;     /* layout curr color is in when ready         */
+
+    /* EXTERNAL_COMMANDS mode only (reserved): app-provided cmd buffer to record
+     * the compute stages into. Ignored in AUTOMATIC mode. */
+    VkCommandBuffer cmd;
 } NvofgGenerateInfo;
 
-/* Records format-prep -> (submit OFA execute) -> refine -> interpolate -> composite.
- * The OFA execute is submitted internally on `queue`; the app waits on *out_sync
- * in its present submit. Zero CPU stall on the hot path. */
+/* Runs prep -> OFA execute -> refine -> interpolate -> composite. In AUTOMATIC
+ * mode nvofg submits the internal command buffers itself (timeline-chained across
+ * the compute and optical-flow queues) and returns, in *out_sync, the timeline
+ * point the app must wait on before presenting the interpolated image. No CPU
+ * stall: the call only records+submits, it does not wait on the GPU. */
 NvofgResult nvofg_record_generate(NvofgContext*, const NvofgGenerateInfo*,
                                   NvofgFrameSync* out_sync);
 

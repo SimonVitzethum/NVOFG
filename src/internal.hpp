@@ -33,6 +33,7 @@ struct NvofgContext {
     uint32_t          width = 0, height = 0;
     NvofgQuality      quality = NVOFG_QUALITY_BALANCED;
     NvofgInterpolator interpolator = NVOFG_INTERP_WARP;
+    NvofgMode         mode = NVOFG_MODE_AUTOMATIC;
     uint32_t          flags = 0;
 
     // --- optical-flow queue (dedicated family) ---

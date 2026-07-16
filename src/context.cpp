@@ -112,6 +112,7 @@ NvofgResult nvofg_create(const NvofgCreateInfo* info, NvofgContext** out) {
     ctx->height         = info->height;
     ctx->quality        = info->quality;
     ctx->interpolator   = info->interpolator;
+    ctx->mode           = info->mode;
     ctx->flags          = info->flags;
     ctx->caps           = caps;
 
