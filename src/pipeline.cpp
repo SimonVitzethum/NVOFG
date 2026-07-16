@@ -154,6 +154,7 @@ NvofgResult ensurePipeline(NvofgContext* ctx) {
     ctx->gridSize = 4;
     ctx->gridW = (W + ctx->gridSize - 1) / ctx->gridSize;
     ctx->gridH = (H + ctx->gridSize - 1) / ctx->gridSize;
+    ctx->bidir = (ctx->flags & NVOFG_FLAG_BIDIRECTIONAL) && ctx->caps.bidirectional;
     const uint32_t fams[2] = {ctx->queueFamily, ctx->ofFamily};
     const uint32_t famCount = (ctx->queueFamily == ctx->ofFamily) ? 1 : 2;
 
@@ -174,10 +175,31 @@ NvofgResult ensurePipeline(NvofgContext* ctx) {
                      VK_OPTICAL_FLOW_USAGE_COST_BIT_NV, fams, famCount) ||
         !createImage(ctx, ctx->refinedFlow, W, H, VK_FORMAT_R16G16_SFLOAT,
                      VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, 0, nullptr, 1) ||
+        !createImage(ctx, ctx->refinedFlowBwd, W, H, VK_FORMAT_R16G16_SFLOAT,
+                     VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, 0, nullptr, 1) ||
         !createImage(ctx, ctx->confidence, W, H, VK_FORMAT_R8_UNORM,
+                     VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, 0, nullptr, 1) ||
+        !createImage(ctx, ctx->occlusion, W, H, VK_FORMAT_R8_UNORM,
                      VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, 0, nullptr, 1)) {
         ctx->setError("failed to allocate scratch images");
         return NVOFG_OUT_OF_MEMORY;
+    }
+
+    // Backward OFA outputs + copy buffers (only when bidirectional is enabled).
+    if (ctx->bidir) {
+        if (!createImage(ctx, ctx->flowBwdImg, ctx->gridW, ctx->gridH, VK_FORMAT_R16G16_SFIXED5_NV,
+                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                         VK_OPTICAL_FLOW_USAGE_OUTPUT_BIT_NV, fams, famCount) ||
+            !createImage(ctx, ctx->costBwdImg, ctx->gridW, ctx->gridH, VK_FORMAT_R8_UINT,
+                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                         VK_OPTICAL_FLOW_USAGE_COST_BIT_NV, fams, famCount) ||
+            !createBuffer(ctx, ctx->flowBwdBuf, (VkDeviceSize)ctx->gridW * ctx->gridH * 4,
+                          VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) ||
+            !createBuffer(ctx, ctx->costBwdBuf, (VkDeviceSize)((ctx->gridW * ctx->gridH + 3) & ~3u),
+                          VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) {
+            ctx->setError("failed to allocate backward-flow resources");
+            return NVOFG_OUT_OF_MEMORY;
+        }
     }
     if (!createBuffer(ctx, ctx->flowBuf, (VkDeviceSize)ctx->gridW * ctx->gridH * 4,
                       VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) ||
@@ -208,6 +230,7 @@ NvofgResult ensurePipeline(NvofgContext* ctx) {
                         : (ctx->quality == NVOFG_QUALITY_PERF)  ? VK_OPTICAL_FLOW_PERFORMANCE_LEVEL_FAST_NV
                                                                 : VK_OPTICAL_FLOW_PERFORMANCE_LEVEL_MEDIUM_NV;
     sci.flags = VK_OPTICAL_FLOW_SESSION_CREATE_ENABLE_COST_BIT_NV;
+    if (ctx->bidir) sci.flags |= VK_OPTICAL_FLOW_SESSION_CREATE_BOTH_DIRECTIONS_BIT_NV;
     if (ctx->of.createSession(ctx->device, &sci, nullptr, &ctx->session) != VK_SUCCESS) {
         ctx->setError("vkCreateOpticalFlowSessionNV failed");
         return NVOFG_INTERNAL;
@@ -220,6 +243,12 @@ NvofgResult ensurePipeline(NvofgContext* ctx) {
                       ctx->flowImg.view, VK_IMAGE_LAYOUT_GENERAL);
     ctx->of.bindImage(ctx->device, ctx->session, VK_OPTICAL_FLOW_SESSION_BINDING_POINT_COST_NV,
                       ctx->costImg.view, VK_IMAGE_LAYOUT_GENERAL);
+    if (ctx->bidir) {
+        ctx->of.bindImage(ctx->device, ctx->session, VK_OPTICAL_FLOW_SESSION_BINDING_POINT_BACKWARD_FLOW_VECTOR_NV,
+                          ctx->flowBwdImg.view, VK_IMAGE_LAYOUT_GENERAL);
+        ctx->of.bindImage(ctx->device, ctx->session, VK_OPTICAL_FLOW_SESSION_BINDING_POINT_BACKWARD_COST_NV,
+                          ctx->costBwdImg.view, VK_IMAGE_LAYOUT_GENERAL);
+    }
 
     // --- sampler ---
     VkSamplerCreateInfo smp{};
@@ -234,8 +263,11 @@ NvofgResult ensurePipeline(NvofgContext* ctx) {
                             bind(1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)};
     std::vector<B> refineB = {bind(0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
                              bind(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
-                             bind(2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE),
-                             bind(3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)};
+                             bind(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
+                             bind(3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE),
+                             bind(4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE),
+                             bind(5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE),
+                             bind(6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)};
     std::vector<B> warpB;
     for (uint32_t i = 0; i <= 3; ++i) warpB.push_back(bind(i, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE));
     for (uint32_t i = 4; i <= 7; ++i) warpB.push_back(bind(i, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE));
@@ -411,7 +443,8 @@ void submitTimeline(VkQueue queue, VkCommandBuffer cmd,
     vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
 }
 
-struct RefinePush { uint32_t width, height, gridW, gridH, gridSize, hasCost; float sigma; };
+struct RefinePush { uint32_t width, height, gridW, gridH, gridSize, flags; float sigma; };
+enum { REFINE_FLAG_COST = 1u, REFINE_FLAG_BIDIR = 2u };
 struct WarpPush   { uint32_t width, height; float phase; uint32_t flags; };
 enum { WARP_FLAG_UI = 1u, WARP_FLAG_REACTIVE = 2u, WARP_FLAG_BIDIR = 4u };
 
@@ -499,10 +532,15 @@ NvofgResult nvofg_record_generate(NvofgContext* ctx, const NvofgGenerateInfo* in
     writeImg(ctx->prepPrevSet, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, ctx->lumaPrev.view, G, VK_NULL_HANDLE);
     writeImg(ctx->prepCurrSet, 0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, ctx->currColor.view, G, VK_NULL_HANDLE);
     writeImg(ctx->prepCurrSet, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, ctx->lumaCurr.view, G, VK_NULL_HANDLE);
+    VkBuffer bwdFlowBuf = ctx->bidir ? ctx->flowBwdBuf.buffer : ctx->flowBuf.buffer;  // placeholder if not bidir
+    VkDeviceSize bwdFlowSz = ctx->bidir ? ctx->flowBwdBuf.size : ctx->flowBuf.size;
     writeBuf(ctx->refineSet, 0, ctx->flowBuf.buffer, ctx->flowBuf.size);
     writeBuf(ctx->refineSet, 1, ctx->costBuf.buffer, ctx->costBuf.size);
-    writeImg(ctx->refineSet, 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, ctx->refinedFlow.view, G, VK_NULL_HANDLE);
-    writeImg(ctx->refineSet, 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, ctx->confidence.view, G, VK_NULL_HANDLE);
+    writeBuf(ctx->refineSet, 2, bwdFlowBuf, bwdFlowSz);
+    writeImg(ctx->refineSet, 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, ctx->refinedFlow.view, G, VK_NULL_HANDLE);
+    writeImg(ctx->refineSet, 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, ctx->refinedFlowBwd.view, G, VK_NULL_HANDLE);
+    writeImg(ctx->refineSet, 5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, ctx->confidence.view, G, VK_NULL_HANDLE);
+    writeImg(ctx->refineSet, 6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, ctx->occlusion.view, G, VK_NULL_HANDLE);
     VkImageView bwdFlowView = ctx->bidir ? ctx->refinedFlowBwd.view : ctx->dummyRG16.view;
     VkImageView occView     = ctx->bidir ? ctx->occlusion.view      : ctx->dummyR8.view;
     VkImageView uiView       = ctx->hasUiMask   ? ctx->uiMask.view   : ctx->dummyR8.view;
@@ -547,6 +585,10 @@ NvofgResult nvofg_record_generate(NvofgContext* ctx, const NvofgGenerateInfo* in
         VkCommandBuffer cmd = beginCmd(ctx, ctx->ofPool);
         imgBarrier(cmd, ctx->flowImg.image, VK_IMAGE_LAYOUT_UNDEFINED, G, 0, VK_ACCESS_MEMORY_WRITE_BIT);
         imgBarrier(cmd, ctx->costImg.image, VK_IMAGE_LAYOUT_UNDEFINED, G, 0, VK_ACCESS_MEMORY_WRITE_BIT);
+        if (ctx->bidir) {
+            imgBarrier(cmd, ctx->flowBwdImg.image, VK_IMAGE_LAYOUT_UNDEFINED, G, 0, VK_ACCESS_MEMORY_WRITE_BIT);
+            imgBarrier(cmd, ctx->costBwdImg.image, VK_IMAGE_LAYOUT_UNDEFINED, G, 0, VK_ACCESS_MEMORY_WRITE_BIT);
+        }
         VkOpticalFlowExecuteInfoNV ei{};
         ei.sType = VK_STRUCTURE_TYPE_OPTICAL_FLOW_EXECUTE_INFO_NV;
         ei.flags = VK_OPTICAL_FLOW_EXECUTE_DISABLE_TEMPORAL_HINTS_BIT_NV;
@@ -563,12 +605,21 @@ NvofgResult nvofg_record_generate(NvofgContext* ctx, const NvofgGenerateInfo* in
         fc.imageExtent = {ctx->gridW, ctx->gridH, 1};
         vkCmdCopyImageToBuffer(cmd, ctx->flowImg.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ctx->flowBuf.buffer, 1, &fc);
         vkCmdCopyImageToBuffer(cmd, ctx->costImg.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ctx->costBuf.buffer, 1, &fc);
+        if (ctx->bidir) {
+            imgBarrier(cmd, ctx->flowBwdImg.image, G, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            imgBarrier(cmd, ctx->costBwdImg.image, G, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            vkCmdCopyImageToBuffer(cmd, ctx->flowBwdImg.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ctx->flowBwdBuf.buffer, 1, &fc);
+            vkCmdCopyImageToBuffer(cmd, ctx->costBwdImg.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ctx->costBwdBuf.buffer, 1, &fc);
+        }
         VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT};
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
 
         imgBarrier(cmd, ctx->refinedFlow.image, VK_IMAGE_LAYOUT_UNDEFINED, G, 0, VK_ACCESS_SHADER_WRITE_BIT);
+        imgBarrier(cmd, ctx->refinedFlowBwd.image, VK_IMAGE_LAYOUT_UNDEFINED, G, 0, VK_ACCESS_SHADER_WRITE_BIT);
         imgBarrier(cmd, ctx->confidence.image, VK_IMAGE_LAYOUT_UNDEFINED, G, 0, VK_ACCESS_SHADER_WRITE_BIT);
-        RefinePush rp{W, H, ctx->gridW, ctx->gridH, ctx->gridSize, 1u,
+        imgBarrier(cmd, ctx->occlusion.image, VK_IMAGE_LAYOUT_UNDEFINED, G, 0, VK_ACCESS_SHADER_WRITE_BIT);
+        uint32_t rflags = REFINE_FLAG_COST | (ctx->bidir ? REFINE_FLAG_BIDIR : 0u);
+        RefinePush rp{W, H, ctx->gridW, ctx->gridH, ctx->gridSize, rflags,
                       (ctx->quality == NVOFG_QUALITY_HIGH) ? 32.f : 48.f};
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->refineStage.pipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->refineStage.pipeLayout, 0, 1, &ctx->refineSet, 0, nullptr);
@@ -578,7 +629,9 @@ NvofgResult nvofg_record_generate(NvofgContext* ctx, const NvofgGenerateInfo* in
         VkMemoryBarrier mb2{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT};
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb2, 0, nullptr, 0, nullptr);
         imgBarrier(cmd, ctx->refinedFlow.image, G, G, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+        imgBarrier(cmd, ctx->refinedFlowBwd.image, G, G, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
         imgBarrier(cmd, ctx->confidence.image, G, G, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+        imgBarrier(cmd, ctx->occlusion.image, G, G, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
         imgBarrier(cmd, ctx->output.image, VK_IMAGE_LAYOUT_UNDEFINED, G, 0, VK_ACCESS_SHADER_WRITE_BIT);
         uint32_t wflags = 0;
         if (ctx->hasUiMask)   wflags |= WARP_FLAG_UI;

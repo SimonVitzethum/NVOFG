@@ -1,40 +1,51 @@
 // Stage 3 — FLOW REFINE.
-// Upsample the coarse OFA flow grid to full resolution (bilinear), decode the
-// S10.5 vectors to pixel space, and derive a continuous confidence from the cost
-// map (ADR 0002 req.#2). Bidirectional/MV/depth fusion attach here in M2.
-//
-// Flow and cost arrive as ByteAddressBuffers (copied from the OFA output images)
-// so no special image views are needed.
+// Upsample the coarse OFA flow grids to full resolution (bilinear), decode the
+// S10.5 vectors, derive a continuous confidence from the cost map (req.#2), and —
+// when bidirectional flow is available — a forward/backward consistency occlusion
+// mask (req.#1). Flow/cost arrive as ByteAddressBuffers copied from the OFA images.
 import common;
 
-[[vk::binding(0, 0)]] ByteAddressBuffer gFlow;   // gridW*gridH packed S10.5 words
-[[vk::binding(1, 0)]] ByteAddressBuffer gCost;   // gridW*gridH bytes (R8_UINT)
+[[vk::binding(0, 0)]] ByteAddressBuffer gFlowFwd;   // gridW*gridH packed S10.5
+[[vk::binding(1, 0)]] ByteAddressBuffer gCost;      // gridW*gridH bytes (R8_UINT)
+[[vk::binding(2, 0)]] ByteAddressBuffer gFlowBwd;   // backward flow (bidir); else placeholder
 [[vk::image_format("rg16f")]]
-[[vk::binding(2, 0)]] RWTexture2D<float2> gRefinedFlow;  // full-res forward flow, px
+[[vk::binding(3, 0)]] RWTexture2D<float2> gRefinedFwd;
+[[vk::image_format("rg16f")]]
+[[vk::binding(4, 0)]] RWTexture2D<float2> gRefinedBwd;
 [[vk::image_format("r8")]]
-[[vk::binding(3, 0)]] RWTexture2D<float>  gConfidence;   // full-res, [0,1]
+[[vk::binding(5, 0)]] RWTexture2D<float>  gConfidence;
+[[vk::image_format("r8")]]
+[[vk::binding(6, 0)]] RWTexture2D<float>  gOcclusion;
 
 struct Push {
-    uint  width, height;
-    uint  gridW, gridH;
-    uint  gridSize;
-    uint  hasCost;
+    uint  width, height, gridW, gridH, gridSize, flags;   // bit0 hasCost, bit1 hasBidir
     float sigma;
 };
 [[vk::push_constant]] Push pc;
 
-float2 flowAtCell(int2 cell) {
-    cell = clamp(cell, int2(0, 0), int2(int(pc.gridW) - 1, int(pc.gridH) - 1));
+static const uint FLAG_COST = 1u, FLAG_BIDIR = 2u;
+
+int2 clampCell(int2 c) { return clamp(c, int2(0, 0), int2(int(pc.gridW) - 1, int(pc.gridH) - 1)); }
+
+float2 flowCell(ByteAddressBuffer buf, int2 cell) {
+    cell = clampCell(cell);
     uint idx = uint(cell.y) * pc.gridW + uint(cell.x);
-    return decodeS10_5(gFlow.Load(idx * 4));
+    return decodeS10_5(buf.Load(idx * 4));
 }
 
-float costAtCell(int2 cell) {
-    if (pc.hasCost == 0) return 0.0;
-    cell = clamp(cell, int2(0, 0), int2(int(pc.gridW) - 1, int(pc.gridH) - 1));
-    uint idx  = uint(cell.y) * pc.gridW + uint(cell.x);
-    uint word = gCost.Load((idx & ~3u));          // aligned 4-byte load
-    return float((word >> ((idx & 3u) * 8u)) & 0xffu);
+// bilinear upsample of a grid flow field at pixel p
+float2 upsample(ByteAddressBuffer buf, int2 p) {
+    float2 g = (float2(p) + 0.5) / float(pc.gridSize) - 0.5;
+    int2 g0 = int2(floor(g)); float2 f = g - float2(g0);
+    float2 a = lerp(flowCell(buf, g0 + int2(0,0)), flowCell(buf, g0 + int2(1,0)), f.x);
+    float2 b = lerp(flowCell(buf, g0 + int2(0,1)), flowCell(buf, g0 + int2(1,1)), f.x);
+    return lerp(a, b, f.y);
+}
+
+// nearest-cell backward flow at an arbitrary pixel position
+float2 flowBwdAt(float2 pos) {
+    int2 cell = int2(round((pos + 0.5) / float(pc.gridSize) - 0.5));
+    return flowCell(gFlowBwd, cell);
 }
 
 [shader("compute")]
@@ -43,22 +54,31 @@ void main(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= pc.width || tid.y >= pc.height) return;
     int2 p = int2(tid.xy);
 
-    // grid-space coordinate of this pixel's center
-    float2 g = (float2(p) + 0.5) / float(pc.gridSize) - 0.5;
-    int2   g0 = int2(floor(g));
-    float2 f  = g - float2(g0);
+    float2 Ffwd = upsample(gFlowFwd, p);
+    gRefinedFwd[p] = Ffwd;
 
-    // bilinear flow upsample
-    float2 f00 = flowAtCell(g0 + int2(0, 0));
-    float2 f10 = flowAtCell(g0 + int2(1, 0));
-    float2 f01 = flowAtCell(g0 + int2(0, 1));
-    float2 f11 = flowAtCell(g0 + int2(1, 1));
-    float2 flow = lerp(lerp(f00, f10, f.x), lerp(f01, f11, f.x), f.y);
-
-    // confidence from nearest cost cell
-    float cost = costAtCell(int2(round(g)));
+    float cost = 0.0;
+    if (pc.flags & FLAG_COST) {
+        int2 c = clampCell(int2(round((float2(p) + 0.5) / float(pc.gridSize) - 0.5)));
+        uint idx = uint(c.y) * pc.gridW + uint(c.x);
+        uint word = gCost.Load(idx & ~3u);
+        cost = float((word >> ((idx & 3u) * 8u)) & 0xffu);
+    }
     float conf = confidenceFromCost(cost, pc.sigma);
 
-    gRefinedFlow[p] = flow;
-    gConfidence[p]  = conf;
+    float occ = 0.0;
+    float2 Fbwd = float2(0.0);
+    if (pc.flags & FLAG_BIDIR) {
+        Fbwd = upsample(gFlowBwd, p);
+        // forward-backward consistency: follow Ffwd, read backward flow there.
+        float2 dst = float2(p) + Ffwd;
+        float2 back = flowBwdAt(dst);
+        float residual = length(Ffwd + back);               // ~0 if consistent
+        float norm = max(length(Ffwd), 1.0);
+        occ = saturate(residual / (0.5 * norm + 2.0));       // relative threshold
+        conf *= (1.0 - 0.5 * occ);                           // occlusion lowers confidence
+    }
+    gRefinedBwd[p] = Fbwd;
+    gConfidence[p] = conf;
+    gOcclusion[p]  = occ;
 }
