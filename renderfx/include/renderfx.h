@@ -297,6 +297,12 @@ RfxResult rfx_record_frame_generation(RfxContext*, const RfxFrameContext* fc,
                                       const RfxFrameSync* input_ready /*nullable*/,
                                       RfxFrameSync* out_sync);
 
+/* Upscaling stage: record the selected upscaler into the app's command buffer (RenderFX
+ * owns no graph). `src` is at render resolution, `dst` at present resolution; both must
+ * be in GENERAL layout. Today the functional backend is Native (bilinear). */
+RfxResult rfx_record_upscaling(RfxContext*, VkCommandBuffer cmd,
+                               const RfxImageDesc* src, const RfxImageDesc* dst);
+
 /* Union of features across the supported backends of the given stage on this context. */
 uint64_t rfx_query_stage_features(RfxContext*, RfxStage);
 

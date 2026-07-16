@@ -23,6 +23,8 @@ RfxResult rfx_create(const RfxCreateInfo* info, RfxContext** out) {
 
 void rfx_destroy(RfxContext* ctx) {
     if (!ctx) return;
+    if (ctx->info.device) vkDeviceWaitIdle(ctx->info.device);
+    renderfx::destroyUpscale(ctx);
     if (ctx->nvofg) nvofg_destroy(ctx->nvofg);
     delete ctx;
 }
