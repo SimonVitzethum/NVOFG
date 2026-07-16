@@ -131,6 +131,34 @@ cost→confidence, light median) → `WarpInterpolator` (two-sided backward warp
 blend + simple hole fill) → output. Bidirectional consistency, depth/MV/reactive/UI paths
 are wired as no-ops/flags now and filled in M2, exactly where this ADR places them.
 
+## M2 as-built (2026-07-16)
+
+Implemented and validation-clean (see `examples/headless_interp.cpp`):
+- **Bidirectional flow** — session `BOTH_DIRECTIONS`; refine computes a forward/
+  backward consistency occlusion mask that lowers confidence at moving edges; warp's
+  curr side follows the backward field (independent estimate).
+- **Confidence** — continuous `exp(-cost/σ)`, used as the blend weight (never a hard
+  threshold).
+- **Motion-vector fusion** — refine adaptively blends `lerp(F_ofa, F_mv, 1-conf)` and
+  boosts confidence on agreement.
+- **Depth** — depth-discontinuity term raises occlusion at silhouettes.
+- **UI mask** (mandatory) and **reactive mask** — applied in warp.
+- **Debug views** — flow / confidence / occlusion / disocclusion via
+  `nvofg_set_debug_view`.
+
+Deliberately deferred (documented so they are additive, not rework):
+- **OFA motion-vector *hint* pre-pass.** `hintSupported=1`, so app MVs could also be
+  fed as a hardware hint (`ENABLE_HINT`) to steer the OFA search — the ADR's "fuse in
+  two places" ideal. M2 implements the refine-side (post) fusion, which is the core of
+  req #3; the hint pre-pass is a future enhancement behind the same `NVOFG_FLAG_USE_MOTION`.
+- **Full reprojection-based disocclusion.** M2 uses a depth-edge heuristic; using
+  `reproj` + prev/curr depth to positively classify disoccluded pixels and pick the
+  visible source side is the next step.
+- **Per-frame descriptor ring.** M2 updates the fixed descriptor sets each call
+  (correct for the single-shot/serialized path); a real per-frame ring lands with M3
+  resize/lifetime work.
+- **Material IDs** (req #5) — registered/plumbed, not yet used for special-casing.
+
 ## Consequences
 - The pluggable boundary keeps the core Vulkan-only and portable while allowing NVIDIA-
   only learned back-ends later (analysis §D).
