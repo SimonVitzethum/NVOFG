@@ -49,6 +49,8 @@ nvofg_add_shader(NVOFG_SHADER_HEADERS SOURCE ${CMAKE_SOURCE_DIR}/src/shaders/deb
                  ENTRY main SYMBOL nvofg_spv_debug)
 nvofg_add_shader(NVOFG_SHADER_HEADERS SOURCE ${CMAKE_SOURCE_DIR}/src/shaders/hint.slang
                  ENTRY main SYMBOL nvofg_spv_hint)
+nvofg_add_shader(NVOFG_SHADER_HEADERS SOURCE ${CMAKE_SOURCE_DIR}/src/shaders/blockmatch.slang
+                 ENTRY main SYMBOL nvofg_spv_blockmatch)
 add_custom_target(nvofg_shaders DEPENDS ${NVOFG_SHADER_HEADERS})
 
 add_library(nvofg

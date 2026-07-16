@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -165,6 +166,7 @@ int main(int argc, char** argv) {
     ci.of_queue=ofQ; ci.of_queue_family_index=ofFamily; ci.gipa=vkGetInstanceProcAddr; ci.width=W; ci.height=H;
     ci.quality=NVOFG_QUALITY_HIGH; ci.interpolator=NVOFG_INTERP_WARP; ci.mode=NVOFG_MODE_AUTOMATIC;
     ci.flags = NVOFG_FLAG_USE_UI_MASK | NVOFG_FLAG_BIDIRECTIONAL | NVOFG_FLAG_USE_MOTION;
+    if (std::getenv("NVOFG_FORCE_SHADER")) { ci.flags |= NVOFG_FLAG_FORCE_SHADER_FLOW; std::printf("[Tier B: portable shader flow]\n"); }
     NvofgContext* ctx=nullptr;
     if (nvofg_create(&ci,&ctx)!=NVOFG_OK){ std::fprintf(stderr,"nvofg_create failed\n"); return 3; }
 

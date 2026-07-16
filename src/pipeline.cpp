@@ -17,6 +17,7 @@
 #include "nvofg_spv_warp.spv.h"
 #include "nvofg_spv_debug.spv.h"
 #include "nvofg_spv_hint.spv.h"
+#include "nvofg_spv_blockmatch.spv.h"
 
 namespace {
 
@@ -146,7 +147,8 @@ struct RefinePush {
     uint32_t width, height, gridW, gridH, gridSize, flags;
     float sigma, nearP, farP;
 };
-enum { REFINE_FLAG_COST = 1u, REFINE_FLAG_BIDIR = 2u, REFINE_FLAG_MOTION = 4u, REFINE_FLAG_DEPTH = 8u };
+enum { REFINE_FLAG_COST = 1u, REFINE_FLAG_BIDIR = 2u, REFINE_FLAG_MOTION = 4u, REFINE_FLAG_DEPTH = 8u,
+       REFINE_FLAG_COST_U32 = 16u };
 
 void writeImg(VkDevice dev, VkDescriptorSet set, uint32_t b, VkDescriptorType t,
               VkImageView view, VkSampler samp) {
@@ -181,26 +183,25 @@ NvofgResult ensurePipeline(NvofgContext* ctx) {
     ctx->gridSize = 4;
     ctx->gridW = (W + ctx->gridSize - 1) / ctx->gridSize;
     ctx->gridH = (H + ctx->gridSize - 1) / ctx->gridSize;
-    ctx->bidir = (ctx->flags & NVOFG_FLAG_BIDIRECTIONAL) && ctx->caps.bidirectional;
-    ctx->useHint = (ctx->flags & NVOFG_FLAG_USE_MOTION) && ctx->hasMotion && ctx->caps.hint_support;
+    // Bidirectional flow and the MV hint are OFA features -> Tier A only.
+    ctx->bidir = !ctx->shaderFlow && (ctx->flags & NVOFG_FLAG_BIDIRECTIONAL) && ctx->caps.bidirectional;
+    ctx->useHint = !ctx->shaderFlow && (ctx->flags & NVOFG_FLAG_USE_MOTION)
+                   && ctx->hasMotion && ctx->caps.hint_support;
     const uint32_t fams[2] = {ctx->queueFamily, ctx->ofFamily};
     const uint32_t famCount = (ctx->queueFamily == ctx->ofFamily) ? 1 : 2;
 
     // --- scratch resources ---
     const VkImageUsageFlags kLumaUsage =
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    // Tier B has no OFA, so the luma images carry no optical-flow usage (that would
+    // require the extension, which a non-NVIDIA GPU won't have).
+    const VkOpticalFlowUsageFlagsNV lumaOfUsage =
+        ctx->shaderFlow ? 0 : VK_OPTICAL_FLOW_USAGE_INPUT_BIT_NV;
+    const uint32_t lumaFamCount = ctx->shaderFlow ? 1 : famCount;
     if (!createImage(ctx, ctx->lumaPrev, W, H, VK_FORMAT_R8_UNORM, kLumaUsage,
-                     VK_OPTICAL_FLOW_USAGE_INPUT_BIT_NV, fams, famCount) ||
+                     lumaOfUsage, fams, lumaFamCount) ||
         !createImage(ctx, ctx->lumaCurr, W, H, VK_FORMAT_R8_UNORM, kLumaUsage,
-                     VK_OPTICAL_FLOW_USAGE_INPUT_BIT_NV, fams, famCount) ||
-        // SAMPLED_BIT is required so a VkImageView can be created for OFA binding
-        // (a view needs a view-compatible usage bit; TRANSFER_SRC alone is not).
-        !createImage(ctx, ctx->flowImg, ctx->gridW, ctx->gridH, VK_FORMAT_R16G16_SFIXED5_NV,
-                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                     VK_OPTICAL_FLOW_USAGE_OUTPUT_BIT_NV, fams, famCount) ||
-        !createImage(ctx, ctx->costImg, ctx->gridW, ctx->gridH, VK_FORMAT_R8_UINT,
-                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                     VK_OPTICAL_FLOW_USAGE_COST_BIT_NV, fams, famCount) ||
+                     lumaOfUsage, fams, lumaFamCount) ||
         !createImage(ctx, ctx->refinedFlow, W, H, VK_FORMAT_R16G16_SFLOAT,
                      VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, 0, nullptr, 1) ||
         !createImage(ctx, ctx->refinedFlowBwd, W, H, VK_FORMAT_R16G16_SFLOAT,
@@ -211,6 +212,21 @@ NvofgResult ensurePipeline(NvofgContext* ctx) {
                      VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, 0, nullptr, 1)) {
         ctx->setError("failed to allocate scratch images");
         return NVOFG_OUT_OF_MEMORY;
+    }
+
+    // OFA output images (Tier A only). Tier B's block-match writes flow/cost straight
+    // into the buffers, so these are skipped.
+    // (SAMPLED_BIT lets a view be created for OFA binding; TRANSFER_SRC alone can't.)
+    if (!ctx->shaderFlow) {
+        if (!createImage(ctx, ctx->flowImg, ctx->gridW, ctx->gridH, VK_FORMAT_R16G16_SFIXED5_NV,
+                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                         VK_OPTICAL_FLOW_USAGE_OUTPUT_BIT_NV, fams, famCount) ||
+            !createImage(ctx, ctx->costImg, ctx->gridW, ctx->gridH, VK_FORMAT_R8_UINT,
+                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                         VK_OPTICAL_FLOW_USAGE_COST_BIT_NV, fams, famCount)) {
+            ctx->setError("failed to allocate OFA output images");
+            return NVOFG_OUT_OF_MEMORY;
+        }
     }
 
     // Backward OFA outputs + copy buffers (only when bidirectional is enabled).
@@ -229,9 +245,10 @@ NvofgResult ensurePipeline(NvofgContext* ctx) {
             return NVOFG_OUT_OF_MEMORY;
         }
     }
+    // cost buffer is one uint/cell (holds both the OFA byte-packed copy and Tier B's uint writes)
     if (!createBuffer(ctx, ctx->flowBuf, (VkDeviceSize)ctx->gridW * ctx->gridH * 4,
                       VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) ||
-        !createBuffer(ctx, ctx->costBuf, (VkDeviceSize)((ctx->gridW * ctx->gridH + 3) & ~3u),
+        !createBuffer(ctx, ctx->costBuf, (VkDeviceSize)ctx->gridW * ctx->gridH * 4,
                       VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) {
         ctx->setError("failed to allocate flow/cost buffers");
         return NVOFG_OUT_OF_MEMORY;
@@ -257,7 +274,8 @@ NvofgResult ensurePipeline(NvofgContext* ctx) {
         return NVOFG_OUT_OF_MEMORY;
     }
 
-    // --- OFA session ---
+    // --- OFA session (Tier A only) ---
+    if (!ctx->shaderFlow) {
     VkOpticalFlowSessionCreateInfoNV sci{};
     sci.sType = VK_STRUCTURE_TYPE_OPTICAL_FLOW_SESSION_CREATE_INFO_NV;
     sci.width = W; sci.height = H;
@@ -295,6 +313,7 @@ NvofgResult ensurePipeline(NvofgContext* ctx) {
         ctx->of.bindImage(ctx->device, ctx->session, VK_OPTICAL_FLOW_SESSION_BINDING_POINT_HINT_NV,
                           ctx->hintImg.view, VK_IMAGE_LAYOUT_GENERAL);
     }
+    }  // !shaderFlow (OFA session)
 
     // --- sampler ---
     VkSamplerCreateInfo smp{};
@@ -340,16 +359,26 @@ NvofgResult ensurePipeline(NvofgContext* ctx) {
             return NVOFG_INTERNAL;
         }
     }
+    if (ctx->shaderFlow) {
+        std::vector<B> bmB = {bind(0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE),
+                              bind(1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE),
+                              bind(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
+                              bind(3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)};
+        if (!createStage(ctx, ctx->blockmatchStage, nvofg_spv_blockmatch, nvofg_spv_blockmatch_size, bmB, 28)) {
+            ctx->setError("failed to create block-match pipeline");
+            return NVOFG_INTERNAL;
+        }
+    }
 
     // --- descriptor pool + sets ---
     VkDescriptorPoolSize sizes[] = {
         {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 20},
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 10},
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6},
         {VK_DESCRIPTOR_TYPE_SAMPLER, 2}};
     VkDescriptorPoolCreateInfo dpci{};
     dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    dpci.maxSets = 6;
+    dpci.maxSets = 7;
     dpci.poolSizeCount = 4;
     dpci.pPoolSizes = sizes;
     if (vkCreateDescriptorPool(ctx->device, &dpci, nullptr, &ctx->descPool) != VK_SUCCESS)
@@ -370,6 +399,7 @@ NvofgResult ensurePipeline(NvofgContext* ctx) {
         !alloc(ctx->debugStage.setLayout, ctx->debugSet))
         return NVOFG_INTERNAL;
     if (ctx->useHint && !alloc(ctx->hintStage.setLayout, ctx->hintSet)) return NVOFG_INTERNAL;
+    if (ctx->shaderFlow && !alloc(ctx->blockmatchStage.setLayout, ctx->blockmatchSet)) return NVOFG_INTERNAL;
 
     // --- per-frame command pools (ring) ---
     VkCommandPoolCreateInfo cpci{};
@@ -462,6 +492,12 @@ void refreshDescriptors(NvofgContext* ctx) {
         writeImg(d, ctx->hintSet, 0, SI, ctx->motion.view, VK_NULL_HANDLE);
         writeBuf(d, ctx->hintSet, 1, ctx->hintBuf.buffer, ctx->hintBuf.size);
     }
+    if (ctx->shaderFlow) {
+        writeImg(d, ctx->blockmatchSet, 0, SI, ctx->lumaPrev.view, VK_NULL_HANDLE);
+        writeImg(d, ctx->blockmatchSet, 1, SI, ctx->lumaCurr.view, VK_NULL_HANDLE);
+        writeBuf(d, ctx->blockmatchSet, 2, ctx->flowBuf.buffer, ctx->flowBuf.size);
+        writeBuf(d, ctx->blockmatchSet, 3, ctx->costBuf.buffer, ctx->costBuf.size);
+    }
     if (ctx->haveDebugTarget) {
         writeImg(d, ctx->debugSet, 0, SI, ctx->refinedFlow.view, VK_NULL_HANDLE);
         writeImg(d, ctx->debugSet, 1, SI, ctx->refinedFlowBwd.view, VK_NULL_HANDLE);
@@ -482,7 +518,8 @@ void destroyPipeline(NvofgContext* ctx) {
     }
     ctx->frameIndex = 0;
     if (ctx->descPool) vkDestroyDescriptorPool(d, ctx->descPool, nullptr);
-    for (Stage* s : {&ctx->prepStage, &ctx->refineStage, &ctx->warpStage, &ctx->debugStage, &ctx->hintStage}) {
+    for (Stage* s : {&ctx->prepStage, &ctx->refineStage, &ctx->warpStage, &ctx->debugStage,
+                     &ctx->hintStage, &ctx->blockmatchStage}) {
         if (s->pipeline) vkDestroyPipeline(d, s->pipeline, nullptr);
         if (s->pipeLayout) vkDestroyPipelineLayout(d, s->pipeLayout, nullptr);
         if (s->setLayout) vkDestroyDescriptorSetLayout(d, s->setLayout, nullptr);
@@ -667,6 +704,80 @@ NvofgResult nvofg_record_generate(NvofgContext* ctx, const NvofgGenerateInfo* in
 
     const uint64_t base = ctx->timelineValue;
     const uint64_t v1 = base + 1, v2 = base + 2, v3 = base + 3;
+
+    // === Tier B (portable shader flow): one compute submit, no OFA queue ===
+    if (ctx->shaderFlow) {
+        VkCommandBuffer cmd = beginCmd(ctx, ctx->computePools[slot]);
+        imgBarrier(cmd, ctx->prevColor.image, info->prev_layout, G, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+        imgBarrier(cmd, ctx->currColor.image, info->curr_layout, G, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+        imgBarrier(cmd, ctx->lumaPrev.image, VK_IMAGE_LAYOUT_UNDEFINED, G, 0, VK_ACCESS_SHADER_WRITE_BIT);
+        imgBarrier(cmd, ctx->lumaCurr.image, VK_IMAGE_LAYOUT_UNDEFINED, G, 0, VK_ACCESS_SHADER_WRITE_BIT);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->prepStage.pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->prepStage.pipeLayout, 0, 1, &ctx->prepPrevSet, 0, nullptr);
+        vkCmdDispatch(cmd, gx, gy, 1);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->prepStage.pipeLayout, 0, 1, &ctx->prepCurrSet, 0, nullptr);
+        vkCmdDispatch(cmd, gx, gy, 1);
+        // luma writes -> block-match reads (sampled)
+        imgBarrier(cmd, ctx->lumaPrev.image, G, G, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+        imgBarrier(cmd, ctx->lumaCurr.image, G, G, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+        // block-match flow -> flowBuf/costBuf
+        struct BmPush { uint32_t width, height, gridW, gridH, gridSize, searchR, blockR; }
+            bp{W, H, ctx->gridW, ctx->gridH, ctx->gridSize, 12u, 3u};
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->blockmatchStage.pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->blockmatchStage.pipeLayout, 0, 1, &ctx->blockmatchSet, 0, nullptr);
+        vkCmdPushConstants(cmd, ctx->blockmatchStage.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bp), &bp);
+        vkCmdDispatch(cmd, (ctx->gridW + 7) / 8, (ctx->gridH + 7) / 8, 1);
+        VkMemoryBarrier mbb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT};
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mbb, 0, nullptr, 0, nullptr);
+
+        // refine (forward-only; cost is uint/cell)
+        imgBarrier(cmd, ctx->refinedFlow.image, VK_IMAGE_LAYOUT_UNDEFINED, G, 0, VK_ACCESS_SHADER_WRITE_BIT);
+        imgBarrier(cmd, ctx->refinedFlowBwd.image, VK_IMAGE_LAYOUT_UNDEFINED, G, 0, VK_ACCESS_SHADER_WRITE_BIT);
+        imgBarrier(cmd, ctx->confidence.image, VK_IMAGE_LAYOUT_UNDEFINED, G, 0, VK_ACCESS_SHADER_WRITE_BIT);
+        imgBarrier(cmd, ctx->occlusion.image, VK_IMAGE_LAYOUT_UNDEFINED, G, 0, VK_ACCESS_SHADER_WRITE_BIT);
+        RefinePush rp{};
+        std::memcpy(rp.reproj, info->reproj, sizeof(rp.reproj));
+        rp.width = W; rp.height = H; rp.gridW = ctx->gridW; rp.gridH = ctx->gridH; rp.gridSize = ctx->gridSize;
+        rp.flags = REFINE_FLAG_COST | REFINE_FLAG_COST_U32
+                 | (ctx->hasMotion ? REFINE_FLAG_MOTION : 0u) | (ctx->hasDepth ? REFINE_FLAG_DEPTH : 0u);
+        rp.sigma = (ctx->quality == NVOFG_QUALITY_HIGH) ? 32.f : 48.f;
+        rp.nearP = info->near_plane; rp.farP = info->far_plane;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->refineStage.pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->refineStage.pipeLayout, 0, 1, &ctx->refineSet, 0, nullptr);
+        vkCmdPushConstants(cmd, ctx->refineStage.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rp), &rp);
+        vkCmdDispatch(cmd, gx, gy, 1);
+        VkMemoryBarrier mb2{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT};
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb2, 0, nullptr, 0, nullptr);
+        imgBarrier(cmd, ctx->refinedFlow.image, G, G, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+        imgBarrier(cmd, ctx->confidence.image, G, G, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+        // warp -> output
+        imgBarrier(cmd, ctx->output.image, VK_IMAGE_LAYOUT_UNDEFINED, G, 0, VK_ACCESS_SHADER_WRITE_BIT);
+        uint32_t wflags = (ctx->hasUiMask ? WARP_FLAG_UI : 0u) | (ctx->hasReactive ? WARP_FLAG_REACTIVE : 0u)
+                        | (ctx->hasMaterialId ? WARP_FLAG_MATERIAL : 0u);   // no bidir in Tier B
+        WarpPush wp{W, H, info->phase, wflags};
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->warpStage.pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->warpStage.pipeLayout, 0, 1, &ctx->warpSet, 0, nullptr);
+        vkCmdPushConstants(cmd, ctx->warpStage.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(wp), &wp);
+        vkCmdDispatch(cmd, gx, gy, 1);
+
+        if (ctx->debugView != NVOFG_DEBUG_NONE && ctx->haveDebugTarget) {
+            imgBarrier(cmd, ctx->debugTarget.image, VK_IMAGE_LAYOUT_UNDEFINED, G, 0, VK_ACCESS_SHADER_WRITE_BIT);
+            struct DbgPush { uint32_t width, height, mode; } dp{W, H, (uint32_t)ctx->debugView};
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->debugStage.pipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->debugStage.pipeLayout, 0, 1, &ctx->debugSet, 0, nullptr);
+            vkCmdPushConstants(cmd, ctx->debugStage.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(dp), &dp);
+            vkCmdDispatch(cmd, gx, gy, 1);
+        }
+        submitTimeline(ctx->queue, cmd, info->input_timeline, info->input_value, ctx->timeline, v1);
+        ctx->slotSignal[slot] = v1;
+        ctx->frameIndex++;
+        ctx->timelineValue = v1;
+        out_sync->semaphore = ctx->timeline;
+        out_sync->value = v1;
+        return NVOFG_OK;
+    }
 
     // === Submit 1 (compute): prep luma from prev/curr color ===
     {

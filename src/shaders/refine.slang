@@ -26,7 +26,8 @@ struct Push {
 };
 [[vk::push_constant]] Push pc;
 
-static const uint FLAG_COST = 1u, FLAG_BIDIR = 2u, FLAG_MOTION = 4u, FLAG_DEPTH = 8u;
+static const uint FLAG_COST = 1u, FLAG_BIDIR = 2u, FLAG_MOTION = 4u, FLAG_DEPTH = 8u,
+                  FLAG_COST_U32 = 16u;   // cost buffer is one uint per cell (Tier B), not byte-packed
 
 int2 clampCell(int2 c) { return clamp(c, int2(0, 0), int2(int(pc.gridW) - 1, int(pc.gridH) - 1)); }
 
@@ -63,8 +64,12 @@ void main(uint3 tid : SV_DispatchThreadID) {
     if (pc.flags & FLAG_COST) {
         int2 c = clampCell(int2(round((float2(p) + 0.5) / float(pc.gridSize) - 0.5)));
         uint idx = uint(c.y) * pc.gridW + uint(c.x);
-        uint word = gCost.Load(idx & ~3u);
-        cost = float((word >> ((idx & 3u) * 8u)) & 0xffu);
+        if (pc.flags & FLAG_COST_U32) {
+            cost = float(gCost.Load(idx * 4) & 0xffu);       // one uint per cell (Tier B)
+        } else {
+            uint word = gCost.Load(idx & ~3u);               // byte-packed (OFA)
+            cost = float((word >> ((idx & 3u) * 8u)) & 0xffu);
+        }
     }
     float conf = confidenceFromCost(cost, pc.sigma);
 

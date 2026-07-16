@@ -67,6 +67,8 @@ enum {
     NVOFG_FLAG_USE_UI_MASK    = 1u << 4, /* UI mask registered & applied           */
     NVOFG_FLAG_USE_REACTIVE   = 1u << 5, /* reactive mask registered & used        */
     NVOFG_FLAG_USE_MATERIAL_ID= 1u << 6, /* material/object id map registered      */
+    NVOFG_FLAG_FORCE_SHADER_FLOW=1u << 7,/* Tier B: use portable shader optical flow,
+                                            not the OFA (works on any Vulkan GPU)   */
 };
 
 /* -------------------------------------------------------------------------- */

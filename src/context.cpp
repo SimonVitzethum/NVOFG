@@ -113,8 +113,12 @@ NvofgResult nvofg_create(const NvofgCreateInfo* info, NvofgContext** out) {
         return NVOFG_INVALID_ARGUMENT;
     *out = nullptr;
 
+    const bool forceShader = (info->flags & NVOFG_FLAG_FORCE_SHADER_FLOW) != 0;
     NvofgCaps caps{};
-    if (!queryCaps(info->gipa, info->instance, info->physical_device, &caps))
+    bool ofa = queryCaps(info->gipa, info->instance, info->physical_device, &caps);
+    // Tier B (portable shader flow) works on any Vulkan GPU, so create can succeed
+    // without an OFA when forced. Otherwise a missing OFA is UNSUPPORTED (run 1x).
+    if (!ofa && !forceShader)
         return NVOFG_UNSUPPORTED;
 
     auto* ctx = new (std::nothrow) NvofgContext();
@@ -133,6 +137,7 @@ NvofgResult nvofg_create(const NvofgCreateInfo* info, NvofgContext** out) {
     ctx->mode           = info->mode;
     ctx->flags          = info->flags;
     ctx->caps           = caps;
+    ctx->shaderFlow     = forceShader || !ofa;
     ctx->ofFamily       = info->of_queue_family_index;
     ctx->ofQueue        = info->of_queue;
 
@@ -141,29 +146,31 @@ NvofgResult nvofg_create(const NvofgCreateInfo* info, NvofgContext** out) {
         info->gipa, info->instance, "vkGetDeviceProcAddr");
     if (!gdpa) { delete ctx; return NVOFG_INTERNAL; }
     auto L = [&](const char* n) { return gdpa(info->device, n); };
-    // The image-formats query is a physical-device function -> load at instance level.
-    ctx->of.getImageFormats = (PFN_vkGetPhysicalDeviceOpticalFlowImageFormatsNV)
-        info->gipa(info->instance, "vkGetPhysicalDeviceOpticalFlowImageFormatsNV");
-    ctx->of.createSession  = (PFN_vkCreateOpticalFlowSessionNV)  L("vkCreateOpticalFlowSessionNV");
-    ctx->of.destroySession = (PFN_vkDestroyOpticalFlowSessionNV) L("vkDestroyOpticalFlowSessionNV");
-    ctx->of.bindImage      = (PFN_vkBindOpticalFlowSessionImageNV)L("vkBindOpticalFlowSessionImageNV");
-    ctx->of.cmdExecute     = (PFN_vkCmdOpticalFlowExecuteNV)     L("vkCmdOpticalFlowExecuteNV");
-    if (!ctx->of.complete()) {
-        ctx->setError("failed to resolve VK_NV_optical_flow entrypoints");
-        delete ctx;
-        return NVOFG_INTERNAL;
-    }
-
-    // Resolve the optical-flow queue if the app did not pass one explicitly.
-    if (ctx->ofQueue == VK_NULL_HANDLE) {
-        auto getQueue = (PFN_vkGetDeviceQueue) L("vkGetDeviceQueue");
-        if (getQueue) getQueue(info->device, ctx->ofFamily, 0, &ctx->ofQueue);
-    }
-    if (ctx->ofQueue == VK_NULL_HANDLE) {
-        ctx->setError("no optical-flow queue: pass of_queue or create one from "
-                      "nvofg_optical_flow_queue_family()");
-        delete ctx;
-        return NVOFG_INVALID_ARGUMENT;
+    // OFA entrypoints + queue are only needed for Tier A (hardware optical flow).
+    if (!ctx->shaderFlow) {
+        // The image-formats query is a physical-device function -> load at instance level.
+        ctx->of.getImageFormats = (PFN_vkGetPhysicalDeviceOpticalFlowImageFormatsNV)
+            info->gipa(info->instance, "vkGetPhysicalDeviceOpticalFlowImageFormatsNV");
+        ctx->of.createSession  = (PFN_vkCreateOpticalFlowSessionNV)  L("vkCreateOpticalFlowSessionNV");
+        ctx->of.destroySession = (PFN_vkDestroyOpticalFlowSessionNV) L("vkDestroyOpticalFlowSessionNV");
+        ctx->of.bindImage      = (PFN_vkBindOpticalFlowSessionImageNV)L("vkBindOpticalFlowSessionImageNV");
+        ctx->of.cmdExecute     = (PFN_vkCmdOpticalFlowExecuteNV)     L("vkCmdOpticalFlowExecuteNV");
+        if (!ctx->of.complete()) {
+            ctx->setError("failed to resolve VK_NV_optical_flow entrypoints");
+            delete ctx;
+            return NVOFG_INTERNAL;
+        }
+        // Resolve the optical-flow queue if the app did not pass one explicitly.
+        if (ctx->ofQueue == VK_NULL_HANDLE) {
+            auto getQueue = (PFN_vkGetDeviceQueue) L("vkGetDeviceQueue");
+            if (getQueue) getQueue(info->device, ctx->ofFamily, 0, &ctx->ofQueue);
+        }
+        if (ctx->ofQueue == VK_NULL_HANDLE) {
+            ctx->setError("no optical-flow queue: pass of_queue or create one from "
+                          "nvofg_optical_flow_queue_family()");
+            delete ctx;
+            return NVOFG_INVALID_ARGUMENT;
+        }
     }
 
     // Cross-stage timeline semaphore.

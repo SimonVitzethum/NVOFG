@@ -82,6 +82,11 @@ struct NvofgContext {
     // --- flow grid config ---
     uint32_t gridSize = 4, gridW = 0, gridH = 0;
 
+    // --- Tier B: portable shader optical flow instead of the OFA ---
+    bool shaderFlow = false;
+    nvofg::Stage    blockmatchStage;
+    VkDescriptorSet blockmatchSet = VK_NULL_HANDLE;
+
     // --- OFA session + scratch resources (built lazily once registered) ---
     VkOpticalFlowSessionNV session = VK_NULL_HANDLE;
     nvofg::Image  lumaPrev, lumaCurr;    // R8 OFA input/reference (prep writes)
