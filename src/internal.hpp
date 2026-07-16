@@ -95,7 +95,7 @@ struct NvofgContext {
 
     // --- optional aux (registered; consumed per flags) ---
     nvofg::RegImage depth, motion, uiMask, reactive, materialId;
-    bool hasDepth = false, hasMotion = false, hasUiMask = false, hasReactive = false;
+    bool hasDepth = false, hasMotion = false, hasUiMask = false, hasReactive = false, hasMaterialId = false;
 
     // --- fallback 1x1 images bound where an aux input is absent ---
     nvofg::Image dummyR8, dummyRG16;

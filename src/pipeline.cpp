@@ -321,6 +321,7 @@ NvofgResult ensurePipeline(NvofgContext* ctx) {
     for (uint32_t i = 4; i <= 7; ++i) warpB.push_back(bind(i, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE));
     warpB.push_back(bind(8, VK_DESCRIPTOR_TYPE_SAMPLER));
     warpB.push_back(bind(9, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE));
+    warpB.push_back(bind(10, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE));
     std::vector<B> debugB;
     for (uint32_t i = 0; i <= 3; ++i) debugB.push_back(bind(i, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE));
     debugB.push_back(bind(4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE));
@@ -455,6 +456,7 @@ void refreshDescriptors(NvofgContext* ctx) {
       w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER; w.pImageInfo = &ii;
       vkUpdateDescriptorSets(d, 1, &w, 0, nullptr); }
     writeImg(d, ctx->warpSet, 9, ST, ctx->output.view, VK_NULL_HANDLE);
+    writeImg(d, ctx->warpSet, 10, SI, ctx->hasMaterialId ? ctx->materialId.view : ctx->dummyR8.view, VK_NULL_HANDLE);
 
     if (ctx->useHint) {
         writeImg(d, ctx->hintSet, 0, SI, ctx->motion.view, VK_NULL_HANDLE);
@@ -571,7 +573,7 @@ void submitTimeline(VkQueue queue, VkCommandBuffer cmd,
 }
 
 struct WarpPush   { uint32_t width, height; float phase; uint32_t flags; };
-enum { WARP_FLAG_UI = 1u, WARP_FLAG_REACTIVE = 2u, WARP_FLAG_BIDIR = 4u };
+enum { WARP_FLAG_UI = 1u, WARP_FLAG_REACTIVE = 2u, WARP_FLAG_BIDIR = 4u, WARP_FLAG_MATERIAL = 8u };
 
 }  // namespace
 
@@ -595,12 +597,11 @@ NvofgResult nvofg_register_aux(NvofgContext* ctx, const NvofgAuxDesc* aux) {
         if (d) { r = {d->image, d->view, d->format, d->width, d->height}; has = true; }
         else   { has = false; }
     };
-    bool dummy = false;
     store(aux->depth,       ctx->depth,      ctx->hasDepth);
     store(aux->motion,      ctx->motion,     ctx->hasMotion);
     store(aux->ui_mask,     ctx->uiMask,     ctx->hasUiMask);
     store(aux->reactive,    ctx->reactive,   ctx->hasReactive);
-    store(aux->material_id, ctx->materialId, dummy);  // material id: plumbed, unused in M2
+    store(aux->material_id, ctx->materialId, ctx->hasMaterialId);
     return NVOFG_OK;
 }
 
@@ -751,9 +752,10 @@ NvofgResult nvofg_record_generate(NvofgContext* ctx, const NvofgGenerateInfo* in
         imgBarrier(cmd, ctx->occlusion.image, G, G, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
         imgBarrier(cmd, ctx->output.image, VK_IMAGE_LAYOUT_UNDEFINED, G, 0, VK_ACCESS_SHADER_WRITE_BIT);
         uint32_t wflags = 0;
-        if (ctx->hasUiMask)   wflags |= WARP_FLAG_UI;
-        if (ctx->hasReactive) wflags |= WARP_FLAG_REACTIVE;
-        if (ctx->bidir)       wflags |= WARP_FLAG_BIDIR;
+        if (ctx->hasUiMask)     wflags |= WARP_FLAG_UI;
+        if (ctx->hasReactive)   wflags |= WARP_FLAG_REACTIVE;
+        if (ctx->bidir)         wflags |= WARP_FLAG_BIDIR;
+        if (ctx->hasMaterialId) wflags |= WARP_FLAG_MATERIAL;
         WarpPush wp{W, H, info->phase, wflags};
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->warpStage.pipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->warpStage.pipeLayout, 0, 1, &ctx->warpSet, 0, nullptr);
