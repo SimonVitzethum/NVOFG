@@ -37,15 +37,16 @@ including the [CUDA-vs-Vulkan analysis](docs/analysis/cuda-vs-vulkan.md) and the
 
 ## Status
 
-Early development. Milestones (see `design.md` §10):
+Milestones (see `design.md` §10), all validation-clean on the reference machine:
 
-- **M0** — prove the native OFA path: create a `VK_NV_optical_flow` session, run one
-  execute, dump the flow field. *(in progress)*
-- **M1** — 2× core: prep → execute → refine → warp → blend.
-- **M2** — aux quality: depth + motion-vector fusion, bidirectional flow, disocclusion.
-- **M3** — API polish: C ABI + Rust crate, `query_support`, resize.
+- **M0** ✅ — native OFA path proven: `VK_NV_optical_flow` session, real execute, flow dump.
+- **M1** ✅ — 2× core: prep → execute → refine → warp → blend through the C ABI.
+- **M2** ✅ — aux quality: bidirectional flow + occlusion, motion-vector fusion (post +
+  OFA hint), depth/reprojection disocclusion, UI + reactive + material masks, debug views.
+- **M3** ✅ — API polish: `nvofg-sys` + safe `nvofg` Rust crate, `query_support`,
+  `resize`, per-frame command ring.
 - **M4** — integrate in RustMineClient.
-- **M5** — optional present pacer + portable shader-flow fallback.
+- **M5** — optional present pacer + portable shader-flow fallback (Tier B).
 
 ## Requirements
 

@@ -52,6 +52,47 @@ AUTOMATIC mode. The app only signals *colors ready* and waits on the returned ti
 point before presenting the interpolated frame. See `examples/headless_interp.cpp` for a
 complete, self-contained driver.
 
+## Resize
+
+On swapchain recreation, call `nvofg_resize(ctx, w, h)` (or `FrameGen::resize`). It waits
+for GPU idle, tears down the size-dependent resources, and clears all registrations —
+then re-register color/aux/output with the new images before the next generate.
+
+## Rust
+
+```rust
+use ash::vk;
+use nvofg::*;
+
+let of_family = optical_flow_queue_family(instance, pd, gipa).expect("no OFA");
+// ... create the device with VK_NV_optical_flow, opticalFlow + timelineSemaphore +
+// shaderStorageImageWriteWithoutFormat features, and a queue from `of_family` ...
+
+let ci = CreateInfo {
+    instance, physical_device: pd, device, queue, queue_family_index,
+    of_queue, of_queue_family_index: of_family,
+    get_instance_proc_addr: gipa,
+    extent: vk::Extent2D { width, height },
+    quality: Quality::High, interpolator: Interpolator::Warp, mode: Mode::Automatic,
+    flags: flags::BIDIRECTIONAL | flags::USE_MOTION | flags::USE_UI_MASK,
+};
+let Some(mut fg) = FrameGen::new(&ci)? else { /* run at 1x */ return Ok(()); };
+fg.register_color(&prev, &curr)?;
+fg.register_aux(&Aux { ui_mask: Some(ui), motion: Some(mv), ..Default::default() })?;
+fg.register_output(&out)?;
+
+let sync = fg.record_generate(&GenerateInfo {
+    phase: 0.5,
+    input: Some(FrameSync { semaphore: colors_ready, value: colors_ready_val }),
+    ..Default::default()
+})?;
+// present `out` waiting on (sync.semaphore, sync.value), then present curr.
+```
+
+Build the C++ library first (`cmake -S . -B build && cmake --build build`); the crates
+link it via `NVOFG_LIB_DIR` (default `<repo>/build`). See
+`crates/nvofg/examples/support.rs`.
+
 ## Frame pacing
 Cap base fps to `displayHz / multiplier` and keep VSync off (or use the optional pacer,
 §7). Added latency ≈ one base frame; there is no Reflex on native Linux.
