@@ -156,6 +156,12 @@ NvofgResult nvofg_register_aux   (NvofgContext*, const NvofgAuxDesc* aux);
 NvofgResult nvofg_register_output(NvofgContext*, const NvofgImageDesc* interpolated);
 void        nvofg_unregister_all (NvofgContext*);
 
+// Resize to a new present resolution (e.g. swapchain recreation). Waits for GPU
+// idle, tears down the size-dependent resources, and clears all registrations;
+// the app must re-register color/aux/output with the new images before the next
+// nvofg_record_generate. Safe to call anytime after nvofg_create.
+NvofgResult nvofg_resize(NvofgContext*, uint32_t width, uint32_t height);
+
 /* -------------------------------------------------------------------------- */
 /* Per-frame recording (hot path)                                             */
 /* -------------------------------------------------------------------------- */

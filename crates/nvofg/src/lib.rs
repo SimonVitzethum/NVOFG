@@ -289,6 +289,14 @@ impl FrameGen {
         unsafe { sys::nvofg_unregister_all(self.ctx) }
     }
 
+    /// Resize to a new present resolution (swapchain recreation). Clears all
+    /// registrations — re-register color/aux/output with the new images before the
+    /// next [`record_generate`](Self::record_generate).
+    pub fn resize(&mut self, extent: vk::Extent2D) -> Result<(), Error> {
+        // SAFETY: `ctx` valid.
+        check(unsafe { sys::nvofg_resize(self.ctx, extent.width, extent.height) })
+    }
+
     /// Record + submit one generated frame. Returns the timeline point to wait on
     /// before presenting the interpolated image. Does not block the CPU.
     pub fn record_generate(&mut self, gen: &GenerateInfo) -> Result<FrameSync, Error> {

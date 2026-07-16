@@ -192,6 +192,7 @@ extern "C" {
         interpolated: *const NvofgImageDesc,
     ) -> NvofgResult;
     pub fn nvofg_unregister_all(ctx: *mut NvofgContext);
+    pub fn nvofg_resize(ctx: *mut NvofgContext, width: u32, height: u32) -> NvofgResult;
 
     pub fn nvofg_record_generate(
         ctx: *mut NvofgContext,

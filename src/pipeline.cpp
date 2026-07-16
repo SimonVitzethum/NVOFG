@@ -617,6 +617,21 @@ void nvofg_unregister_all(NvofgContext* ctx) {
     if (!ctx) return;
     if (ctx->pipelineReady) { vkDeviceWaitIdle(ctx->device); nvofg::destroyPipeline(ctx); }
     ctx->haveColor = ctx->haveOutput = false;
+    ctx->hasDepth = ctx->hasMotion = ctx->hasUiMask = ctx->hasReactive = ctx->hasMaterialId = false;
+    ctx->haveDebugTarget = false;
+    ctx->debugView = NVOFG_DEBUG_NONE;
+}
+
+NvofgResult nvofg_resize(NvofgContext* ctx, uint32_t width, uint32_t height) {
+    if (!ctx || !width || !height) return NVOFG_INVALID_ARGUMENT;
+    if (width > ctx->caps.max_width || height > ctx->caps.max_height) {
+        ctx->setError("nvofg_resize: resolution exceeds OFA maximum");
+        return NVOFG_INVALID_ARGUMENT;
+    }
+    nvofg_unregister_all(ctx);       // waits idle + tears down + clears registrations
+    ctx->width = width;
+    ctx->height = height;
+    return NVOFG_OK;                 // pipeline rebuilds on next record after re-registration
 }
 
 // ---------------------------------------------------------------------------

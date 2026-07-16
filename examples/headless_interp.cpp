@@ -193,6 +193,16 @@ int main(int argc, char** argv) {
         VKCHECK(vkWaitSemaphores(dev,&wi,UINT64_MAX));
     }
 
+    // Resize round-trip: tear down + rebuild the pipeline, re-register, regenerate.
+    // (Same extent here for a compact test; a different extent takes the same path.)
+    if (nvofg_resize(ctx, W, H) != NVOFG_OK) { std::fprintf(stderr,"resize failed: %s\n", nvofg_last_error(ctx)); return 3; }
+    if (nvofg_register_color(ctx,&pd0,&cd0)!=NVOFG_OK || nvofg_register_output(ctx,&od0)!=NVOFG_OK
+        || nvofg_register_aux(ctx,&aux)!=NVOFG_OK){ std::fprintf(stderr,"re-register failed\n"); return 3; }
+    nvofg_set_debug_view(ctx, NVOFG_DEBUG_FLOW_FWD, &dbg0);
+    if (nvofg_record_generate(ctx,&gi,&sync)!=NVOFG_OK){ std::fprintf(stderr,"post-resize generate failed: %s\n", nvofg_last_error(ctx)); return 3; }
+    { VkSemaphoreWaitInfo wi{}; wi.sType=VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO; wi.semaphoreCount=1; wi.pSemaphores=&sync.semaphore; wi.pValues=&sync.value; VKCHECK(vkWaitSemaphores(dev,&wi,UINT64_MAX)); }
+    std::printf("resize round-trip: OK\n");
+
     // --- read output back ---
     VkBuffer rb; VkDeviceMemory rbm; VkDeviceSize bytes=(VkDeviceSize)W*H*4;
     { VkBufferCreateInfo bc{}; bc.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO; bc.size=bytes; bc.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT; bc.sharingMode=VK_SHARING_MODE_EXCLUSIVE; vkCreateBuffer(dev,&bc,nullptr,&rb);
