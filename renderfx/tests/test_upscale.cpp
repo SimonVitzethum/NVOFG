@@ -83,11 +83,16 @@ int main() {
     for (int f=0; f<4; ++f) oneShot([&](VkCommandBuffer c){ rfx_record_upscaling(ctx,c,&fc,&dd,f==0?1u:0u); });
     bool tempOk = verify("temporal");
 
+    // FSR (EASU-style edge-adaptive spatial upscaler): 1 frame; smooth monotonic ramp.
+    commit(RFX_BACKEND_FSR);
+    oneShot([&](VkCommandBuffer c){ rfx_record_upscaling(ctx,c,&fc,&dd,1); });
+    bool fsrOk = verify("fsr");
+
     vkDestroyBuffer(dev,rb,nullptr); vkFreeMemory(dev,rbm,nullptr);
     rfx_destroy(ctx);
     for(Img* im:{&src,&dst}){ vkDestroyImageView(dev,im->view,nullptr); vkDestroyImage(dev,im->image,nullptr); vkFreeMemory(dev,im->mem,nullptr); }
     vkDestroyCommandPool(dev,pool,nullptr); vkDestroyDevice(dev,nullptr); vkDestroyInstance(inst,nullptr);
-    bool ok = nativeOk && tempOk;
-    std::printf("RESULT: %s\n", ok?"PASS (native + temporal upscaling verified)":"FAIL");
+    bool ok = nativeOk && tempOk && fsrOk;
+    std::printf("RESULT: %s\n", ok?"PASS (native + temporal + fsr upscaling verified)":"FAIL");
     return ok?0:4;
 }

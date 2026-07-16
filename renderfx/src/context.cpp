@@ -44,7 +44,7 @@ RfxResult rfx_query_capabilities(RfxContext* ctx, RfxCapabilities* outCaps) {
     // Portable shader FG works on any Vulkan GPU. NGX SR/DLAA/RR reflect the probe done
     // at rfx_create; FSR is our own portable EASU/RCAS shader (any Vulkan GPU).
     renderfx::buildCapabilities(ofa, /*shader*/ true, outCaps, ctx->ngxSr, ctx->ngxRr,
-                                /*fsr*/ false, /*xess*/ false);
+                                /*fsr*/ true, /*xess*/ false);
     ctx->caps = *outCaps;
     return RFX_OK;
 }

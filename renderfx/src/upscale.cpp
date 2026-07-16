@@ -8,6 +8,7 @@
 
 #include "rfx_spv_upscale_native.spv.h"
 #include "rfx_spv_upscale_temporal.spv.h"
+#include "rfx_spv_upscale_fsr.spv.h"
 
 namespace {
 
@@ -200,6 +201,53 @@ RfxResult recordTemporal(RfxContext* ctx, VkCommandBuffer cmd, const RfxFrameCon
     return RFX_OK;
 }
 
+// ---- FSR (EASU-style edge-adaptive spatial upscaler) ----------------------
+bool ensureFsr(RfxContext* ctx) {
+    if (ctx->fsrReady) return true;
+    VkDevice d = ctx->info.device;
+    ctx->fsrSm = makeModule(d, rfx_spv_upscale_fsr, rfx_spv_upscale_fsr_size);
+    if (!ctx->fsrSm) return false;
+    VkDescriptorSetLayoutBinding b[2] = {
+        {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},   // src (Load)
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};  // dst
+    VkDescriptorSetLayoutCreateInfo dl{}; dl.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dl.bindingCount = 2; dl.pBindings = b;
+    vkCreateDescriptorSetLayout(d, &dl, nullptr, &ctx->fsrSetLayout);
+    VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
+    VkPipelineLayoutCreateInfo pl{}; pl.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pl.setLayoutCount = 1; pl.pSetLayouts = &ctx->fsrSetLayout; pl.pushConstantRangeCount = 1; pl.pPushConstantRanges = &pcr;
+    vkCreatePipelineLayout(d, &pl, nullptr, &ctx->fsrPipeLayout);
+    VkComputePipelineCreateInfo cp{}; cp.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    cp.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; cp.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cp.stage.module = ctx->fsrSm; cp.stage.pName = "main"; cp.layout = ctx->fsrPipeLayout;
+    if (vkCreateComputePipelines(d, VK_NULL_HANDLE, 1, &cp, nullptr, &ctx->fsrPipeline) != VK_SUCCESS) return false;
+    VkDescriptorPoolSize sz[2] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1}};
+    VkDescriptorPoolCreateInfo dp{}; dp.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO; dp.maxSets = 1; dp.poolSizeCount = 2; dp.pPoolSizes = sz;
+    vkCreateDescriptorPool(d, &dp, nullptr, &ctx->fsrPool);
+    VkDescriptorSetAllocateInfo ai{}; ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO; ai.descriptorPool = ctx->fsrPool; ai.descriptorSetCount = 1; ai.pSetLayouts = &ctx->fsrSetLayout;
+    vkAllocateDescriptorSets(d, &ai, &ctx->fsrSet);
+    ctx->fsrReady = true;
+    return true;
+}
+
+RfxResult recordFsr(RfxContext* ctx, VkCommandBuffer cmd, const RfxImageDesc* src, const RfxImageDesc* dst) {
+    if (!ensureFsr(ctx)) return RFX_INTERNAL;
+    const VkImageLayout G = VK_IMAGE_LAYOUT_GENERAL;
+    VkDescriptorImageInfo si{VK_NULL_HANDLE, src->view, G}, di{VK_NULL_HANDLE, dst->view, G};
+    VkWriteDescriptorSet w[2]{};
+    for (int i = 0; i < 2; ++i) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = ctx->fsrSet; w[i].dstBinding = i; w[i].descriptorCount = 1; }
+    w[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; w[0].pImageInfo = &si;
+    w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[1].pImageInfo = &di;
+    vkUpdateDescriptorSets(ctx->info.device, 2, w, 0, nullptr);
+    memBarrier(cmd);
+    struct Push { uint32_t sw, sh, dw, dh; } push{src->width, src->height, dst->width, dst->height};
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->fsrPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->fsrPipeLayout, 0, 1, &ctx->fsrSet, 0, nullptr);
+    vkCmdPushConstants(cmd, ctx->fsrPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    vkCmdDispatch(cmd, (dst->width + 7) / 8, (dst->height + 7) / 8, 1);
+    return RFX_OK;
+}
+
 }  // namespace
 
 namespace renderfx {
@@ -221,8 +269,13 @@ void destroyUpscale(RfxContext* ctx) {
         if (im->image) vkDestroyImage(d, im->image, nullptr);
         if (im->mem) vkFreeMemory(d, im->mem, nullptr);
     }
+    if (ctx->fsrPipeline) vkDestroyPipeline(d, ctx->fsrPipeline, nullptr);
+    if (ctx->fsrPipeLayout) vkDestroyPipelineLayout(d, ctx->fsrPipeLayout, nullptr);
+    if (ctx->fsrSetLayout) vkDestroyDescriptorSetLayout(d, ctx->fsrSetLayout, nullptr);
+    if (ctx->fsrPool) vkDestroyDescriptorPool(d, ctx->fsrPool, nullptr);
+    if (ctx->fsrSm) vkDestroyShaderModule(d, ctx->fsrSm, nullptr);
     if (ctx->upSampler) vkDestroySampler(d, ctx->upSampler, nullptr);
-    ctx->upReady = ctx->tReady = false;
+    ctx->upReady = ctx->tReady = ctx->fsrReady = false;
 }
 }  // namespace renderfx
 
@@ -234,8 +287,9 @@ extern "C" RfxResult rfx_record_upscaling(RfxContext* ctx, VkCommandBuffer cmd,
         case RFX_BACKEND_TEMPORAL: return recordTemporal(ctx, cmd, fc, dst, reset);
         case RFX_BACKEND_DLAA:     return renderfx::ngxRecordDLAA(ctx, cmd, fc, dst, reset);
         case RFX_BACKEND_DLSS_SR:  return renderfx::ngxRecordDLAA(ctx, cmd, fc, dst, reset);
+        case RFX_BACKEND_FSR:      return recordFsr(ctx, cmd, &fc->color, dst);
         case RFX_BACKEND_NONE:
         case RFX_BACKEND_NATIVE:   return recordNative(ctx, cmd, &fc->color, dst);
-        default:                   return RFX_UNSUPPORTED;  // FSR/XeSS reserved
+        default:                   return RFX_UNSUPPORTED;  // XeSS reserved
     }
 }

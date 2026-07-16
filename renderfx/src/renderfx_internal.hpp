@@ -77,6 +77,15 @@ struct RfxContext {
     uint32_t              frameParity = 0;
     bool                  historyValid = false;
 
+    // FSR (EASU-style) spatial upscaler: src(sampled, via Load) + dst(storage), 16B push.
+    VkShaderModule        fsrSm = VK_NULL_HANDLE;
+    VkDescriptorSetLayout fsrSetLayout = VK_NULL_HANDLE;
+    VkPipelineLayout      fsrPipeLayout = VK_NULL_HANDLE;
+    VkPipeline            fsrPipeline = VK_NULL_HANDLE;
+    VkDescriptorPool      fsrPool = VK_NULL_HANDLE;
+    VkDescriptorSet       fsrSet = VK_NULL_HANDLE;
+    bool                  fsrReady = false;
+
     // RR/GBuffer debug visualisation pipeline (built lazily).
     VkShaderModule        dbgSm = VK_NULL_HANDLE;
     VkDescriptorSetLayout dbgSetLayout = VK_NULL_HANDLE;

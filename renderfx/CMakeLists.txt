@@ -11,6 +11,8 @@ nvofg_add_shader(RENDERFX_SHADERS SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders
                  ENTRY main SYMBOL rfx_spv_upscale_native)
 nvofg_add_shader(RENDERFX_SHADERS SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/upscale_temporal.slang
                  ENTRY main SYMBOL rfx_spv_upscale_temporal)
+nvofg_add_shader(RENDERFX_SHADERS SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/upscale_fsr.slang
+                 ENTRY main SYMBOL rfx_spv_upscale_fsr)
 nvofg_add_shader(RENDERFX_SHADERS SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/rr_debug.slang
                  ENTRY main SYMBOL rfx_spv_rr_debug)
 add_custom_target(renderfx_shaders DEPENDS ${RENDERFX_SHADERS})
