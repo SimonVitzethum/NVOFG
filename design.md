@@ -412,3 +412,110 @@ nvofg/
   (why OFA is the one feasible native route) and `docs/15-lsfg-vk-framegen-plan.md`
   (the layer-based alternative this replaces for NVIDIA users).
 ```
+
+---
+
+## 13. Long-term vision — "RenderFX" and the case for a focused core
+
+> **Status:** vision / design-guardrail, **not** a committed roadmap item. This section
+> evaluates a proposal to grow nvofg into a modular Vulkan rendering-effects framework
+> ("RenderFX") with a shared Core (resource/sync/descriptor management + common inputs:
+> motion vectors, depth, jitter, camera matrices, exposure, resolution, color) and
+> optional plugin modules (Frame Generation, Upscaling, Anti-Aliasing, Ray
+> Reconstruction) over vendor backends (NVIDIA/AMD/Intel/Generic), behind one API. Per
+> the request, **no current API or implementation is changed by this section** — it only
+> records the analysis and the guardrails that keep such an evolution *possible* without
+> breaking today's users.
+
+### 13.1 The proposal, stated fairly
+Almost every modern temporal technique consumes the same inputs (MVs, depth, jitter,
+matrices, exposure, color, resolution). The proposal is to manage those **once** in a
+vendor-neutral Core and expose each technique as an optional module sharing that Core, so
+an engine tags its resources one time and toggles DLSS/DLAA/RR/FG/XeSS/FSR as plugins.
+The Core must not force any proprietary dependency (NGX/FidelityFX/XeSS); vendor tech
+lives only in optional backends.
+
+### 13.2 This is validated prior art — and that cuts both ways
+The design is essentially what **NVIDIA Streamline** (`sl.*`: tag resources once, enable
+DLSS/DLSS-G/Reflex as plugins) and the **AMD FidelityFX SDK** (a common backend +
+effect modules) already do. So the shape is proven and the input-sharing win is real.
+But it also means the idea's hard parts are *already solved by shipping SDKs on Windows*,
+and that the differentiated, unfilled gap is specifically a **native-Linux, vendor-neutral**
+version — which is a far larger mission than "frame generation on the OFA."
+
+### 13.3 Critical assessment
+
+**Would it improve reusability?** Yes, for the *input contract*. A small, stable,
+vendor-neutral description of MV/depth/jitter/matrices/exposure/color/resolution is
+genuinely reusable across FG, upscaling, and AA, and removes duplicate plumbing for
+integrators. This part of the vision is sound and worth designing toward now.
+
+**Would it improve maintainability? Mixed — and mostly *worse* if done as one library.**
+- A shared Core only helps if the effects truly share it. They diverge more than the
+  pitch suggests: FG needs *two* finished frames + the OFA + a middle-frame present
+  cadence; upscaling needs *one* frame + jitter *history* + a fixed output scale; AA/TAA
+  needs history but not FG's occlusion machinery; RR is denoiser-shaped. A Core general
+  enough to serve all becomes a leaky abstraction that is *harder* to maintain than
+  focused libraries — the classic framework-vs-library tradeoff.
+- Scope explosion is the real risk. nvofg's entire value today is being the **only**
+  native, no-Wine, no-paid-DLL, hardware-accelerated Linux FG. Turning it into a
+  rendering-effects framework dilutes that focus and could mean never shipping an
+  *excellent* FG because effort went into a framework.
+
+**Would the module menu even exist natively?** Largely no, and this is decisive. On
+native Linux the "good" upscalers/RR are as gated as DLSS-G: DLSS/DLAA/RR are NGX
+(the quality models are Windows PEs), XeSS's best path is Intel-GPU/oneAPI, and only
+**FSR** is truly open and cross-vendor. So a Linux-native RenderFX would realistically
+offer *FSR + its own OFA frame-gen + generic shader fallbacks* — a fraction of the
+advertised DLSS/DLAA/RR menu. The unified-API ergonomics would be real; the module set
+would be modest. Honest scoping matters here (same caveat as §1's non-goals).
+
+**API-stability risk.** Designing the grand `enable_dlss/enable_rr/execute` surface now,
+before each effect's real needs are understood, is premature abstraction. The *inputs*
+subset is well understood and safe to stabilize; the *per-effect orchestration* surface
+is not, and freezing it early would create exactly the API breakage the request wants to
+avoid.
+
+**Naming.** `nvofg` literally means *NVIDIA Optical Flow*. A vendor-neutral umbrella
+wants a neutral identity. That nvofg is honestly NVIDIA-OFA-specific is a feature, and it
+argues for the umbrella being a *different* thing that composes nvofg, not nvofg renamed.
+
+### 13.4 Recommendation — compose, don't absorb
+
+**Keep nvofg a focused, best-in-class native-Linux frame-generation library.** Do **not**
+grow it into RenderFX. Instead, if the umbrella is pursued, build it as a **separate
+composition layer** (a "Streamline for native Linux") that *depends on* nvofg as its FG
+module and on FSR/XeSS/etc. as sibling modules. This is the Unix-tools model — small
+sharp libraries plus a thin composition layer — and it is objectively better here than a
+monolith-core-absorbs-everything because it: preserves nvofg's focus and shippability;
+lets each module keep the divergent internals it actually needs; avoids a premature
+over-general Core; and sidesteps the naming/scope tension. It also matches the boundary
+this project already drew (ADR 0002's pluggable interpolator; the CUDA-vs-Vulkan
+analysis's rule that vendor tech lives *behind* a boundary, never in the core).
+
+**What that means we do — and don't — do now (guardrails, zero API change):**
+- **Do** keep the public input structs (`NvofgImageDesc`, `NvofgAuxDesc`, `reproj`,
+  near/far, resolution, quality) clean, minimal, and free of FG-internal coupling, so a
+  future shared "core-inputs" contract can adopt the *same* description without a break.
+  Treat these as the seed of a reusable input vocabulary.
+- **Do** keep the Core dependency-free of any vendor SDK beyond the already-isolated OFA
+  backend (ADR 0001), so nvofg could later be *one backend module* under an umbrella
+  without carrying proprietary weight into that umbrella's core.
+- **Do** keep the modular-interpolator seam (ADR 0002 §8) — it is the template for how an
+  umbrella would host effect modules.
+- **Don't** introduce an `enable_*/execute` mega-API, a shared descriptor/resource
+  manager spanning hypothetical effects, or any speculative Core abstraction now. Those
+  are the parts most likely to be wrong before real second/third modules exist, and they
+  are exactly what the request says must not destabilize current users.
+- **When a real second module appears** (most plausibly an FSR-style upscaler or a Tier-B
+  shader optical-flow, §8), *that* is the moment to extract the shared input/sync/
+  descriptor utilities into a genuine `core` crate — refactored from two working modules,
+  not designed in the abstract. Two concrete users is the right trigger; one is not.
+
+### 13.5 Bottom line
+The vision is directionally right about *input sharing* and *plugin modularity*, and
+wrong about *where it should live*. Ship nvofg as a focused FG library; keep its inputs
+and boundaries clean enough to be reused; and let a **separate** native-Linux composition
+project (if it ever materializes) adopt nvofg as its FG backend. That maximizes both the
+near-term value (a great FG that actually ships) and the long-term option value (a clean
+seam to build the umbrella later) with **no** risk to current users.
