@@ -101,4 +101,7 @@ if(NVOFG_ENABLE_CUDA)
   message(STATUS "nvofg: CUDA Tensor-Core backend enabled (arch ${CMAKE_CUDA_ARCHITECTURES})")
 endif()
 
+# RenderFX — separate modular framework that composes nvofg (design.md §13-18).
+add_subdirectory(renderfx)
+
 # Rust crates live under crates/ (nvofg-sys links this library via build.rs).
