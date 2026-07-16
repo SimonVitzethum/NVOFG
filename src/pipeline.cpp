@@ -187,6 +187,14 @@ NvofgResult ensurePipeline(NvofgContext* ctx) {
         return NVOFG_OUT_OF_MEMORY;
     }
 
+    // 1x1 fallback images bound where an aux/bidir input is absent.
+    const VkImageUsageFlags kDummy = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (!createImage(ctx, ctx->dummyR8, 1, 1, VK_FORMAT_R8_UNORM, kDummy, 0, nullptr, 1) ||
+        !createImage(ctx, ctx->dummyRG16, 1, 1, VK_FORMAT_R16G16_SFLOAT, kDummy, 0, nullptr, 1)) {
+        ctx->setError("failed to allocate dummy images");
+        return NVOFG_OUT_OF_MEMORY;
+    }
+
     // --- OFA session ---
     VkOpticalFlowSessionCreateInfoNV sci{};
     sci.sType = VK_STRUCTURE_TYPE_OPTICAL_FLOW_SESSION_CREATE_INFO_NV;
@@ -228,12 +236,11 @@ NvofgResult ensurePipeline(NvofgContext* ctx) {
                              bind(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
                              bind(2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE),
                              bind(3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)};
-    std::vector<B> warpB = {bind(0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE),
-                            bind(1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE),
-                            bind(2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE),
-                            bind(3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE),
-                            bind(4, VK_DESCRIPTOR_TYPE_SAMPLER),
-                            bind(5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)};
+    std::vector<B> warpB;
+    for (uint32_t i = 0; i <= 3; ++i) warpB.push_back(bind(i, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE));
+    for (uint32_t i = 4; i <= 7; ++i) warpB.push_back(bind(i, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE));
+    warpB.push_back(bind(8, VK_DESCRIPTOR_TYPE_SAMPLER));
+    warpB.push_back(bind(9, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE));
     if (!createStage(ctx, ctx->prepStage, nvofg_spv_prep, nvofg_spv_prep_size, prepB, 0) ||
         !createStage(ctx, ctx->refineStage, nvofg_spv_refine, nvofg_spv_refine_size, refineB, 28) ||
         !createStage(ctx, ctx->warpStage, nvofg_spv_warp, nvofg_spv_warp_size, warpB, 16)) {
@@ -243,9 +250,9 @@ NvofgResult ensurePipeline(NvofgContext* ctx) {
 
     // --- descriptor pool + sets ---
     VkDescriptorPoolSize sizes[] = {
-        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 8},
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 6},
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2},
+        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 16},
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4},
         {VK_DESCRIPTOR_TYPE_SAMPLER, 2}};
     VkDescriptorPoolCreateInfo dpci{};
     dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -278,6 +285,32 @@ NvofgResult ensurePipeline(NvofgContext* ctx) {
     cpci.queueFamilyIndex = ctx->ofFamily;
     vkCreateCommandPool(ctx->device, &cpci, nullptr, &ctx->ofPool);
 
+    // Clear the 1x1 dummies to 0 so bound-but-unused reads return defined values.
+    {
+        VkCommandBufferAllocateInfo ai{};
+        ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        ai.commandPool = ctx->computePool; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = 1;
+        VkCommandBuffer c; vkAllocateCommandBuffers(ctx->device, &ai, &c);
+        VkCommandBufferBeginInfo bi{}; bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT; vkBeginCommandBuffer(c, &bi);
+        VkClearColorValue zero{}; VkImageSubresourceRange rng{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        for (nvofg::Image* im : {&ctx->dummyR8, &ctx->dummyRG16}) {
+            VkImageMemoryBarrier b{}; b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; b.image = im->image;
+            b.subresourceRange = rng; b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+            vkCmdClearColorImage(c, im->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &rng);
+            b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+        }
+        vkEndCommandBuffer(c);
+        VkSubmitInfo si{}; si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO; si.commandBufferCount = 1; si.pCommandBuffers = &c;
+        vkQueueSubmit(ctx->queue, 1, &si, VK_NULL_HANDLE); vkQueueWaitIdle(ctx->queue);
+        vkFreeCommandBuffers(ctx->device, ctx->computePool, 1, &c);
+    }
+
     ctx->pipelineReady = true;
     return NVOFG_OK;
 }
@@ -300,8 +333,14 @@ void destroyPipeline(NvofgContext* ctx) {
         if (b->buffer) vkDestroyBuffer(d, b->buffer, nullptr);
         if (b->memory) vkFreeMemory(d, b->memory, nullptr);
     }
+    for (Buffer* b : {&ctx->flowBwdBuf, &ctx->costBwdBuf}) {
+        if (b->buffer) vkDestroyBuffer(d, b->buffer, nullptr);
+        if (b->memory) vkFreeMemory(d, b->memory, nullptr);
+    }
     for (Image* im : {&ctx->lumaPrev, &ctx->lumaCurr, &ctx->flowImg, &ctx->costImg,
-                      &ctx->refinedFlow, &ctx->confidence}) {
+                      &ctx->refinedFlow, &ctx->confidence, &ctx->dummyR8, &ctx->dummyRG16,
+                      &ctx->flowBwdImg, &ctx->costBwdImg, &ctx->refinedFlowBwd, &ctx->occlusion,
+                      &ctx->hintImg}) {
         if (im->view) vkDestroyImageView(d, im->view, nullptr);
         if (im->image) vkDestroyImage(d, im->image, nullptr);
         if (im->memory) vkFreeMemory(d, im->memory, nullptr);
@@ -373,7 +412,8 @@ void submitTimeline(VkQueue queue, VkCommandBuffer cmd,
 }
 
 struct RefinePush { uint32_t width, height, gridW, gridH, gridSize, hasCost; float sigma; };
-struct WarpPush   { uint32_t width, height; float phase; uint32_t uiMasked; };
+struct WarpPush   { uint32_t width, height; float phase; uint32_t flags; };
+enum { WARP_FLAG_UI = 1u, WARP_FLAG_REACTIVE = 2u, WARP_FLAG_BIDIR = 4u };
 
 }  // namespace
 
@@ -393,7 +433,16 @@ NvofgResult nvofg_register_color(NvofgContext* ctx, const NvofgImageDesc* prev,
 
 NvofgResult nvofg_register_aux(NvofgContext* ctx, const NvofgAuxDesc* aux) {
     if (!ctx || !aux) return NVOFG_INVALID_ARGUMENT;
-    // Aux (depth/motion/ui/reactive/material) is consumed in M2; accepted now.
+    auto store = [](const NvofgImageDesc* d, nvofg::RegImage& r, bool& has) {
+        if (d) { r = {d->image, d->view, d->format, d->width, d->height}; has = true; }
+        else   { has = false; }
+    };
+    bool dummy = false;
+    store(aux->depth,       ctx->depth,      ctx->hasDepth);
+    store(aux->motion,      ctx->motion,     ctx->hasMotion);
+    store(aux->ui_mask,     ctx->uiMask,     ctx->hasUiMask);
+    store(aux->reactive,    ctx->reactive,   ctx->hasReactive);
+    store(aux->material_id, ctx->materialId, dummy);  // material id: plumbed, unused in M2
     return NVOFG_OK;
 }
 
@@ -454,16 +503,24 @@ NvofgResult nvofg_record_generate(NvofgContext* ctx, const NvofgGenerateInfo* in
     writeBuf(ctx->refineSet, 1, ctx->costBuf.buffer, ctx->costBuf.size);
     writeImg(ctx->refineSet, 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, ctx->refinedFlow.view, G, VK_NULL_HANDLE);
     writeImg(ctx->refineSet, 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, ctx->confidence.view, G, VK_NULL_HANDLE);
+    VkImageView bwdFlowView = ctx->bidir ? ctx->refinedFlowBwd.view : ctx->dummyRG16.view;
+    VkImageView occView     = ctx->bidir ? ctx->occlusion.view      : ctx->dummyR8.view;
+    VkImageView uiView       = ctx->hasUiMask   ? ctx->uiMask.view   : ctx->dummyR8.view;
+    VkImageView reactiveView = ctx->hasReactive ? ctx->reactive.view : ctx->dummyR8.view;
     writeImg(ctx->warpSet, 0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, ctx->prevColor.view, G, VK_NULL_HANDLE);
     writeImg(ctx->warpSet, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, ctx->currColor.view, G, VK_NULL_HANDLE);
     writeImg(ctx->warpSet, 2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, ctx->refinedFlow.view, G, VK_NULL_HANDLE);
-    writeImg(ctx->warpSet, 3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, ctx->confidence.view, G, VK_NULL_HANDLE);
+    writeImg(ctx->warpSet, 3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, bwdFlowView, G, VK_NULL_HANDLE);
+    writeImg(ctx->warpSet, 4, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, ctx->confidence.view, G, VK_NULL_HANDLE);
+    writeImg(ctx->warpSet, 5, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, occView, G, VK_NULL_HANDLE);
+    writeImg(ctx->warpSet, 6, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, uiView, G, VK_NULL_HANDLE);
+    writeImg(ctx->warpSet, 7, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, reactiveView, G, VK_NULL_HANDLE);
     { VkDescriptorImageInfo ii{ctx->linearSampler, VK_NULL_HANDLE, G};
       VkWriteDescriptorSet w{}; w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-      w.dstSet = ctx->warpSet; w.dstBinding = 4; w.descriptorCount = 1;
+      w.dstSet = ctx->warpSet; w.dstBinding = 8; w.descriptorCount = 1;
       w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER; w.pImageInfo = &ii;
       vkUpdateDescriptorSets(ctx->device, 1, &w, 0, nullptr); }
-    writeImg(ctx->warpSet, 5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, ctx->output.view, G, VK_NULL_HANDLE);
+    writeImg(ctx->warpSet, 9, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, ctx->output.view, G, VK_NULL_HANDLE);
 
     const uint64_t base = ctx->timelineValue;
     const uint64_t v1 = base + 1, v2 = base + 2, v3 = base + 3;
@@ -523,7 +580,11 @@ NvofgResult nvofg_record_generate(NvofgContext* ctx, const NvofgGenerateInfo* in
         imgBarrier(cmd, ctx->refinedFlow.image, G, G, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
         imgBarrier(cmd, ctx->confidence.image, G, G, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
         imgBarrier(cmd, ctx->output.image, VK_IMAGE_LAYOUT_UNDEFINED, G, 0, VK_ACCESS_SHADER_WRITE_BIT);
-        WarpPush wp{W, H, info->phase, 0u};
+        uint32_t wflags = 0;
+        if (ctx->hasUiMask)   wflags |= WARP_FLAG_UI;
+        if (ctx->hasReactive) wflags |= WARP_FLAG_REACTIVE;
+        if (ctx->bidir)       wflags |= WARP_FLAG_BIDIR;
+        WarpPush wp{W, H, info->phase, wflags};
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->warpStage.pipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->warpStage.pipeLayout, 0, 1, &ctx->warpSet, 0, nullptr);
         vkCmdPushConstants(cmd, ctx->warpStage.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(wp), &wp);

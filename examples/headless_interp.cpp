@@ -98,6 +98,9 @@ int main(int argc, char** argv) {
     Img prev = mkImg(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     Img curr = mkImg(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     Img outI = mkImg(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    Img uiImg = mkImg(VK_FORMAT_R8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    // UI mask rectangle (never interpolated).
+    const uint32_t UIX0=96, UIX1=160, UIY0=96, UIY1=160;
 
     // --- staging upload of the pair ---
     VkCommandPool pool; { VkCommandPoolCreateInfo p{}; p.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO; p.queueFamilyIndex = gfxFamily; p.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; vkCreateCommandPool(dev,&p,nullptr,&pool); }
@@ -121,17 +124,39 @@ int main(int argc, char** argv) {
     };
     upload(prev, 0); upload(curr, SHIFT);
 
+    // upload the UI mask (R8: 255 inside the rectangle, 0 elsewhere)
+    {
+        std::vector<uint8_t> m(W*H, 0);
+        for (uint32_t y=UIY0;y<UIY1;++y) for (uint32_t x=UIX0;x<UIX1;++x) m[y*W+x]=255;
+        VkBuffer buf; VkDeviceMemory bm; VkBufferCreateInfo bc{}; bc.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO; bc.size=m.size(); bc.usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT; bc.sharingMode=VK_SHARING_MODE_EXCLUSIVE; vkCreateBuffer(dev,&bc,nullptr,&buf);
+        VkMemoryRequirements rq{}; vkGetBufferMemoryRequirements(dev,buf,&rq); VkMemoryAllocateInfo ai{}; ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO; ai.allocationSize=rq.size; ai.memoryTypeIndex=memType(pd,rq.memoryTypeBits,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT); vkAllocateMemory(dev,&ai,nullptr,&bm); vkBindBufferMemory(dev,buf,bm,0);
+        void* mp; vkMapMemory(dev,bm,0,m.size(),0,&mp); std::memcpy(mp,m.data(),m.size()); vkUnmapMemory(dev,bm);
+        oneShot([&](VkCommandBuffer c){
+            VkImageMemoryBarrier b{}; b.sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER; b.oldLayout=VK_IMAGE_LAYOUT_UNDEFINED; b.newLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.srcQueueFamilyIndex=b.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED; b.image=uiImg.image; b.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1}; b.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;
+            vkCmdPipelineBarrier(c,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&b);
+            VkBufferImageCopy r{}; r.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1}; r.imageExtent={W,H,1};
+            vkCmdCopyBufferToImage(c,buf,uiImg.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&r);
+            b.oldLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.newLayout=VK_IMAGE_LAYOUT_GENERAL; b.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT;
+            vkCmdPipelineBarrier(c,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,nullptr,0,nullptr,1,&b);
+        });
+        vkDestroyBuffer(dev,buf,nullptr); vkFreeMemory(dev,bm,nullptr);
+    }
+
     // --- create nvofg + register + generate ---
     NvofgCreateInfo ci{}; ci.instance=instance; ci.physical_device=pd; ci.device=dev; ci.queue=gfxQ; ci.queue_family_index=gfxFamily;
     ci.of_queue=ofQ; ci.of_queue_family_index=ofFamily; ci.gipa=vkGetInstanceProcAddr; ci.width=W; ci.height=H;
     ci.quality=NVOFG_QUALITY_HIGH; ci.interpolator=NVOFG_INTERP_WARP; ci.mode=NVOFG_MODE_AUTOMATIC;
+    ci.flags = NVOFG_FLAG_USE_UI_MASK;
     NvofgContext* ctx=nullptr;
     if (nvofg_create(&ci,&ctx)!=NVOFG_OK){ std::fprintf(stderr,"nvofg_create failed\n"); return 3; }
 
     NvofgImageDesc pd0{prev.image,prev.view,VK_FORMAT_R8G8B8A8_UNORM,W,H};
     NvofgImageDesc cd0{curr.image,curr.view,VK_FORMAT_R8G8B8A8_UNORM,W,H};
     NvofgImageDesc od0{outI.image,outI.view,VK_FORMAT_R8G8B8A8_UNORM,W,H};
+    NvofgImageDesc ui0{uiImg.image,uiImg.view,VK_FORMAT_R8_UNORM,W,H};
     if (nvofg_register_color(ctx,&pd0,&cd0)!=NVOFG_OK || nvofg_register_output(ctx,&od0)!=NVOFG_OK){ std::fprintf(stderr,"register failed\n"); return 3; }
+    NvofgAuxDesc aux{}; aux.ui_mask=&ui0;
+    if (nvofg_register_aux(ctx,&aux)!=NVOFG_OK){ std::fprintf(stderr,"register_aux failed\n"); return 3; }
 
     NvofgGenerateInfo gi{}; gi.phase=0.5f; gi.prev_layout=VK_IMAGE_LAYOUT_GENERAL; gi.curr_layout=VK_IMAGE_LAYOUT_GENERAL;
     gi.input_timeline=VK_NULL_HANDLE;  // colors already uploaded+idle
@@ -157,22 +182,36 @@ int main(int argc, char** argv) {
 
     // --- validate against the +4px analytic midpoint (interior only) ---
     double mae=0; int cnt=0; const int M=SHIFT+4;  // ignore border where flow falls off
+    auto inUI=[&](uint32_t x,uint32_t y){ return x>=UIX0&&x<UIX1&&y>=UIY0&&y<UIY1; };
     for (uint32_t y=(uint32_t)M;y<H-M;++y) for (uint32_t x=(uint32_t)M;x<W-M;++x){
+        if (inUI(x,y)) continue;                     // UI region is not interpolated
         int got = px[(y*W+x)*4]; int gt = pat((int)x-4,(int)y);
         mae += std::abs(got-gt); ++cnt;
     }
     mae /= (cnt?cnt:1);
     std::printf("interpolated vs +4px ground truth: MAE = %.2f (0-255) over %d interior px\n", mae, cnt);
 
+    // UI mask: masked pixels must equal curr (= pattern shifted +8), NOT the +4 midpoint.
+    double uiMaeCurr=0, uiMaeMid=0; int uiCnt=0;
+    for (uint32_t y=UIY0+2;y<UIY1-2;++y) for (uint32_t x=UIX0+2;x<UIX1-2;++x){
+        int got=px[(y*W+x)*4];
+        uiMaeCurr += std::abs(got - pat((int)x-SHIFT,(int)y));
+        uiMaeMid  += std::abs(got - pat((int)x-4,(int)y));
+        ++uiCnt;
+    }
+    uiMaeCurr/=uiCnt; uiMaeMid/=uiCnt;
+    std::printf("UI region: MAE vs curr = %.2f, MAE vs midpoint = %.2f (want curr<<midpoint)\n", uiMaeCurr, uiMaeMid);
+    bool uiOk = uiMaeCurr < 3.0 && uiMaeMid > uiMaeCurr + 5.0;
+
     FILE* f=std::fopen(outPath,"wb");
     if (f){ std::fprintf(f,"P6\n%u %u\n255\n",W,H); std::vector<uint8_t> rgb(W*H*3); for(uint32_t i=0;i<W*H;++i){rgb[i*3]=px[i*4];rgb[i*3+1]=px[i*4+1];rgb[i*3+2]=px[i*4+2];} std::fwrite(rgb.data(),1,rgb.size(),f); std::fclose(f); std::printf("wrote %s\n",outPath); }
 
-    bool ok = mae < 12.0;  // warp+bilinear+flow-noise tolerance
-    std::printf("RESULT: %s\n", ok ? "PASS (interpolated frame matches midpoint)" : "CHECK (MAE high)");
+    bool ok = mae < 12.0 && uiOk;  // warp+bilinear+flow-noise tolerance + UI mask honoured
+    std::printf("RESULT: %s\n", ok ? "PASS (midpoint matches + UI mask honoured)" : "CHECK (see MAE above)");
 
     vkUnmapMemory(dev,rbm); vkDestroyBuffer(dev,rb,nullptr); vkFreeMemory(dev,rbm,nullptr);
     nvofg_destroy(ctx);
-    for (Img* im : {&prev,&curr,&outI}){ vkDestroyImageView(dev,im->view,nullptr); vkDestroyImage(dev,im->image,nullptr); vkFreeMemory(dev,im->mem,nullptr); }
+    for (Img* im : {&prev,&curr,&outI,&uiImg}){ vkDestroyImageView(dev,im->view,nullptr); vkDestroyImage(dev,im->image,nullptr); vkFreeMemory(dev,im->mem,nullptr); }
     vkDestroyCommandPool(dev,pool,nullptr); vkDestroyDevice(dev,nullptr); vkDestroyInstance(instance,nullptr);
     return ok ? 0 : 4;
 }

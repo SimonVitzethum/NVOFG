@@ -93,6 +93,31 @@ struct NvofgContext {
     nvofg::RegImage prevColor, currColor, output;
     bool haveColor = false, haveOutput = false;
 
+    // --- optional aux (registered; consumed per flags) ---
+    nvofg::RegImage depth, motion, uiMask, reactive, materialId;
+    bool hasDepth = false, hasMotion = false, hasUiMask = false, hasReactive = false;
+
+    // --- fallback 1x1 images bound where an aux input is absent ---
+    nvofg::Image dummyR8, dummyRG16;
+
+    // --- bidirectional (BOTH_DIRECTIONS) resources ---
+    bool bidir = false;
+    nvofg::Image  flowBwdImg, costBwdImg;
+    nvofg::Buffer flowBwdBuf, costBwdBuf;
+    nvofg::Image  refinedFlowBwd, occlusion;
+
+    // --- motion-vector hint (ENABLE_HINT) ---
+    bool useHint = false;
+    nvofg::Image  hintImg;              // SFIXED5 at hint grid
+    nvofg::Stage  hintStage;           // converts app MVs -> S10.5 hint
+    VkDescriptorSet hintSet = VK_NULL_HANDLE;
+
+    // --- debug visualisation ---
+    nvofg::RegImage debugTarget;
+    bool haveDebugTarget = false;
+    nvofg::Stage  debugStage;
+    VkDescriptorSet debugSet = VK_NULL_HANDLE;
+
     // --- compute stages ---
     nvofg::Stage prepStage, refineStage, warpStage;
     VkSampler        linearSampler = VK_NULL_HANDLE;
