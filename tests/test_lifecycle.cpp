@@ -77,12 +77,19 @@ int main() {
     for (uint32_t i = 0; i < qfCount; ++i)
         if (qfs[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) { gfxFamily = i; break; }
 
+    uint32_t ofFamily = 0;
+    REQUIRE(nvofg_optical_flow_queue_family(instance, ofDev, vkGetInstanceProcAddr, &ofFamily)
+                == NVOFG_OK, "nvofg_optical_flow_queue_family -> OK");
+
     float prio = 1.0f;
-    VkDeviceQueueCreateInfo qci{};
-    qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-    qci.queueFamilyIndex = gfxFamily;
-    qci.queueCount = 1;
-    qci.pQueuePriorities = &prio;
+    VkDeviceQueueCreateInfo qcis[2]{};
+    qcis[0].sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+    qcis[0].queueFamilyIndex = gfxFamily;
+    qcis[0].queueCount = 1;
+    qcis[0].pQueuePriorities = &prio;
+    qcis[1] = qcis[0];
+    qcis[1].queueFamilyIndex = ofFamily;
+    uint32_t qciCount = (gfxFamily == ofFamily) ? 1u : 2u;
     VkPhysicalDeviceOpticalFlowFeaturesNV of{};
     of.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPTICAL_FLOW_FEATURES_NV;
     of.opticalFlow = VK_TRUE;
@@ -91,15 +98,16 @@ int main() {
     VkDeviceCreateInfo dci{};
     dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     dci.pNext = &of;
-    dci.queueCreateInfoCount = 1;
-    dci.pQueueCreateInfos = &qci;
+    dci.queueCreateInfoCount = qciCount;
+    dci.pQueueCreateInfos = qcis;
     dci.enabledExtensionCount = reqCount;
     dci.ppEnabledExtensionNames = reqExts;
     VkDevice device;
     REQUIRE(vkCreateDevice(ofDev, &dci, nullptr, &device) == VK_SUCCESS,
             "vkCreateDevice with nvofg_required_device_extensions");
-    VkQueue queue;
+    VkQueue queue, ofQueue;
     vkGetDeviceQueue(device, gfxFamily, 0, &queue);
+    vkGetDeviceQueue(device, ofFamily, 0, &ofQueue);
 
     NvofgCreateInfo info{};
     info.instance = instance;
@@ -107,6 +115,8 @@ int main() {
     info.device = device;
     info.queue = queue;
     info.queue_family_index = gfxFamily;
+    info.of_queue = ofQueue;
+    info.of_queue_family_index = ofFamily;
     info.gipa = vkGetInstanceProcAddr;
     info.width = 1920;
     info.height = 1080;

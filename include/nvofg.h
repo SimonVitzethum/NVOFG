@@ -94,8 +94,14 @@ typedef struct NvofgCreateInfo {
     VkInstance        instance;
     VkPhysicalDevice  physical_device;
     VkDevice          device;
-    VkQueue           queue;              /* queue nvofg submits OFA work on       */
+    VkQueue           queue;              /* compute-capable queue: prep/refine/warp */
     uint32_t          queue_family_index;
+    /* Optical-flow queue: the OFA executes on a dedicated queue family, so the app
+     * requests one queue from that family at device creation and passes it here.
+     * Find the family with nvofg_optical_flow_queue_family(). If of_queue is
+     * VK_NULL_HANDLE, nvofg calls vkGetDeviceQueue(of_queue_family_index, 0). */
+    VkQueue           of_queue;
+    uint32_t          of_queue_family_index;
     PFN_vkGetInstanceProcAddr gipa;       /* resolve VK fns against app's loader   */
     uint32_t          width, height;      /* full present resolution               */
     NvofgQuality      quality;
@@ -108,6 +114,12 @@ typedef struct NvofgCreateInfo {
  * NVOFG_UNSUPPORTED (and supported=0) if the device has no usable OFA. */
 NvofgResult nvofg_query_support(VkInstance instance, VkPhysicalDevice pd,
                                 PFN_vkGetInstanceProcAddr gipa, NvofgCaps* out);
+
+/* Find the queue family that supports optical flow (VK_QUEUE_OPTICAL_FLOW_BIT_NV).
+ * Call at device-creation time so the app can add one queue from that family and
+ * pass it as NvofgCreateInfo.of_queue. Returns NVOFG_UNSUPPORTED if none. */
+NvofgResult nvofg_optical_flow_queue_family(VkInstance instance, VkPhysicalDevice pd,
+                                            PFN_vkGetInstanceProcAddr gipa, uint32_t* out_family);
 
 /* Instance/device extensions nvofg needs the app to enable. Returns a
  * NULL-terminated array of C strings owned by the library (valid for process

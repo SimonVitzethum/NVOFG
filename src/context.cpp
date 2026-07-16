@@ -89,6 +89,24 @@ NvofgResult nvofg_query_support(VkInstance instance, VkPhysicalDevice pd,
     return queryCaps(gipa, instance, pd, out) ? NVOFG_OK : NVOFG_UNSUPPORTED;
 }
 
+NvofgResult nvofg_optical_flow_queue_family(VkInstance instance, VkPhysicalDevice pd,
+                                            PFN_vkGetInstanceProcAddr gipa, uint32_t* out_family) {
+    if (!instance || !pd || !gipa || !out_family) return NVOFG_INVALID_ARGUMENT;
+    auto getQF = loadInstance<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
+        gipa, instance, "vkGetPhysicalDeviceQueueFamilyProperties");
+    if (!getQF) return NVOFG_INTERNAL;
+    uint32_t n = 0;
+    getQF(pd, &n, nullptr);
+    if (!n) return NVOFG_UNSUPPORTED;
+    VkQueueFamilyProperties* qf = new VkQueueFamilyProperties[n];
+    getQF(pd, &n, qf);
+    NvofgResult res = NVOFG_UNSUPPORTED;
+    for (uint32_t i = 0; i < n; ++i)
+        if (qf[i].queueFlags & VK_QUEUE_OPTICAL_FLOW_BIT_NV) { *out_family = i; res = NVOFG_OK; break; }
+    delete[] qf;
+    return res;
+}
+
 NvofgResult nvofg_create(const NvofgCreateInfo* info, NvofgContext** out) {
     if (!info || !out || !info->device || !info->physical_device || !info->instance
         || !info->gipa || !info->width || !info->height)
@@ -115,6 +133,8 @@ NvofgResult nvofg_create(const NvofgCreateInfo* info, NvofgContext** out) {
     ctx->mode           = info->mode;
     ctx->flags          = info->flags;
     ctx->caps           = caps;
+    ctx->ofFamily       = info->of_queue_family_index;
+    ctx->ofQueue        = info->of_queue;
 
     // Resolve device-level entrypoints via the app's loader.
     auto gdpa = loadInstance<PFN_vkGetDeviceProcAddr>(
@@ -132,6 +152,18 @@ NvofgResult nvofg_create(const NvofgCreateInfo* info, NvofgContext** out) {
         ctx->setError("failed to resolve VK_NV_optical_flow entrypoints");
         delete ctx;
         return NVOFG_INTERNAL;
+    }
+
+    // Resolve the optical-flow queue if the app did not pass one explicitly.
+    if (ctx->ofQueue == VK_NULL_HANDLE) {
+        auto getQueue = (PFN_vkGetDeviceQueue) L("vkGetDeviceQueue");
+        if (getQueue) getQueue(info->device, ctx->ofFamily, 0, &ctx->ofQueue);
+    }
+    if (ctx->ofQueue == VK_NULL_HANDLE) {
+        ctx->setError("no optical-flow queue: pass of_queue or create one from "
+                      "nvofg_optical_flow_queue_family()");
+        delete ctx;
+        return NVOFG_INVALID_ARGUMENT;
     }
 
     // Cross-stage timeline semaphore.
