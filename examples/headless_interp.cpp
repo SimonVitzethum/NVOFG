@@ -99,6 +99,7 @@ int main(int argc, char** argv) {
     Img curr = mkImg(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     Img outI = mkImg(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     Img uiImg = mkImg(VK_FORMAT_R8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    Img mvImg = mkImg(VK_FORMAT_R32G32_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     // UI mask rectangle (never interpolated).
     const uint32_t UIX0=96, UIX1=160, UIY0=96, UIY1=160;
 
@@ -142,11 +143,28 @@ int main(int argc, char** argv) {
         vkDestroyBuffer(dev,buf,nullptr); vkFreeMemory(dev,bm,nullptr);
     }
 
+    // upload synthetic motion vectors (RG32F): (+8,0) everywhere, = the true motion
+    {
+        std::vector<float> mv(W*H*2); for (uint32_t i=0;i<W*H;++i){ mv[i*2]=(float)SHIFT; mv[i*2+1]=0.f; }
+        VkBuffer buf; VkDeviceMemory bm; VkBufferCreateInfo bc{}; bc.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO; bc.size=mv.size()*4; bc.usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT; bc.sharingMode=VK_SHARING_MODE_EXCLUSIVE; vkCreateBuffer(dev,&bc,nullptr,&buf);
+        VkMemoryRequirements rq{}; vkGetBufferMemoryRequirements(dev,buf,&rq); VkMemoryAllocateInfo ai{}; ai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO; ai.allocationSize=rq.size; ai.memoryTypeIndex=memType(pd,rq.memoryTypeBits,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT); vkAllocateMemory(dev,&ai,nullptr,&bm); vkBindBufferMemory(dev,buf,bm,0);
+        void* mp; vkMapMemory(dev,bm,0,mv.size()*4,0,&mp); std::memcpy(mp,mv.data(),mv.size()*4); vkUnmapMemory(dev,bm);
+        oneShot([&](VkCommandBuffer c){
+            VkImageMemoryBarrier b{}; b.sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER; b.oldLayout=VK_IMAGE_LAYOUT_UNDEFINED; b.newLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.srcQueueFamilyIndex=b.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED; b.image=mvImg.image; b.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1}; b.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;
+            vkCmdPipelineBarrier(c,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&b);
+            VkBufferImageCopy r{}; r.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1}; r.imageExtent={W,H,1};
+            vkCmdCopyBufferToImage(c,buf,mvImg.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&r);
+            b.oldLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.newLayout=VK_IMAGE_LAYOUT_GENERAL; b.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT;
+            vkCmdPipelineBarrier(c,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,nullptr,0,nullptr,1,&b);
+        });
+        vkDestroyBuffer(dev,buf,nullptr); vkFreeMemory(dev,bm,nullptr);
+    }
+
     // --- create nvofg + register + generate ---
     NvofgCreateInfo ci{}; ci.instance=instance; ci.physical_device=pd; ci.device=dev; ci.queue=gfxQ; ci.queue_family_index=gfxFamily;
     ci.of_queue=ofQ; ci.of_queue_family_index=ofFamily; ci.gipa=vkGetInstanceProcAddr; ci.width=W; ci.height=H;
     ci.quality=NVOFG_QUALITY_HIGH; ci.interpolator=NVOFG_INTERP_WARP; ci.mode=NVOFG_MODE_AUTOMATIC;
-    ci.flags = NVOFG_FLAG_USE_UI_MASK | NVOFG_FLAG_BIDIRECTIONAL;
+    ci.flags = NVOFG_FLAG_USE_UI_MASK | NVOFG_FLAG_BIDIRECTIONAL | NVOFG_FLAG_USE_MOTION;
     NvofgContext* ctx=nullptr;
     if (nvofg_create(&ci,&ctx)!=NVOFG_OK){ std::fprintf(stderr,"nvofg_create failed\n"); return 3; }
 
@@ -155,7 +173,8 @@ int main(int argc, char** argv) {
     NvofgImageDesc od0{outI.image,outI.view,VK_FORMAT_R8G8B8A8_UNORM,W,H};
     NvofgImageDesc ui0{uiImg.image,uiImg.view,VK_FORMAT_R8_UNORM,W,H};
     if (nvofg_register_color(ctx,&pd0,&cd0)!=NVOFG_OK || nvofg_register_output(ctx,&od0)!=NVOFG_OK){ std::fprintf(stderr,"register failed\n"); return 3; }
-    NvofgAuxDesc aux{}; aux.ui_mask=&ui0;
+    NvofgImageDesc mv0{mvImg.image,mvImg.view,VK_FORMAT_R32G32_SFLOAT,W,H};
+    NvofgAuxDesc aux{}; aux.ui_mask=&ui0; aux.motion=&mv0;
     if (nvofg_register_aux(ctx,&aux)!=NVOFG_OK){ std::fprintf(stderr,"register_aux failed\n"); return 3; }
 
     NvofgGenerateInfo gi{}; gi.phase=0.5f; gi.prev_layout=VK_IMAGE_LAYOUT_GENERAL; gi.curr_layout=VK_IMAGE_LAYOUT_GENERAL;
@@ -211,7 +230,7 @@ int main(int argc, char** argv) {
 
     vkUnmapMemory(dev,rbm); vkDestroyBuffer(dev,rb,nullptr); vkFreeMemory(dev,rbm,nullptr);
     nvofg_destroy(ctx);
-    for (Img* im : {&prev,&curr,&outI,&uiImg}){ vkDestroyImageView(dev,im->view,nullptr); vkDestroyImage(dev,im->image,nullptr); vkFreeMemory(dev,im->mem,nullptr); }
+    for (Img* im : {&prev,&curr,&outI,&uiImg,&mvImg}){ vkDestroyImageView(dev,im->view,nullptr); vkDestroyImage(dev,im->image,nullptr); vkFreeMemory(dev,im->mem,nullptr); }
     vkDestroyCommandPool(dev,pool,nullptr); vkDestroyDevice(dev,nullptr); vkDestroyInstance(instance,nullptr);
     return ok ? 0 : 4;
 }

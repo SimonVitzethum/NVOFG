@@ -16,14 +16,15 @@ import common;
 [[vk::binding(5, 0)]] RWTexture2D<float>  gConfidence;
 [[vk::image_format("r8")]]
 [[vk::binding(6, 0)]] RWTexture2D<float>  gOcclusion;
+[[vk::binding(7, 0)]] Texture2D<float2>   gMotion;    // app motion vectors, px (prev->curr)
 
 struct Push {
-    uint  width, height, gridW, gridH, gridSize, flags;   // bit0 hasCost, bit1 hasBidir
+    uint  width, height, gridW, gridH, gridSize, flags;   // bit0 cost,1 bidir,2 motion
     float sigma;
 };
 [[vk::push_constant]] Push pc;
 
-static const uint FLAG_COST = 1u, FLAG_BIDIR = 2u;
+static const uint FLAG_COST = 1u, FLAG_BIDIR = 2u, FLAG_MOTION = 4u;
 
 int2 clampCell(int2 c) { return clamp(c, int2(0, 0), int2(int(pc.gridW) - 1, int(pc.gridH) - 1)); }
 
@@ -55,7 +56,6 @@ void main(uint3 tid : SV_DispatchThreadID) {
     int2 p = int2(tid.xy);
 
     float2 Ffwd = upsample(gFlowFwd, p);
-    gRefinedFwd[p] = Ffwd;
 
     float cost = 0.0;
     if (pc.flags & FLAG_COST) {
@@ -65,6 +65,17 @@ void main(uint3 tid : SV_DispatchThreadID) {
         cost = float((word >> ((idx & 3u) * 8u)) & 0xffu);
     }
     float conf = confidenceFromCost(cost, pc.sigma);
+
+    // Motion-vector fusion (req.#3): adaptively combine OFA flow with app MVs by
+    // confidence — never fully replace either. Where the OFA is unreliable the
+    // result leans on the engine MV; where they agree, confidence is boosted.
+    if (pc.flags & FLAG_MOTION) {
+        float2 Fmv = gMotion[p];
+        Ffwd = lerp(Ffwd, Fmv, 1.0 - conf);
+        float agree = 1.0 - saturate(length(Ffwd - Fmv) / 8.0);
+        conf = saturate(max(conf, 0.5 * conf + 0.5 * agree));
+    }
+    gRefinedFwd[p] = Ffwd;
 
     float occ = 0.0;
     float2 Fbwd = float2(0.0);

@@ -267,7 +267,8 @@ NvofgResult ensurePipeline(NvofgContext* ctx) {
                              bind(3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE),
                              bind(4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE),
                              bind(5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE),
-                             bind(6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)};
+                             bind(6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE),
+                             bind(7, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE)};
     std::vector<B> warpB;
     for (uint32_t i = 0; i <= 3; ++i) warpB.push_back(bind(i, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE));
     for (uint32_t i = 4; i <= 7; ++i) warpB.push_back(bind(i, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE));
@@ -444,7 +445,7 @@ void submitTimeline(VkQueue queue, VkCommandBuffer cmd,
 }
 
 struct RefinePush { uint32_t width, height, gridW, gridH, gridSize, flags; float sigma; };
-enum { REFINE_FLAG_COST = 1u, REFINE_FLAG_BIDIR = 2u };
+enum { REFINE_FLAG_COST = 1u, REFINE_FLAG_BIDIR = 2u, REFINE_FLAG_MOTION = 4u };
 struct WarpPush   { uint32_t width, height; float phase; uint32_t flags; };
 enum { WARP_FLAG_UI = 1u, WARP_FLAG_REACTIVE = 2u, WARP_FLAG_BIDIR = 4u };
 
@@ -541,6 +542,8 @@ NvofgResult nvofg_record_generate(NvofgContext* ctx, const NvofgGenerateInfo* in
     writeImg(ctx->refineSet, 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, ctx->refinedFlowBwd.view, G, VK_NULL_HANDLE);
     writeImg(ctx->refineSet, 5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, ctx->confidence.view, G, VK_NULL_HANDLE);
     writeImg(ctx->refineSet, 6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, ctx->occlusion.view, G, VK_NULL_HANDLE);
+    writeImg(ctx->refineSet, 7, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+             ctx->hasMotion ? ctx->motion.view : ctx->dummyRG16.view, G, VK_NULL_HANDLE);
     VkImageView bwdFlowView = ctx->bidir ? ctx->refinedFlowBwd.view : ctx->dummyRG16.view;
     VkImageView occView     = ctx->bidir ? ctx->occlusion.view      : ctx->dummyR8.view;
     VkImageView uiView       = ctx->hasUiMask   ? ctx->uiMask.view   : ctx->dummyR8.view;
@@ -618,7 +621,8 @@ NvofgResult nvofg_record_generate(NvofgContext* ctx, const NvofgGenerateInfo* in
         imgBarrier(cmd, ctx->refinedFlowBwd.image, VK_IMAGE_LAYOUT_UNDEFINED, G, 0, VK_ACCESS_SHADER_WRITE_BIT);
         imgBarrier(cmd, ctx->confidence.image, VK_IMAGE_LAYOUT_UNDEFINED, G, 0, VK_ACCESS_SHADER_WRITE_BIT);
         imgBarrier(cmd, ctx->occlusion.image, VK_IMAGE_LAYOUT_UNDEFINED, G, 0, VK_ACCESS_SHADER_WRITE_BIT);
-        uint32_t rflags = REFINE_FLAG_COST | (ctx->bidir ? REFINE_FLAG_BIDIR : 0u);
+        uint32_t rflags = REFINE_FLAG_COST | (ctx->bidir ? REFINE_FLAG_BIDIR : 0u)
+                        | (ctx->hasMotion ? REFINE_FLAG_MOTION : 0u);
         RefinePush rp{W, H, ctx->gridW, ctx->gridH, ctx->gridSize, rflags,
                       (ctx->quality == NVOFG_QUALITY_HIGH) ? 32.f : 48.f};
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->refineStage.pipeline);
