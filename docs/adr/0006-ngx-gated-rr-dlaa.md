@@ -77,15 +77,30 @@ mirroring RMC's proven NGX FFI) **builds and links cleanly**, and at runtime NGX
   `__NGX_DISABLE_UPDATER`, and `NGX_CUBIN_DISABLE_RESOURCE_CACHE` did not redirect it on
   this driver (610.43.03).
 
-**Conclusion:** this is a **system-configuration/permission** limitation, not a code or
-hardware one. On a host where `/usr/share/nvidia/ngx` exists and is writable (or a working
-NGX system config), the same build initialises NGX and the DLSS RR / DLAA / SR backends
-become functional **with no code change** — `rfx_query_capabilities` flips them to
-`supported` and the existing resolver/dispatch selects them. Until then they correctly
-report `unsupported`, and the pipeline runs on the vendor-neutral backends (Native/Temporal
-upscaling, nvofg FG). To enable on a target system: build with `-DRENDERFX_NGX`, ensure the
-NGX model directory is writable, and place the feature blobs beside the app (see
-`RENDERFX_NGX_DATA_PATH`).
+### Resolution (design.md §19) — NGX now initialises
+
+The blocker was fixed per **design.md §19**. Two things were required together:
+1. **A writable application-data path**, passed in BOTH the legacy `InApplicationDataPath`
+   arg AND `NVSDK_NGX_FeatureCommonInfo.PathListInfo` — so NGX writes its cubin/model cache
+   and logs there instead of the root-owned `/usr/share/nvidia/ngx`.
+2. **A valid UUID project id** for `Init_with_ProjectID` — a non-UUID string is itself a
+   `FAIL_InvalidParameter` (`0xBAD00005`) cause (§19: "don't conflate the two").
+
+With both applied, the probe (`src/ngx_probe.cpp`) on the RTX 5070 / driver 610 prints:
+
+```
+NGX init result: 0x00000001 (ok)
+  DLSS SR / DLAA available : 1
+  DLSS Ray Reconstruction  : 1
+```
+
+**So DLSS Super Resolution, DLAA, and Ray Reconstruction are available on this machine.**
+The NGX-gated backends are therefore genuinely functional here (build with
+`-DRENDERFX_NGX`): `rfx_query_capabilities` marks them `supported`, and the existing
+resolver/dispatch selects them. Where NGX cannot init (non-NVIDIA, no SDK, unwritable
+path), they report `unsupported` and the pipeline falls back — the graceful-degradation
+path (G6). The remaining work to make them *do* the denoise/upscale is the per-frame
+`CreateFeature`/`EvaluateFeature` wiring consuming the shared Frame Context.
 
 ## Alternatives considered
 - **Reimplement DLSS RR / DLAA natively** — rejected (design.md §16.1 asymmetry; infeasible

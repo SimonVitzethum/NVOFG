@@ -49,6 +49,7 @@ endif()
 if(NOT NVOFG_LIBRARY_ONLY)
   if(RENDERFX_NGX AND EXISTS "${RFX_NGX_LIB}")
     add_executable(renderfx_ngx_probe src/ngx_probe.cpp)
+    target_include_directories(renderfx_ngx_probe PRIVATE ${RFX_NGX_DIR}/include)
     target_compile_definitions(renderfx_ngx_probe PRIVATE
       RENDERFX_NGX_DATA_PATH="${RFX_NGX_DIR}/lib/Linux_x86_64/rel")
     target_link_libraries(renderfx_ngx_probe PRIVATE Vulkan::Vulkan ${RFX_NGX_LIB} stdc++ dl)

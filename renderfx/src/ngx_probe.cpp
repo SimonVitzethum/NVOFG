@@ -7,6 +7,8 @@
 // 2 = no NVIDIA device / NGX unavailable (the backend then reports unsupported).
 #include <vulkan/vulkan.h>
 
+#include "nvsdk_ngx_defs.h"   // NVSDK_NGX_FeatureCommonInfo / PathListInfo (design.md §19)
+
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -68,10 +70,22 @@ int main() {
     VkDevice dev; if (vkCreateDevice(pd, &dci, nullptr, &dev) != VK_SUCCESS) { std::printf("no device\n"); return 2; }
 
     auto gdpa = (PFN_vkGetDeviceProcAddr)vkGetInstanceProcAddr(inst, "vkGetDeviceProcAddr");
+
+    // design.md §19: NGX otherwise writes its cache under the root-owned
+    // /usr/share/nvidia/ngx and Init fails with 0xBAD00005 (FAIL_InvalidParameter).
+    // Fix: pass a WRITABLE data path in BOTH the legacy arg AND FeatureCommonInfo
+    // .PathListInfo (also the snippet search path). `dataPath` (the vendored rel dir)
+    // is user-writable and holds the DLSS/RR snippets.
     std::vector<uint32_t> wp = wpath(dataPath);
+    const wchar_t* pathW = reinterpret_cast<const wchar_t*>(wp.data());
+    const wchar_t* paths[1] = { pathW };
+    NVSDK_NGX_FeatureCommonInfo fci; std::memset(&fci, 0, sizeof(fci));
+    fci.PathListInfo.Path = paths;
+    fci.PathListInfo.Length = 1;
+    // NGX validates the project id as a UUID; a non-UUID string -> FAIL_InvalidParameter.
     int r = NVSDK_NGX_VULKAN_Init_with_ProjectID(
-        "renderfx-probe", 0 /*ENGINE_TYPE_CUSTOM*/, "0.1", wp.data(),
-        inst, pd, dev, vkGetInstanceProcAddr, gdpa, nullptr, 0x0000015 /*NVSDK_NGX_Version_API*/);
+        "b1e7fa2c-9d34-4c1a-8b77-6f0a1e2d3c4b", 0 /*ENGINE_TYPE_CUSTOM*/, "1.0", wp.data(),
+        inst, pd, dev, vkGetInstanceProcAddr, gdpa, &fci, 0x0000015 /*NVSDK_NGX_Version_API*/);
     std::printf("NGX init result: 0x%08X (%s)\n", (unsigned)r, ngxOk(r) ? "ok" : "FAILED");
     if (!ngxOk(r)) { std::printf("RESULT: NGX unavailable on this device/driver -> backends report unsupported\n"); vkDestroyDevice(dev, nullptr); vkDestroyInstance(inst, nullptr); return 2; }
 
