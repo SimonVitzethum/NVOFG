@@ -185,12 +185,13 @@ int main(int argc, char** argv) {
     NvofgGenerateInfo gi{}; gi.phase=0.5f; gi.prev_layout=VK_IMAGE_LAYOUT_GENERAL; gi.curr_layout=VK_IMAGE_LAYOUT_GENERAL;
     gi.input_timeline=VK_NULL_HANDLE;  // colors already uploaded+idle
     NvofgFrameSync sync{};
-    NvofgResult gr = nvofg_record_generate(ctx,&gi,&sync);
-    if (gr!=NVOFG_OK){ std::fprintf(stderr,"record_generate -> %d: %s\n",(int)gr,nvofg_last_error(ctx)); return 3; }
-
-    // wait for the interpolated frame on the CPU (host) before readback
-    VkSemaphoreWaitInfo wi{}; wi.sType=VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO; wi.semaphoreCount=1; wi.pSemaphores=&sync.semaphore; wi.pValues=&sync.value;
-    VKCHECK(vkWaitSemaphores(dev,&wi,UINT64_MAX));
+    // Several frames to exercise the command-buffer ring (slot reuse, pool reset).
+    for (int frame=0; frame<5; ++frame) {
+        NvofgResult gr = nvofg_record_generate(ctx,&gi,&sync);
+        if (gr!=NVOFG_OK){ std::fprintf(stderr,"record_generate -> %d: %s\n",(int)gr,nvofg_last_error(ctx)); return 3; }
+        VkSemaphoreWaitInfo wi{}; wi.sType=VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO; wi.semaphoreCount=1; wi.pSemaphores=&sync.semaphore; wi.pValues=&sync.value;
+        VKCHECK(vkWaitSemaphores(dev,&wi,UINT64_MAX));
+    }
 
     // --- read output back ---
     VkBuffer rb; VkDeviceMemory rbm; VkDeviceSize bytes=(VkDeviceSize)W*H*4;

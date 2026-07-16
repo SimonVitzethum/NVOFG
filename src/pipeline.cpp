@@ -148,6 +148,24 @@ struct RefinePush {
 };
 enum { REFINE_FLAG_COST = 1u, REFINE_FLAG_BIDIR = 2u, REFINE_FLAG_MOTION = 4u, REFINE_FLAG_DEPTH = 8u };
 
+void writeImg(VkDevice dev, VkDescriptorSet set, uint32_t b, VkDescriptorType t,
+              VkImageView view, VkSampler samp) {
+    VkDescriptorImageInfo ii{samp, view, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet w{};
+    w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w.dstSet = set; w.dstBinding = b; w.descriptorCount = 1; w.descriptorType = t;
+    w.pImageInfo = &ii;
+    vkUpdateDescriptorSets(dev, 1, &w, 0, nullptr);
+}
+void writeBuf(VkDevice dev, VkDescriptorSet set, uint32_t b, VkBuffer buf, VkDeviceSize size) {
+    VkDescriptorBufferInfo bi{buf, 0, size};
+    VkWriteDescriptorSet w{};
+    w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w.dstSet = set; w.dstBinding = b; w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w.pBufferInfo = &bi;
+    vkUpdateDescriptorSets(dev, 1, &w, 0, nullptr);
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -352,20 +370,21 @@ NvofgResult ensurePipeline(NvofgContext* ctx) {
         return NVOFG_INTERNAL;
     if (ctx->useHint && !alloc(ctx->hintStage.setLayout, ctx->hintSet)) return NVOFG_INTERNAL;
 
-    // --- command pools ---
+    // --- per-frame command pools (ring) ---
     VkCommandPoolCreateInfo cpci{};
     cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    cpci.queueFamilyIndex = ctx->queueFamily;
-    vkCreateCommandPool(ctx->device, &cpci, nullptr, &ctx->computePool);
-    cpci.queueFamilyIndex = ctx->ofFamily;
-    vkCreateCommandPool(ctx->device, &cpci, nullptr, &ctx->ofPool);
+    for (uint32_t i = 0; i < NvofgContext::kRing; ++i) {
+        cpci.queueFamilyIndex = ctx->queueFamily;
+        vkCreateCommandPool(ctx->device, &cpci, nullptr, &ctx->computePools[i]);
+        cpci.queueFamilyIndex = ctx->ofFamily;
+        vkCreateCommandPool(ctx->device, &cpci, nullptr, &ctx->ofPools[i]);
+    }
 
     // Clear the 1x1 dummies to 0 so bound-but-unused reads return defined values.
     {
         VkCommandBufferAllocateInfo ai{};
         ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        ai.commandPool = ctx->computePool; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = 1;
+        ai.commandPool = ctx->computePools[0]; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = 1;
         VkCommandBuffer c; vkAllocateCommandBuffers(ctx->device, &ai, &c);
         VkCommandBufferBeginInfo bi{}; bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT; vkBeginCommandBuffer(c, &bi);
@@ -384,18 +403,82 @@ NvofgResult ensurePipeline(NvofgContext* ctx) {
         vkEndCommandBuffer(c);
         VkSubmitInfo si{}; si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO; si.commandBufferCount = 1; si.pCommandBuffers = &c;
         vkQueueSubmit(ctx->queue, 1, &si, VK_NULL_HANDLE); vkQueueWaitIdle(ctx->queue);
-        vkFreeCommandBuffers(ctx->device, ctx->computePool, 1, &c);
+        vkFreeCommandBuffers(ctx->device, ctx->computePools[0], 1, &c);
     }
 
     ctx->pipelineReady = true;
+    refreshDescriptors(ctx);   // write the static descriptor sets once
     return NVOFG_OK;
+}
+
+// Write the static descriptor sets from the currently registered images. Bound
+// images are stable across frames, so this runs once (and on re-register/debug
+// change), removing any per-frame update-in-flight hazard.
+void refreshDescriptors(NvofgContext* ctx) {
+    if (!ctx->pipelineReady) return;
+    VkDevice d = ctx->device;
+    const auto SI = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    const auto ST = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+
+    writeImg(d, ctx->prepPrevSet, 0, SI, ctx->prevColor.view, VK_NULL_HANDLE);
+    writeImg(d, ctx->prepPrevSet, 1, ST, ctx->lumaPrev.view, VK_NULL_HANDLE);
+    writeImg(d, ctx->prepCurrSet, 0, SI, ctx->currColor.view, VK_NULL_HANDLE);
+    writeImg(d, ctx->prepCurrSet, 1, ST, ctx->lumaCurr.view, VK_NULL_HANDLE);
+
+    VkBuffer bwdFlowBuf = ctx->bidir ? ctx->flowBwdBuf.buffer : ctx->flowBuf.buffer;
+    VkDeviceSize bwdFlowSz = ctx->bidir ? ctx->flowBwdBuf.size : ctx->flowBuf.size;
+    writeBuf(d, ctx->refineSet, 0, ctx->flowBuf.buffer, ctx->flowBuf.size);
+    writeBuf(d, ctx->refineSet, 1, ctx->costBuf.buffer, ctx->costBuf.size);
+    writeBuf(d, ctx->refineSet, 2, bwdFlowBuf, bwdFlowSz);
+    writeImg(d, ctx->refineSet, 3, ST, ctx->refinedFlow.view, VK_NULL_HANDLE);
+    writeImg(d, ctx->refineSet, 4, ST, ctx->refinedFlowBwd.view, VK_NULL_HANDLE);
+    writeImg(d, ctx->refineSet, 5, ST, ctx->confidence.view, VK_NULL_HANDLE);
+    writeImg(d, ctx->refineSet, 6, ST, ctx->occlusion.view, VK_NULL_HANDLE);
+    writeImg(d, ctx->refineSet, 7, SI, ctx->hasMotion ? ctx->motion.view : ctx->dummyRG16.view, VK_NULL_HANDLE);
+    writeImg(d, ctx->refineSet, 8, SI, ctx->hasDepth ? ctx->depth.view : ctx->dummyR8.view, VK_NULL_HANDLE);
+
+    VkImageView bwdFlowView = ctx->bidir ? ctx->refinedFlowBwd.view : ctx->dummyRG16.view;
+    VkImageView occView     = ctx->bidir ? ctx->occlusion.view      : ctx->dummyR8.view;
+    VkImageView uiView       = ctx->hasUiMask   ? ctx->uiMask.view   : ctx->dummyR8.view;
+    VkImageView reactiveView = ctx->hasReactive ? ctx->reactive.view : ctx->dummyR8.view;
+    writeImg(d, ctx->warpSet, 0, SI, ctx->prevColor.view, VK_NULL_HANDLE);
+    writeImg(d, ctx->warpSet, 1, SI, ctx->currColor.view, VK_NULL_HANDLE);
+    writeImg(d, ctx->warpSet, 2, SI, ctx->refinedFlow.view, VK_NULL_HANDLE);
+    writeImg(d, ctx->warpSet, 3, SI, bwdFlowView, VK_NULL_HANDLE);
+    writeImg(d, ctx->warpSet, 4, SI, ctx->confidence.view, VK_NULL_HANDLE);
+    writeImg(d, ctx->warpSet, 5, SI, occView, VK_NULL_HANDLE);
+    writeImg(d, ctx->warpSet, 6, SI, uiView, VK_NULL_HANDLE);
+    writeImg(d, ctx->warpSet, 7, SI, reactiveView, VK_NULL_HANDLE);
+    { VkDescriptorImageInfo ii{ctx->linearSampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL};
+      VkWriteDescriptorSet w{}; w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+      w.dstSet = ctx->warpSet; w.dstBinding = 8; w.descriptorCount = 1;
+      w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER; w.pImageInfo = &ii;
+      vkUpdateDescriptorSets(d, 1, &w, 0, nullptr); }
+    writeImg(d, ctx->warpSet, 9, ST, ctx->output.view, VK_NULL_HANDLE);
+
+    if (ctx->useHint) {
+        writeImg(d, ctx->hintSet, 0, SI, ctx->motion.view, VK_NULL_HANDLE);
+        writeBuf(d, ctx->hintSet, 1, ctx->hintBuf.buffer, ctx->hintBuf.size);
+    }
+    if (ctx->haveDebugTarget) {
+        writeImg(d, ctx->debugSet, 0, SI, ctx->refinedFlow.view, VK_NULL_HANDLE);
+        writeImg(d, ctx->debugSet, 1, SI, ctx->refinedFlowBwd.view, VK_NULL_HANDLE);
+        writeImg(d, ctx->debugSet, 2, SI, ctx->confidence.view, VK_NULL_HANDLE);
+        writeImg(d, ctx->debugSet, 3, SI, ctx->occlusion.view, VK_NULL_HANDLE);
+        writeImg(d, ctx->debugSet, 4, ST, ctx->debugTarget.view, VK_NULL_HANDLE);
+    }
 }
 
 void destroyPipeline(NvofgContext* ctx) {
     VkDevice d = ctx->device;
     if (!d) return;
-    if (ctx->computePool) vkDestroyCommandPool(d, ctx->computePool, nullptr);
-    if (ctx->ofPool) vkDestroyCommandPool(d, ctx->ofPool, nullptr);
+    for (uint32_t i = 0; i < NvofgContext::kRing; ++i) {
+        if (ctx->computePools[i]) vkDestroyCommandPool(d, ctx->computePools[i], nullptr);
+        if (ctx->ofPools[i]) vkDestroyCommandPool(d, ctx->ofPools[i], nullptr);
+        ctx->computePools[i] = ctx->ofPools[i] = VK_NULL_HANDLE;
+        ctx->slotSignal[i] = 0;
+    }
+    ctx->frameIndex = 0;
     if (ctx->descPool) vkDestroyDescriptorPool(d, ctx->descPool, nullptr);
     for (Stage* s : {&ctx->prepStage, &ctx->refineStage, &ctx->warpStage, &ctx->debugStage, &ctx->hintStage}) {
         if (s->pipeline) vkDestroyPipeline(d, s->pipeline, nullptr);
@@ -551,71 +634,27 @@ NvofgResult nvofg_record_generate(NvofgContext* ctx, const NvofgGenerateInfo* in
     const uint32_t W = ctx->width, H = ctx->height;
     const uint32_t gx = (W + 7) / 8, gy = (H + 7) / 8;
 
-    // --- update descriptor sets (registered images are stable; single-shot M1) ---
-    auto writeImg = [&](VkDescriptorSet set, uint32_t b, VkDescriptorType t,
-                        VkImageView view, VkImageLayout layout, VkSampler samp) {
-        VkDescriptorImageInfo ii{samp, view, layout};
-        VkWriteDescriptorSet w{};
-        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w.dstSet = set; w.dstBinding = b; w.descriptorCount = 1; w.descriptorType = t;
-        w.pImageInfo = &ii;
-        vkUpdateDescriptorSets(ctx->device, 1, &w, 0, nullptr);
-    };
-    auto writeBuf = [&](VkDescriptorSet set, uint32_t b, VkBuffer buf, VkDeviceSize size) {
-        VkDescriptorBufferInfo bi{buf, 0, size};
-        VkWriteDescriptorSet w{};
-        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w.dstSet = set; w.dstBinding = b; w.descriptorCount = 1;
-        w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w.pBufferInfo = &bi;
-        vkUpdateDescriptorSets(ctx->device, 1, &w, 0, nullptr);
-    };
     const VkImageLayout G = VK_IMAGE_LAYOUT_GENERAL;
-    writeImg(ctx->prepPrevSet, 0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, ctx->prevColor.view, G, VK_NULL_HANDLE);
-    writeImg(ctx->prepPrevSet, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, ctx->lumaPrev.view, G, VK_NULL_HANDLE);
-    writeImg(ctx->prepCurrSet, 0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, ctx->currColor.view, G, VK_NULL_HANDLE);
-    writeImg(ctx->prepCurrSet, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, ctx->lumaCurr.view, G, VK_NULL_HANDLE);
-    VkBuffer bwdFlowBuf = ctx->bidir ? ctx->flowBwdBuf.buffer : ctx->flowBuf.buffer;  // placeholder if not bidir
-    VkDeviceSize bwdFlowSz = ctx->bidir ? ctx->flowBwdBuf.size : ctx->flowBuf.size;
-    writeBuf(ctx->refineSet, 0, ctx->flowBuf.buffer, ctx->flowBuf.size);
-    writeBuf(ctx->refineSet, 1, ctx->costBuf.buffer, ctx->costBuf.size);
-    writeBuf(ctx->refineSet, 2, bwdFlowBuf, bwdFlowSz);
-    writeImg(ctx->refineSet, 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, ctx->refinedFlow.view, G, VK_NULL_HANDLE);
-    writeImg(ctx->refineSet, 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, ctx->refinedFlowBwd.view, G, VK_NULL_HANDLE);
-    writeImg(ctx->refineSet, 5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, ctx->confidence.view, G, VK_NULL_HANDLE);
-    writeImg(ctx->refineSet, 6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, ctx->occlusion.view, G, VK_NULL_HANDLE);
-    writeImg(ctx->refineSet, 7, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
-             ctx->hasMotion ? ctx->motion.view : ctx->dummyRG16.view, G, VK_NULL_HANDLE);
-    writeImg(ctx->refineSet, 8, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
-             ctx->hasDepth ? ctx->depth.view : ctx->dummyR8.view, G, VK_NULL_HANDLE);
-    VkImageView bwdFlowView = ctx->bidir ? ctx->refinedFlowBwd.view : ctx->dummyRG16.view;
-    VkImageView occView     = ctx->bidir ? ctx->occlusion.view      : ctx->dummyR8.view;
-    VkImageView uiView       = ctx->hasUiMask   ? ctx->uiMask.view   : ctx->dummyR8.view;
-    VkImageView reactiveView = ctx->hasReactive ? ctx->reactive.view : ctx->dummyR8.view;
-    writeImg(ctx->warpSet, 0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, ctx->prevColor.view, G, VK_NULL_HANDLE);
-    writeImg(ctx->warpSet, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, ctx->currColor.view, G, VK_NULL_HANDLE);
-    writeImg(ctx->warpSet, 2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, ctx->refinedFlow.view, G, VK_NULL_HANDLE);
-    writeImg(ctx->warpSet, 3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, bwdFlowView, G, VK_NULL_HANDLE);
-    writeImg(ctx->warpSet, 4, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, ctx->confidence.view, G, VK_NULL_HANDLE);
-    writeImg(ctx->warpSet, 5, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, occView, G, VK_NULL_HANDLE);
-    writeImg(ctx->warpSet, 6, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, uiView, G, VK_NULL_HANDLE);
-    writeImg(ctx->warpSet, 7, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, reactiveView, G, VK_NULL_HANDLE);
-    { VkDescriptorImageInfo ii{ctx->linearSampler, VK_NULL_HANDLE, G};
-      VkWriteDescriptorSet w{}; w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-      w.dstSet = ctx->warpSet; w.dstBinding = 8; w.descriptorCount = 1;
-      w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER; w.pImageInfo = &ii;
-      vkUpdateDescriptorSets(ctx->device, 1, &w, 0, nullptr); }
-    writeImg(ctx->warpSet, 9, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, ctx->output.view, G, VK_NULL_HANDLE);
-    if (ctx->useHint) {
-        writeImg(ctx->hintSet, 0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, ctx->motion.view, G, VK_NULL_HANDLE);
-        writeBuf(ctx->hintSet, 1, ctx->hintBuf.buffer, ctx->hintBuf.size);
+
+    // Ring slot: wait for this slot's previous frame to finish on the GPU, then
+    // reset its command pools before recording. Descriptor sets are static
+    // (written in refreshDescriptors), so there is no per-frame update hazard.
+    const uint32_t slot = ctx->frameIndex % NvofgContext::kRing;
+    if (ctx->slotSignal[slot]) {
+        VkSemaphoreWaitInfo wi{};
+        wi.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+        wi.semaphoreCount = 1; wi.pSemaphores = &ctx->timeline; wi.pValues = &ctx->slotSignal[slot];
+        vkWaitSemaphores(ctx->device, &wi, UINT64_MAX);
     }
+    vkResetCommandPool(ctx->device, ctx->computePools[slot], 0);
+    vkResetCommandPool(ctx->device, ctx->ofPools[slot], 0);
 
     const uint64_t base = ctx->timelineValue;
     const uint64_t v1 = base + 1, v2 = base + 2, v3 = base + 3;
 
     // === Submit 1 (compute): prep luma from prev/curr color ===
     {
-        VkCommandBuffer cmd = beginCmd(ctx, ctx->computePool);
+        VkCommandBuffer cmd = beginCmd(ctx, ctx->computePools[slot]);
         imgBarrier(cmd, ctx->prevColor.image, info->prev_layout, G, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
         imgBarrier(cmd, ctx->currColor.image, info->curr_layout, G, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
         imgBarrier(cmd, ctx->lumaPrev.image, VK_IMAGE_LAYOUT_UNDEFINED, G, 0, VK_ACCESS_SHADER_WRITE_BIT);
@@ -652,7 +691,7 @@ NvofgResult nvofg_record_generate(NvofgContext* ctx, const NvofgGenerateInfo* in
 
     // === Submit 2 (optical flow): execute forward flow + cost ===
     {
-        VkCommandBuffer cmd = beginCmd(ctx, ctx->ofPool);
+        VkCommandBuffer cmd = beginCmd(ctx, ctx->ofPools[slot]);
         imgBarrier(cmd, ctx->flowImg.image, VK_IMAGE_LAYOUT_UNDEFINED, G, 0, VK_ACCESS_MEMORY_WRITE_BIT);
         imgBarrier(cmd, ctx->costImg.image, VK_IMAGE_LAYOUT_UNDEFINED, G, 0, VK_ACCESS_MEMORY_WRITE_BIT);
         if (ctx->bidir) {
@@ -670,7 +709,7 @@ NvofgResult nvofg_record_generate(NvofgContext* ctx, const NvofgGenerateInfo* in
 
     // === Submit 3 (compute): copy flow/cost -> buffers, refine, warp -> output ===
     {
-        VkCommandBuffer cmd = beginCmd(ctx, ctx->computePool);
+        VkCommandBuffer cmd = beginCmd(ctx, ctx->computePools[slot]);
         imgBarrier(cmd, ctx->flowImg.image, G, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
         imgBarrier(cmd, ctx->costImg.image, G, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
         VkBufferImageCopy fc{}; fc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -723,11 +762,6 @@ NvofgResult nvofg_record_generate(NvofgContext* ctx, const NvofgGenerateInfo* in
 
         // Optional debug visualisation into an app-provided target.
         if (ctx->debugView != NVOFG_DEBUG_NONE && ctx->haveDebugTarget) {
-            writeImg(ctx->debugSet, 0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, ctx->refinedFlow.view, G, VK_NULL_HANDLE);
-            writeImg(ctx->debugSet, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, ctx->refinedFlowBwd.view, G, VK_NULL_HANDLE);
-            writeImg(ctx->debugSet, 2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, ctx->confidence.view, G, VK_NULL_HANDLE);
-            writeImg(ctx->debugSet, 3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, ctx->occlusion.view, G, VK_NULL_HANDLE);
-            writeImg(ctx->debugSet, 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, ctx->debugTarget.view, G, VK_NULL_HANDLE);
             imgBarrier(cmd, ctx->debugTarget.image, VK_IMAGE_LAYOUT_UNDEFINED, G, 0, VK_ACCESS_SHADER_WRITE_BIT);
             struct DbgPush { uint32_t width, height, mode; } dp{W, H, (uint32_t)ctx->debugView};
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->debugStage.pipeline);
@@ -738,6 +772,8 @@ NvofgResult nvofg_record_generate(NvofgContext* ctx, const NvofgGenerateInfo* in
         submitTimeline(ctx->queue, cmd, ctx->timeline, v2, ctx->timeline, v3);
     }
 
+    ctx->slotSignal[slot] = v3;
+    ctx->frameIndex++;
     ctx->timelineValue = v3;
     out_sync->semaphore = ctx->timeline;
     out_sync->value = v3;

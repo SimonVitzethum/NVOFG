@@ -125,7 +125,12 @@ struct NvofgContext {
     VkDescriptorPool descPool = VK_NULL_HANDLE;
     VkDescriptorSet  prepPrevSet = VK_NULL_HANDLE, prepCurrSet = VK_NULL_HANDLE;
     VkDescriptorSet  refineSet = VK_NULL_HANDLE, warpSet = VK_NULL_HANDLE;
-    VkCommandPool    computePool = VK_NULL_HANDLE, ofPool = VK_NULL_HANDLE;
+    // Per-frame command-buffer ring (bounds resources; avoids reuse-in-flight).
+    static constexpr uint32_t kRing = 2;
+    VkCommandPool computePools[kRing] = {};
+    VkCommandPool ofPools[kRing] = {};
+    uint64_t      slotSignal[kRing] = {};   // timeline value each slot last signalled
+    uint32_t      frameIndex = 0;
     bool pipelineReady = false;
 
     // --- diagnostics ---
@@ -140,4 +145,7 @@ namespace nvofg {
 // output are registered. Idempotent. Tears everything down on destroy.
 NvofgResult ensurePipeline(NvofgContext* ctx);
 void        destroyPipeline(NvofgContext* ctx);
+// (Re)write the (static) descriptor sets from the currently registered images.
+// Call after (re)registration or a debug-view change, with the device idle.
+void        refreshDescriptors(NvofgContext* ctx);
 }  // namespace nvofg

@@ -215,6 +215,11 @@ NvofgResult nvofg_set_debug_view(NvofgContext* ctx, NvofgDebugView view,
     } else {
         ctx->haveDebugTarget = false;
     }
+    // Rebind the (static) debug descriptors if the pipeline already exists.
+    if (ctx->pipelineReady && ctx->haveDebugTarget) {
+        vkDeviceWaitIdle(ctx->device);
+        nvofg::refreshDescriptors(ctx);
+    }
     return NVOFG_OK;
 }
 
