@@ -29,3 +29,7 @@ Cargo.lock
 *.png.actual
 flow_*.png
 !docs/**/*.png
+
+# debug flow dumps
+*.ppm
+flow.png

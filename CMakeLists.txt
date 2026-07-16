@@ -24,4 +24,8 @@ add_executable(nvofg_probe src/spike/probe.cpp)
 target_include_directories(nvofg_probe PRIVATE include)
 target_link_libraries(nvofg_probe PRIVATE Vulkan::Vulkan nvofg_warnings)
 
+# M0 (full): run one hardware optical-flow execute and dump the flow field.
+add_executable(nvofg_flow_dump src/spike/flow_dump.cpp)
+target_link_libraries(nvofg_flow_dump PRIVATE Vulkan::Vulkan nvofg_warnings)
+
 # The library and Rust crates are wired in as milestones land (M1+).
