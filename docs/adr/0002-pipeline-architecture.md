@@ -146,18 +146,20 @@ Implemented and validation-clean (see `examples/headless_interp.cpp`):
 - **Debug views** — flow / confidence / occlusion / disocclusion via
   `nvofg_set_debug_view`.
 
-Deliberately deferred (documented so they are additive, not rework):
-- **OFA motion-vector *hint* pre-pass.** `hintSupported=1`, so app MVs could also be
-  fed as a hardware hint (`ENABLE_HINT`) to steer the OFA search — the ADR's "fuse in
-  two places" ideal. M2 implements the refine-side (post) fusion, which is the core of
-  req #3; the hint pre-pass is a future enhancement behind the same `NVOFG_FLAG_USE_MOTION`.
-- **Full reprojection-based disocclusion.** M2 uses a depth-edge heuristic; using
-  `reproj` + prev/curr depth to positively classify disoccluded pixels and pick the
-  visible source side is the next step.
-- **Per-frame descriptor ring.** M2 updates the fixed descriptor sets each call
-  (correct for the single-shot/serialized path); a real per-frame ring lands with M3
-  resize/lifetime work.
-- **Material IDs** (req #5) — registered/plumbed, not yet used for special-casing.
+Post-M2 follow-ups — now all implemented (were deferred at M2 close):
+- **OFA motion-vector *hint* pre-pass** — done: `hint.slang` encodes app MVs into the
+  S10.5 hint grid; session `ENABLE_HINT`; measurable win (MAE 1.57→0.96 with correct MVs).
+- **Reprojection-based disocclusion** — done: refine uses `reproj` + depth to compute a
+  static-scene geometric flow and flags dynamic/disoccluded pixels where the OFA flow
+  disagrees, combined with the depth-edge signal.
+- **Per-frame command ring + static descriptor sets** — done: a 2-slot command-pool ring
+  (host-wait the slot's prior timeline value, reset, record) plus write-once descriptor
+  sets in `refreshDescriptors`. Removes the cmd-buffer leak and the update-in-flight hazard.
+- **Material IDs (req #5)** — done: plumbed to warp; material discontinuities lower
+  effective confidence so the interpolator does not blend across object boundaries.
+
+Still open (future): a real per-frame *input ring* (double-buffered aux), OFA ROI
+optimisation, and the Tier-B shader-flow fallback.
 
 ## Consequences
 - The pluggable boundary keeps the core Vulkan-only and portable while allowing NVIDIA-
