@@ -17,14 +17,15 @@ import common;
 [[vk::image_format("r8")]]
 [[vk::binding(6, 0)]] RWTexture2D<float>  gOcclusion;
 [[vk::binding(7, 0)]] Texture2D<float2>   gMotion;    // app motion vectors, px (prev->curr)
+[[vk::binding(8, 0)]] Texture2D<float>    gDepth;     // curr depth (linear or device)
 
 struct Push {
-    uint  width, height, gridW, gridH, gridSize, flags;   // bit0 cost,1 bidir,2 motion
+    uint  width, height, gridW, gridH, gridSize, flags;   // bit0 cost,1 bidir,2 motion,3 depth
     float sigma;
 };
 [[vk::push_constant]] Push pc;
 
-static const uint FLAG_COST = 1u, FLAG_BIDIR = 2u, FLAG_MOTION = 4u;
+static const uint FLAG_COST = 1u, FLAG_BIDIR = 2u, FLAG_MOTION = 4u, FLAG_DEPTH = 8u;
 
 int2 clampCell(int2 c) { return clamp(c, int2(0, 0), int2(int(pc.gridW) - 1, int(pc.gridH) - 1)); }
 
@@ -88,6 +89,19 @@ void main(uint3 tid : SV_DispatchThreadID) {
         float norm = max(length(Ffwd), 1.0);
         occ = saturate(residual / (0.5 * norm + 2.0));       // relative threshold
         conf *= (1.0 - 0.5 * occ);                           // occlusion lowers confidence
+    }
+    // Depth disocclusion (req.#4): strong depth discontinuities mark object
+    // silhouettes, where newly-revealed background disoccludes — raise occlusion so
+    // the warp fills from the non-occluded side instead of blending across the edge.
+    if (pc.flags & FLAG_DEPTH) {
+        float dC = gDepth[p];
+        float dR = gDepth[int2(min(p.x + 1, int(pc.width) - 1), p.y)];
+        float dL = gDepth[int2(max(p.x - 1, 0), p.y)];
+        float dD = gDepth[int2(p.x, min(p.y + 1, int(pc.height) - 1))];
+        float dU = gDepth[int2(p.x, max(p.y - 1, 0))];
+        float grad = abs(dR - dL) + abs(dD - dU);
+        float edge = saturate(grad / (abs(dC) * 0.1 + 1e-3));  // relative depth step
+        occ = max(occ, edge);
     }
     gRefinedBwd[p] = Fbwd;
     gConfidence[p] = conf;
