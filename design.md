@@ -519,3 +519,213 @@ and boundaries clean enough to be reused; and let a **separate** native-Linux co
 project (if it ever materializes) adopt nvofg as its FG backend. That maximizes both the
 near-term value (a great FG that actually ships) and the long-term option value (a clean
 seam to build the umbrella later) with **no** risk to current users.
+
+---
+
+## 14. Linux-first mandate
+
+The primary target is **native Linux Vulkan**, and the architecture is designed
+Linux-first, not Windows-first. Concretely this means, as standing constraints on every
+future decision:
+
+- **No platform assumption beyond a Vulkan 1.3 loader + a POSIX-ish host.** No Win32,
+  no D3D, no PE bridges, no Wine/Proton in any code path.
+- **Vulkan is the substrate.** Interop with other APIs (CUDA, §13/ADR 0004) is optional,
+  internal, and imported *into* Vulkan (external memory/semaphore fd) — never a Windows
+  handle type, never a requirement.
+- **Windows is a possible *consequence*, never a driver of design.** If a feature falls
+  out naturally cross-platform, fine; but Linux support is never traded for it.
+
+This is already how nvofg is built (ADR 0001: `VK_NV_optical_flow`, no dlopen of Windows
+DLLs; interop via `OPAQUE_FD`, ADR 0004). §14 records it as an explicit, permanent
+principle so later modules can't quietly regress it.
+
+## 15. Extensibility guardrails for a future modular framework
+
+§13 recommends nvofg stay a focused FG library and that any "RenderFX" umbrella be a
+**separate** project composing it. This section makes that seam concrete: the small,
+zero-cost things to get right *now* so the umbrella is possible **without API breaks**,
+and — critically — the parts of the proposed design that are **wrong as stated** and
+should be replaced with something objectively better.
+
+### 15.1 Shared Frame Context — adopt as an *input vocabulary*, not a subsystem
+The proposal (one `FrameContext` holding color/depth/MVs/material/reactive/exposure/
+jitter/reproj, later roughness/albedo/normals/GBuffer; produced once, reused by every
+technique) is **sound and worth designing toward** — it is precisely what Streamline and
+the FidelityFX SDK do, and it removes the duplicate-plumbing tax when a second technique
+appears. But two critical caveats:
+
+- **The Core must not *own* or *produce* these resources — the renderer does.** The
+  framework only needs a stable *description* of them. nvofg's public inputs
+  (`NvofgImageDesc`, `NvofgAuxDesc`, `reproj`, near/far) are already a subset of this
+  vocabulary. The guardrail is to keep those structs a clean, minimal, FG-agnostic
+  *view* onto app resources — which they already are.
+- **ABI extensibility is the real requirement.** "Add roughness/albedo/normals later
+  without breaking users" is an ABI-versioning problem, not a grand-design problem. The
+  concrete mechanism: give the input structs a **Vulkan-style extensibility contract** —
+  a `sType`/`pNext` chain *or* a leading `struct_size`/`version` field — so new fields
+  append without changing existing layouts, plus a **capabilities query** so callers
+  discover what a given build/GPU consumes. This is the single most important thing to do
+  now; it costs nothing and is the actual guarantee of "no future API breaks."
+
+**Verdict:** adopt the Frame Context as a versioned, renderer-owned input vocabulary that
+nvofg's inputs already prefigure. Do **not** build a resource manager for it now.
+
+### 15.2 Render graph — reject the framework-owned graph; adopt a *stage-ordering contract*
+This is where the proposal is **objectively wrong as stated**, and a better architecture
+exists. A framework that owns a render graph (resource lifetime, barrier scheduling,
+aliasing, execution) is a large engine subsystem — and **real engines already have one**
+(RustMineClient has `render_graph.rs`). Two render graphs fighting over the same command
+buffers is a recipe for redundant barriers, ownership conflicts, and exactly the
+present/sync fragility §9 warns about.
+
+The industry-proven answer is **Streamline's model, not FidelityFX's framework**: the
+composition layer owns **no** graph. It defines only:
+1. a **logical stage order** — `Renderer → FrameContext → Upscaling → RayReconstruction →
+   FrameGeneration → Present` — as a *contract*, and
+2. **stage plugins** that record into command buffers the **engine's** graph schedules.
+
+So "each stage selects a backend" is right; "the framework is a render graph" is wrong.
+The framework is a **set of composable stage modules + an ordering contract**; the engine
+remains the scheduler. This is strictly better on maintainability (no duplicate graph),
+integration (drops into any engine's existing graph), and the §9 safety mandate (the
+framework never owns queue submission it can DEVICE_LOST on). nvofg already embodies this:
+it records into the app's command buffers and only owns its isolated OFA submit.
+
+**Verdict:** logical stage order + pluggable per-stage backends: **yes.** A framework that
+executes a render graph: **no.** Adopt the Streamline-style thin-layer model.
+
+### 15.3 Algorithm ⟂ Execution Backend — adopt, with a caveat about the sparse matrix
+Separating the *algorithm* (Warp / CNN / Transformer) from the *execution backend*
+(Vulkan Compute / CUDA / TensorRT / CPU) is a genuinely good orthogonal-axis design and is
+**already latent** in the codebase: ADR 0002 §8's `Interpolator` interface is the
+algorithm axis; ADR 0004's optional CUDA path is a backend axis. Refinements:
+
+- **The matrix is sparse, not full.** "Warp on TensorRT" is meaningless — Warp is not a
+  network. The backend axis is meaningful only for the **learned** algorithms (CNN /
+  Transformer), which can run on Vulkan-cooperative-matrix, CUDA, or TensorRT. Classical
+  Warp is Vulkan-compute by nature. So the interface is: *algorithm* is the public
+  selector; *backend* is an implementation detail of a learned algorithm, chosen by
+  build/runtime capability — not an independent public knob for every algorithm.
+- **A CPU backend is worth it — as a golden reference.** A slow, exact CPU implementation
+  of each learned algorithm is invaluable for deterministic tests and debugging
+  (compare GPU output against it), which fits nvofg's "test everything" mandate. This is
+  the strongest reason to keep the backend axis explicit.
+
+**Verdict:** adopt the split for learned interpolators; keep it an implementation detail
+behind the algorithm interface, not a full public matrix; add a CPU reference backend for
+tests.
+
+### 15.4 Hardware-independent public API — already the principle; reaffirm
+The public API must never expose CUDA / NGX / OFA specifics; backend selection is
+internal. This is **already the design**: ADR 0001 keeps the core Vulkan-only; the Tier
+A (OFA) / Tier B (shader) ladder is exactly the "VK_NV_optical_flow → future AMD → future
+Intel → shader fallback" abstraction the proposal asks for, already implemented and
+selected internally (`NVOFG_FLAG_FORCE_SHADER_FLOW` + auto-fallback). ADR 0004 keeps CUDA
+optional and behind the interpolator boundary. The guardrail: **never let a vendor type
+leak into `nvofg.h`** (no `cudaX`, no `NVSDK_NGX_*`, no `NvOF*` in the public header —
+already true). Reaffirmed as permanent.
+
+## 16. DLSS / DLAA / Ray Reconstruction on native Linux — Option A vs B
+
+The request asks whether DLSS-class techniques should use **(A)** NVIDIA's official Linux
+interfaces (NGX) or **(B)** the "unified RenderFX" approach of driving underlying native
+capabilities directly, the way nvofg drives the OFA for frame generation. This needs a
+rigorous answer because it rests on a technical asymmetry the framing hides.
+
+### 16.1 The decisive asymmetry: reusable hardware block vs. proprietary model
+nvofg can bypass DLSS Frame Generation because FG decomposes into **(i) a general-purpose
+hardware block** (the OFA, a standalone optical-flow engine usable via a standard Vulkan
+extension) **plus (ii) a viable non-proprietary algorithm** (classical warp; a learned
+one later). The *value* of DLSS-G is partly a trained network, but a *usable, lower-tier*
+FG exists **without** it.
+
+**DLSS Super Resolution, DLAA, and Ray Reconstruction have no such decomposition.** Their
+value **is** the trained neural network. There is no "underlying native upscaling block"
+analogous to the OFA — the only underlying capability is the **Tensor Cores**, which are
+just matrix-multiply units. Running them buys you nothing unless you already possess a
+trained SR/denoiser model. Therefore "Option B for DLSS SR/RR" reduces to **"train your
+own DLSS,"** which is an enormous ML research program, would not match DLSS quality, and —
+if it meant extracting or reusing NVIDIA's weights — is legally untenable. Option B, as a
+*native reimplementation of DLSS*, **collapses** for SR/DLAA/RR. It only ever worked for
+FG, and that case is already built.
+
+### 16.2 What is actually available natively
+- **DLSS SR / DLAA / RR via NGX** *are* reachable on Linux — the driver ships the NGX
+  runtime and the feature `.so` snippets; the app links the NGX app-side lib (RMC already
+  does this). This is **Option A, and it works on Linux today.**
+- **DLSS Frame Generation** is the Windows-gated one (`nvngx_dlssg.dll` PE) — the gap
+  nvofg fills.
+- **Open, vendor-neutral models** — FSR (fully open), XeSS (Intel, open-ish) — are the
+  only "native, non-proprietary-model" upscalers/AA that actually exist. They are the
+  legitimate Option-B-*spirit* backends: vendor-neutral, no NVIDIA dependency — but they
+  are *other vendors' models*, not a native reimplementation of DLSS.
+
+### 16.3 Axis-by-axis
+| Axis | A: NGX (NVIDIA official) | B: "native reimplementation of DLSS" | Open backends (FSR/XeSS) |
+|---|---|---|---|
+| Image quality (SR/RR) | **best** (the real model) | far worse (your model) | between |
+| Maintainability | low (NVIDIA maintains the model) | **very high** (own a model) | moderate |
+| Performance/latency | optimized | unknown, likely worse | good |
+| Linux-first | works (NGX on Linux) | native but hollow | fully native/open |
+| Architectural cleanliness | clean *behind a stage interface* | n/a | clean behind same interface |
+| Portability | NVIDIA-only | NVIDIA-only (Tensor Cores) | **cross-vendor** |
+| Future-proofing | tracks NVIDIA | fragile | good |
+| Future-driver compat | **best** (official) | fragile / RE-risk | n/a |
+| Complexity | moderate | **highest** | moderate |
+| Licensing/legal | clean (NGX SDK license; blobs from driver) | **untenable** if it reuses NVIDIA weights | clean (open) |
+
+### 16.4 Recommendation — hybrid, and it is *not* an A-vs-B choice
+The correct architecture **unifies the interface, not the implementation strategy**:
+
+1. **Unify at the stage level** (§15.2): `Upscaling` and `RayReconstruction` are stages
+   with pluggable backends, consuming the shared Frame Context.
+2. **Per stage, offer multiple backends:**
+   - **NGX (Option A)** as the *NVIDIA* backend for SR/DLAA/RR — the only path to DLSS
+     quality, official, legal, Linux-supported.
+   - **Open models (FSR/XeSS) + a built-in temporal** as the *vendor-neutral* backends —
+     this is the RenderFX philosophy done correctly (pluggable, portable) **without**
+     pretending to reimplement DLSS.
+   - **native-HW-direct (Option B *spirit*)** *only where the FG asymmetry holds* — i.e.
+     **frame generation** (OFA + warp = nvofg), already built.
+3. **Do not attempt to natively reimplement DLSS SR/RR.** It is the one part of B that is
+   infeasible and legally fraught; the asymmetry (§16.1) is why.
+
+This hybrid is objectively superior to a pure A or a pure B: it delivers DLSS quality
+where only NVIDIA can (via official NGX), vendor neutrality via open backends, and the
+unique native FG nvofg already provides — all behind **one** stage interface. It is also
+Linux-first (every backend runs natively) and future-proof: **if NVIDIA ever ships native
+Linux DLSS-G, it is simply another `FrameGeneration` backend** next to nvofg, and any
+future RR is another `RayReconstruction` backend — no API change, which is the stated
+goal. That drop-in property is the entire payoff of §15.2's stage design.
+
+### 16.5 Ray Reconstruction as a first-class stage — reserve, don't build
+Making RR a first-class stage (inputs: MVs, depth, roughness, diffuse/specular albedo,
+normals — all in the Frame Context) is architecturally right: **reserve the stage and the
+Frame-Context fields.** But be honest that a *non-DLSS* RR is a large neural-denoiser
+research effort with the same model-vs-hardware asymmetry as §16.1 — so in practice the RR
+stage's only near-term real backend is **NGX RR (Option A)**, with open/none as the other
+slots. Reserving the stage costs nothing and avoids a future API break; implying a native
+RR is near would be dishonest.
+
+## 17. Net verdict on the long-term vision
+
+- **Linux-first, hardware-independent public API, shared input vocabulary, pluggable
+  per-stage backends, algorithm⟂backend split** — all **sound**, mostly **already latent**
+  in nvofg, and worth *preparing for now* via cheap guardrails (ABI-versioned input
+  structs + capability queries; keep vendor types out of the public header; a CPU
+  reference backend for tests).
+- **A framework-owned render graph** — **rejected** in favour of a Streamline-style
+  stage-ordering contract with engine-owned scheduling (§15.2). Objectively better on
+  maintainability, integration, and safety.
+- **"Option B: reimplement DLSS natively"** — **rejected** for SR/DLAA/RR due to the
+  hardware-block-vs-model asymmetry (§16.1); the hybrid (NGX + open backends + native FG,
+  one interface) is objectively superior.
+- **Where it lives** — still **a separate RenderFX project** that composes nvofg as its FG
+  backend (§13). nvofg stays a focused, shippable FG library; the framework is the thin
+  composition layer.
+
+None of the above changes the current implementation. The only *actionable now, zero-risk*
+items are the ABI-extensibility guardrails in §15.1/§15.4 — and even those can wait until
+the first real second consumer exists, since the public structs are already clean subsets
+of the Frame Context vocabulary.
