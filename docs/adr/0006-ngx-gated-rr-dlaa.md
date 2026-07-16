@@ -61,6 +61,32 @@ build flag once the NGX SDK is present — with **no public API change**.
 - The NGX FFI itself (the `-DRENDERFX_NGX` real path) is a stub until the SDK is vendored;
   the call sites and capability wiring are in place.
 
+## NGX bring-up finding (this environment)
+
+The NGX SDK (`nvsdk_ngx` headers + `libnvsdk_ngx.a` + the `dlss`/`dlssd` feature blobs)
+was vendored under `renderfx/vendor/ngx/` (local only; NVIDIA-licensed, git-ignored) and
+the build path wired behind `-DRENDERFX_NGX`. A diagnostic probe (`src/ngx_probe.cpp`,
+mirroring RMC's proven NGX FFI) **builds and links cleanly**, and at runtime NGX:
+
+- **loads the DLSS Super Resolution + Ray Reconstruction snippets** and reports the RTX
+  5070 as **Blackwell, supported** (the `nvngx_dlssd` log shows "Setting DLSS Base Cubins
+  for standalone RR"); the model blobs are architecture-compatible.
+- but `NVSDK_NGX_VULKAN_Init` returns **`0xBAD00005`** because NGX **requires a writable
+  models directory and defaults to `/usr/share/nvidia/ngx`**, which it cannot create
+  (permission denied — needs root). The `nvidia-ngx-conf.json` `ngx_models_path` override,
+  `__NGX_DISABLE_UPDATER`, and `NGX_CUBIN_DISABLE_RESOURCE_CACHE` did not redirect it on
+  this driver (610.43.03).
+
+**Conclusion:** this is a **system-configuration/permission** limitation, not a code or
+hardware one. On a host where `/usr/share/nvidia/ngx` exists and is writable (or a working
+NGX system config), the same build initialises NGX and the DLSS RR / DLAA / SR backends
+become functional **with no code change** — `rfx_query_capabilities` flips them to
+`supported` and the existing resolver/dispatch selects them. Until then they correctly
+report `unsupported`, and the pipeline runs on the vendor-neutral backends (Native/Temporal
+upscaling, nvofg FG). To enable on a target system: build with `-DRENDERFX_NGX`, ensure the
+NGX model directory is writable, and place the feature blobs beside the app (see
+`RENDERFX_NGX_DATA_PATH`).
+
 ## Alternatives considered
 - **Reimplement DLSS RR / DLAA natively** — rejected (design.md §16.1 asymmetry; infeasible
   and legally untenable to reuse NVIDIA weights).

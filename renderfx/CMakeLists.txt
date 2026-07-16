@@ -28,7 +28,32 @@ target_include_directories(renderfx
 target_link_libraries(renderfx PUBLIC Vulkan::Vulkan PRIVATE nvofg)
 set_target_properties(renderfx PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION 0)
 
+# -------------------------------------------------------------------------------
+# Optional official NVIDIA NGX backend (DLSS SR / DLAA / Ray Reconstruction).
+# design.md §16 / ADR 0006: use NGX where available; unsupported otherwise. Needs the
+# vendored SDK under vendor/ngx (headers + libnvsdk_ngx.a + rel/ feature blobs).
+# -------------------------------------------------------------------------------
+option(RENDERFX_NGX "Build the official NVIDIA NGX backend (DLSS SR/DLAA/RR)" OFF)
+set(RFX_NGX_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/ngx")
+set(RFX_NGX_LIB "${RFX_NGX_DIR}/lib/Linux_x86_64/libnvsdk_ngx.a")
+if(RENDERFX_NGX AND EXISTS "${RFX_NGX_LIB}")
+  message(STATUS "renderfx: NGX backend enabled (${RFX_NGX_LIB})")
+  target_include_directories(renderfx PRIVATE ${RFX_NGX_DIR}/include)
+  target_compile_definitions(renderfx PRIVATE RENDERFX_NGX
+    RENDERFX_NGX_DATA_PATH="${RFX_NGX_DIR}/lib/Linux_x86_64/rel")
+  target_link_libraries(renderfx PRIVATE ${RFX_NGX_LIB} stdc++ dl)
+elseif(RENDERFX_NGX)
+  message(WARNING "renderfx: RENDERFX_NGX set but ${RFX_NGX_LIB} not found; NGX disabled")
+endif()
+
 if(NOT NVOFG_LIBRARY_ONLY)
+  if(RENDERFX_NGX AND EXISTS "${RFX_NGX_LIB}")
+    add_executable(renderfx_ngx_probe src/ngx_probe.cpp)
+    target_compile_definitions(renderfx_ngx_probe PRIVATE
+      RENDERFX_NGX_DATA_PATH="${RFX_NGX_DIR}/lib/Linux_x86_64/rel")
+    target_link_libraries(renderfx_ngx_probe PRIVATE Vulkan::Vulkan ${RFX_NGX_LIB} stdc++ dl)
+  endif()
+
   add_executable(renderfx_test_resolve tests/test_resolve.cpp)
   target_link_libraries(renderfx_test_resolve PRIVATE renderfx)
   add_test(NAME renderfx_resolve COMMAND renderfx_test_resolve)

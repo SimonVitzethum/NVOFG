@@ -36,3 +36,9 @@ flow.png
 
 # CUDA build dir
 /build-cuda/
+
+# vendored NGX SDK (binaries kept out of git; license + headers only)
+
+# vendored NVIDIA NGX SDK (local only; NVIDIA-licensed, not redistributed)
+renderfx/vendor/ngx/
+/build-ngx/
