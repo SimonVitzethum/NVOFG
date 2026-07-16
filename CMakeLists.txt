@@ -28,4 +28,36 @@ target_link_libraries(nvofg_probe PRIVATE Vulkan::Vulkan nvofg_warnings)
 add_executable(nvofg_flow_dump src/spike/flow_dump.cpp)
 target_link_libraries(nvofg_flow_dump PRIVATE Vulkan::Vulkan nvofg_warnings)
 
-# The library and Rust crates are wired in as milestones land (M1+).
+# ---------------------------------------------------------------------------
+# libnvofg — the frame-generation library (C ABI in include/nvofg.h).
+# ---------------------------------------------------------------------------
+include(cmake/Shaders.cmake)
+
+set(NVOFG_SHADER_HEADERS "")
+nvofg_add_shader(NVOFG_SHADER_HEADERS SOURCE ${CMAKE_SOURCE_DIR}/src/shaders/prep.slang
+                 ENTRY main SYMBOL nvofg_spv_prep)
+nvofg_add_shader(NVOFG_SHADER_HEADERS SOURCE ${CMAKE_SOURCE_DIR}/src/shaders/refine.slang
+                 ENTRY main SYMBOL nvofg_spv_refine)
+nvofg_add_shader(NVOFG_SHADER_HEADERS SOURCE ${CMAKE_SOURCE_DIR}/src/shaders/warp.slang
+                 ENTRY main SYMBOL nvofg_spv_warp)
+add_custom_target(nvofg_shaders DEPENDS ${NVOFG_SHADER_HEADERS})
+
+add_library(nvofg
+  src/context.cpp
+  src/pipeline.cpp)
+add_dependencies(nvofg nvofg_shaders)
+target_include_directories(nvofg
+  PUBLIC  include
+  PRIVATE src ${NVOFG_SHADER_GEN_DIR})
+target_link_libraries(nvofg PUBLIC Vulkan::Vulkan PRIVATE nvofg_warnings)
+set_target_properties(nvofg PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION 0)
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+enable_testing()
+add_executable(nvofg_test_lifecycle tests/test_lifecycle.cpp)
+target_link_libraries(nvofg_test_lifecycle PRIVATE nvofg Vulkan::Vulkan)
+add_test(NAME lifecycle COMMAND nvofg_test_lifecycle)
+
+# The Rust crates (nvofg-sys, nvofg) are wired in at M3.
