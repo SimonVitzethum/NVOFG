@@ -73,7 +73,8 @@ constexpr uint32_t kTableCount = sizeof(kTable) / sizeof(kTable[0]);
 
 namespace renderfx {
 
-void buildCapabilities(bool nvofgOfa, bool nvofgShader, RfxCapabilities* out) {
+void buildCapabilities(bool nvofgOfa, bool nvofgShader, RfxCapabilities* out,
+                       bool ngxSr, bool ngxRr, bool fsr, bool xess) {
     std::memset(out, 0, sizeof(*out));
     out->api_version = RFX_API_VERSION;
     out->capability_schema_version = RFX_CAPABILITY_SCHEMA_VERSION;
@@ -86,6 +87,18 @@ void buildCapabilities(bool nvofgOfa, bool nvofgShader, RfxCapabilities* out) {
             case RFX_BACKEND_NVOFG:     b.supported = nvofgOfa ? 1 : 0;
                                         if (!nvofgOfa) b.note = "no OFA on this device"; break;
             case RFX_BACKEND_SHADER_FG: b.supported = nvofgShader ? 1 : 0; break;
+            // Official NGX (design §16): available only where NGX initialised + the model
+            // is present. DLSS_SR + DLAA share the SuperSampling feature; RR is DLSS-D.
+            case RFX_BACKEND_DLSS_SR:   b.supported = ngxSr ? 1 : 0;
+                                        if (!ngxSr) b.note = "NGX/DLSS unavailable"; break;
+            case RFX_BACKEND_DLAA:      b.supported = ngxSr ? 1 : 0;
+                                        if (!ngxSr) b.note = "NGX/DLSS unavailable"; break;
+            case RFX_BACKEND_DLSS_RR:   b.supported = ngxRr ? 1 : 0;
+                                        if (!ngxRr) b.note = "NGX/DLSS-RR unavailable"; break;
+            // Portable FSR (our own EASU/RCAS compute) runs on any Vulkan GPU.
+            case RFX_BACKEND_FSR:       b.supported = fsr ? 1 : 0; break;
+            case RFX_BACKEND_XESS:      b.supported = xess ? 1 : 0;
+                                        if (!xess) b.note = "XeSS runtime unavailable"; break;
             default:                    b.supported = 0;   // reserved (needs SDK)
         }
     }

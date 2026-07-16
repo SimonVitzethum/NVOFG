@@ -5,7 +5,8 @@
 #include <cstdio>
 #include <cstring>
 
-namespace renderfx { void buildCapabilities(bool, bool, RfxCapabilities*); }
+namespace renderfx { void buildCapabilities(bool, bool, RfxCapabilities*,
+                                            bool = false, bool = false, bool = false, bool = false); }
 
 #define REQUIRE(c, m)                                                            \
     do { if (!(c)) { std::fprintf(stderr, "FAIL: %s\n", m); return 1; }          \

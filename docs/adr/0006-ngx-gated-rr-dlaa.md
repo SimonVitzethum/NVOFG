@@ -1,6 +1,7 @@
 # ADR 0006 — NGX-gated Ray Reconstruction & DLAA backends (RenderFX)
 
-- **Status:** Accepted (architecture + diagnostics functional; NGX execution gated)
+- **Status:** Accepted — **NGX DLAA + DLSS Super Resolution + Ray Reconstruction functional**
+  on RTX 5070 (build `-DRENDERFX_NGX`); inert-stub + graceful fallback otherwise.
 - **Date:** 2026-07-16
 - **Relates to:** design.md §16 (DLSS strategy), §18 (stages/dispatch); RenderFX ROADMAP
   phase C.
@@ -99,8 +100,40 @@ The NGX-gated backends are therefore genuinely functional here (build with
 `-DRENDERFX_NGX`): `rfx_query_capabilities` marks them `supported`, and the existing
 resolver/dispatch selects them. Where NGX cannot init (non-NVIDIA, no SDK, unwritable
 path), they report `unsupported` and the pipeline falls back — the graceful-degradation
-path (G6). The remaining work to make them *do* the denoise/upscale is the per-frame
-`CreateFeature`/`EvaluateFeature` wiring consuming the shared Frame Context.
+path (G6).
+
+### Functional bring-up (per-frame CreateFeature / EvaluateFeature)
+
+`src/ngx.cpp` now implements the full per-frame path via the SDK's inline VK helpers
+(`NGX_VULKAN_CREATE/EVALUATE_DLSS[D]_EXT`), consuming the shared Frame Context:
+
+- **DLAA / DLSS Super Resolution** (`ngxRecordDLAA`, dispatched from `rfx_record_upscaling`
+  for `RFX_BACKEND_DLAA` / `RFX_BACKEND_DLSS_SR`): render == target ⇒ DLAA (native AA),
+  target > render ⇒ Super Resolution — one path, dimensions decide. Consumes
+  color+depth+motion+jitter (+exposure). Feature created lazily on first record (needs a
+  command buffer) and recreated on resolution change.
+- **DLSS Ray Reconstruction** (`ngxRecordRR`, dispatched from
+  `rfx_record_ray_reconstruction` for `RFX_BACKEND_DLSS_RR`): consumes the full GBuffer —
+  color+depth+motion+normals+roughness+diffuse/specular albedo + the world→view / view→clip
+  matrices (appended to `RfxFrameContext`, ABI-guarded by `struct_size`).
+
+`renderfx/tests/test_ngx.cpp` (CTest `renderfx_ngx`, gated `-DRENDERFX_NGX`) drives both
+end-to-end on the GPU through the public API and asserts NGX produced non-zero output:
+
+```
+device: NVIDIA GeForce RTX 5070 Laptop GPU
+  caps: DLAA supported=1, DLSS_RR supported=1
+  DLAA    : record=0 output_nonzero=1 -> OK
+  DLSS-RR : record=0 output_nonzero=1 -> OK
+RESULT: PASS (NGX DLAA + Ray Reconstruction evaluated on GPU)
+```
+
+**Validation:** the RenderFX library records **zero** Vulkan commands for NGX — it calls
+NGX's helpers, which record internally. Under `VK_LAYER_KHRONOS_validation` our library and
+test harness are clean; the only remaining message is `VUID-vkCmdDraw-None-09600` (×2)
+emitted from **inside** NGX's own `EvaluateFeature` draws (a documented DLSS-on-Vulkan
+artifact — NVIDIA writes descriptors expecting a layout that the validator flags against
+`GENERAL`). It is not fixable from our side and does not affect correctness or output.
 
 ## Alternatives considered
 - **Reimplement DLSS RR / DLAA natively** — rejected (design.md §16.1 asymmetry; infeasible

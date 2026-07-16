@@ -20,7 +20,8 @@ add_library(renderfx
   src/resolve.cpp
   src/context.cpp
   src/upscale.cpp
-  src/rr_debug.cpp)
+  src/rr_debug.cpp
+  src/ngx.cpp)
 add_dependencies(renderfx renderfx_shaders)
 target_include_directories(renderfx
   PUBLIC  include
@@ -53,6 +54,11 @@ if(NOT NVOFG_LIBRARY_ONLY)
     target_compile_definitions(renderfx_ngx_probe PRIVATE
       RENDERFX_NGX_DATA_PATH="${RFX_NGX_DIR}/lib/Linux_x86_64/rel")
     target_link_libraries(renderfx_ngx_probe PRIVATE Vulkan::Vulkan ${RFX_NGX_LIB} stdc++ dl)
+
+    # Functional NGX GPU test: drives DLAA + Ray Reconstruction end-to-end (ADR 0006).
+    add_executable(renderfx_test_ngx tests/test_ngx.cpp)
+    target_link_libraries(renderfx_test_ngx PRIVATE renderfx Vulkan::Vulkan ${RFX_NGX_LIB} stdc++ dl)
+    add_test(NAME renderfx_ngx COMMAND renderfx_test_ngx)
   endif()
 
   add_executable(renderfx_test_resolve tests/test_resolve.cpp)

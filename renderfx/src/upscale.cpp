@@ -232,8 +232,10 @@ extern "C" RfxResult rfx_record_upscaling(RfxContext* ctx, VkCommandBuffer cmd,
     if (!ctx || !cmd || !fc || !dst) return RFX_INVALID_ARGUMENT;
     switch (ctx->upscaleBackend) {
         case RFX_BACKEND_TEMPORAL: return recordTemporal(ctx, cmd, fc, dst, reset);
+        case RFX_BACKEND_DLAA:     return renderfx::ngxRecordDLAA(ctx, cmd, fc, dst, reset);
+        case RFX_BACKEND_DLSS_SR:  return renderfx::ngxRecordDLAA(ctx, cmd, fc, dst, reset);
         case RFX_BACKEND_NONE:
         case RFX_BACKEND_NATIVE:   return recordNative(ctx, cmd, &fc->color, dst);
-        default:                   return RFX_UNSUPPORTED;  // NGX/FSR/XeSS reserved
+        default:                   return RFX_UNSUPPORTED;  // FSR/XeSS reserved
     }
 }

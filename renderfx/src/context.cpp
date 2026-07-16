@@ -17,6 +17,9 @@ RfxResult rfx_create(const RfxCreateInfo* info, RfxContext** out) {
     auto* ctx = new (std::nothrow) RfxContext();
     if (!ctx) return RFX_INTERNAL;
     ctx->info = *info;
+    // Probe the official NGX backend once (design.md §19 fix). Availability gates the
+    // DLSS SR/DLAA/RR capability flags below; inert stub when built without -DRENDERFX_NGX.
+    renderfx::ngxInit(ctx, &ctx->ngxSr, &ctx->ngxRr);
     *out = ctx;
     return RFX_OK;
 }
@@ -26,6 +29,7 @@ void rfx_destroy(RfxContext* ctx) {
     if (ctx->info.device) vkDeviceWaitIdle(ctx->info.device);
     renderfx::destroyUpscale(ctx);
     renderfx::destroyDebug(ctx);
+    renderfx::ngxShutdown(ctx);
     if (ctx->nvofg) nvofg_destroy(ctx->nvofg);
     delete ctx;
 }
@@ -37,8 +41,10 @@ RfxResult rfx_query_capabilities(RfxContext* ctx, RfxCapabilities* outCaps) {
     NvofgCaps nc{};
     bool ofa = nvofg_query_support(ctx->info.instance, ctx->info.physical_device,
                                    ctx->info.gipa, &nc) == NVOFG_OK && nc.supported;
-    // Portable shader FG works on any Vulkan GPU.
-    renderfx::buildCapabilities(ofa, /*shader*/ true, outCaps);
+    // Portable shader FG works on any Vulkan GPU. NGX SR/DLAA/RR reflect the probe done
+    // at rfx_create; FSR is our own portable EASU/RCAS shader (any Vulkan GPU).
+    renderfx::buildCapabilities(ofa, /*shader*/ true, outCaps, ctx->ngxSr, ctx->ngxRr,
+                                /*fsr*/ false, /*xess*/ false);
     ctx->caps = *outCaps;
     return RFX_OK;
 }
@@ -138,15 +144,16 @@ uint32_t rfx_missing_inputs(RfxContext* ctx, RfxStage stage, const RfxFrameConte
     return rfx_backend_required_inputs(b) & ~fc->provided_inputs;
 }
 
-RfxResult rfx_record_ray_reconstruction(RfxContext* ctx, VkCommandBuffer /*cmd*/,
+RfxResult rfx_record_ray_reconstruction(RfxContext* ctx, VkCommandBuffer cmd,
                                         const RfxFrameContext* fc, const RfxImageDesc* output) {
     if (!ctx || !fc || !output) return RFX_INVALID_ARGUMENT;
     switch (ctx->rrBackend) {
         case RFX_BACKEND_DLSS_RR:
-            // NGX Ray Reconstruction. Built only with -DRENDERFX_NGX and a present NGX
-            // runtime + DLSS-RR model (design.md §16). Absent here -> unsupported; the
-            // resolver never selects it when unsupported, so this is a safety net.
-            return RFX_UNSUPPORTED;
+            // Official NGX Ray Reconstruction (DLSS-D). Functional with -DRENDERFX_NGX +
+            // the vendored SDK/model; an inert stub returns RFX_UNSUPPORTED otherwise. The
+            // resolver only selects it when the capability probe marked it supported.
+            if (!cmd) return RFX_INVALID_ARGUMENT;
+            return renderfx::ngxRecordRR(ctx, cmd, fc, output, /*reset*/ 0);
         case RFX_BACKEND_NONE:
             return RFX_OK;   // stage disabled: nothing to do
         default:

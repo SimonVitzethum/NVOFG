@@ -143,6 +143,13 @@ typedef struct RfxFrameContext {
     float jitter[2];
     float reproj[16];           /* prevVP * inverse(currVP), row-major */
     float near_plane, far_plane;
+
+    /* Camera matrices — required by DLSS Ray Reconstruction (NGX consumes them to
+     * reproject the denoised GBuffer). Row-major. ABI-appended (guard with struct_size);
+     * leave zero for stages that don't need them (FG / SR / DLAA use motion+jitter). */
+    float world_to_view[16];
+    float view_to_clip[16];
+    float mv_scale[2];          /* motion-vector -> pixel-space scale (0 => {1,1}) */
 } RfxFrameContext;
 
 /* -------------------------------------------------------------------------- */

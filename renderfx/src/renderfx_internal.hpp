@@ -2,9 +2,28 @@
 #include "renderfx.h"
 #include "nvofg.h"
 
+struct RfxContext;  // global fwd (full definition below)
+
 namespace renderfx {
-// Fill the capability table with per-build `supported` flags.
-void buildCapabilities(bool nvofgOfa, bool nvofgShader, RfxCapabilities* out);
+// Fill the capability table with per-build `supported` flags. NGX SR/RR and FSR/XeSS
+// availability are probed at rfx_create; defaults keep older callers (tests) working.
+void buildCapabilities(bool nvofgOfa, bool nvofgShader, RfxCapabilities* out,
+                       bool ngxSr = false, bool ngxRr = false,
+                       bool fsr = false, bool xess = false);
+
+// --- Official NVIDIA NGX backend (DLSS SR/DLAA/Ray Reconstruction). Real when built
+// with -DRENDERFX_NGX + the vendored SDK; otherwise inert stubs (ADR 0006, design §16). ---
+// Init NGX on ctx's device (design.md §19 writable-path + UUID fix) and report which
+// features this device+driver expose. Returns false if NGX is unavailable (then the
+// backends stay unsupported and the pipeline falls back — graceful degradation G6).
+bool ngxInit(RfxContext* ctx, bool* srAvail, bool* rrAvail);
+void ngxShutdown(RfxContext* ctx);
+// DLAA: native-res anti-aliasing (color+depth+motion+jitter). dst == render res.
+RfxResult ngxRecordDLAA(RfxContext* ctx, VkCommandBuffer cmd, const RfxFrameContext* fc,
+                        const RfxImageDesc* dst, uint32_t reset);
+// Ray Reconstruction (DLSS-D): denoise + upscale consuming the GBuffer.
+RfxResult ngxRecordRR(RfxContext* ctx, VkCommandBuffer cmd, const RfxFrameContext* fc,
+                      const RfxImageDesc* output, uint32_t reset);
 
 // A RenderFX-owned scratch image (e.g. the temporal-upscaler history ping-pong).
 struct OwnedImage {
@@ -28,6 +47,12 @@ struct RfxContext {
     // The committed per-stage backends (dispatched by the record functions).
     RfxBackendId upscaleBackend = RFX_BACKEND_NONE;
     RfxBackendId rrBackend = RFX_BACKEND_NONE;
+
+    // Official NGX backend state (opaque renderfx::NgxState*, owned by ngx.cpp). NGX
+    // availability probed once at rfx_create; features created lazily on first record.
+    void* ngx = nullptr;
+    bool  ngxSr = false;   // DLSS Super Resolution + DLAA available on this device
+    bool  ngxRr = false;   // DLSS Ray Reconstruction available on this device
 
     // Native upscaling backend (built lazily, records into the app's command buffer).
     VkShaderModule        upSm = VK_NULL_HANDLE;
