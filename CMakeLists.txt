@@ -60,4 +60,9 @@ add_executable(nvofg_test_lifecycle tests/test_lifecycle.cpp)
 target_link_libraries(nvofg_test_lifecycle PRIVATE nvofg Vulkan::Vulkan)
 add_test(NAME lifecycle COMMAND nvofg_test_lifecycle)
 
+# Headless 2x interpolation example doubles as an integration test.
+add_executable(nvofg_headless_interp examples/headless_interp.cpp)
+target_link_libraries(nvofg_headless_interp PRIVATE nvofg Vulkan::Vulkan)
+add_test(NAME headless_interp COMMAND nvofg_headless_interp)
+
 # The Rust crates (nvofg-sys, nvofg) are wired in at M3.

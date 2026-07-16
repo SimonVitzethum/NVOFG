@@ -188,11 +188,9 @@ NvofgResult nvofg_create(const NvofgCreateInfo* info, NvofgContext** out) {
 
 void nvofg_destroy(NvofgContext* ctx) {
     if (!ctx) return;
-    auto gdpa = loadInstance<PFN_vkGetDeviceProcAddr>(ctx->gipa, ctx->instance, "vkGetDeviceProcAddr");
-    if (gdpa && ctx->timeline) {
-        auto destroySem = (PFN_vkDestroySemaphore) gdpa(ctx->device, "vkDestroySemaphore");
-        if (destroySem) destroySem(ctx->device, ctx->timeline, nullptr);
-    }
+    if (ctx->device) vkDeviceWaitIdle(ctx->device);
+    if (ctx->pipelineReady) nvofg::destroyPipeline(ctx);
+    if (ctx->timeline) vkDestroySemaphore(ctx->device, ctx->timeline, nullptr);
     delete ctx;
 }
 
