@@ -20,8 +20,9 @@ import common;
 [[vk::binding(8, 0)]] Texture2D<float>    gDepth;     // curr depth (linear or device)
 
 struct Push {
+    float4x4 reproj;                                      // curr clip -> prev clip
     uint  width, height, gridW, gridH, gridSize, flags;   // bit0 cost,1 bidir,2 motion,3 depth
-    float sigma;
+    float sigma, nearP, farP;
 };
 [[vk::push_constant]] Push pc;
 
@@ -90,9 +91,12 @@ void main(uint3 tid : SV_DispatchThreadID) {
         occ = saturate(residual / (0.5 * norm + 2.0));       // relative threshold
         conf *= (1.0 - 0.5 * occ);                           // occlusion lowers confidence
     }
-    // Depth disocclusion (req.#4): strong depth discontinuities mark object
-    // silhouettes, where newly-revealed background disoccludes — raise occlusion so
-    // the warp fills from the non-occluded side instead of blending across the edge.
+    // Depth disocclusion (req.#4). Two signals combine into the occlusion mask:
+    //  (a) depth-edge: strong (relative) depth discontinuities mark object
+    //      silhouettes where newly-revealed background disoccludes.
+    //  (b) reprojection: a static-scene geometric flow from depth + reproj; where
+    //      the OFA flow disagrees with it, the region is dynamic or disoccluded.
+    // In both, the warp then fills from the non-occluded side instead of blending.
     if (pc.flags & FLAG_DEPTH) {
         float dC = gDepth[p];
         float dR = gDepth[int2(min(p.x + 1, int(pc.width) - 1), p.y)];
@@ -100,8 +104,20 @@ void main(uint3 tid : SV_DispatchThreadID) {
         float dD = gDepth[int2(p.x, min(p.y + 1, int(pc.height) - 1))];
         float dU = gDepth[int2(p.x, max(p.y - 1, 0))];
         float grad = abs(dR - dL) + abs(dD - dU);
-        float edge = saturate(grad / (abs(dC) * 0.1 + 1e-3));  // relative depth step
+        float edge = saturate(grad / (abs(dC) * 0.1 + 1e-3));
         occ = max(occ, edge);
+
+        // reprojection disagreement
+        float2 dim = float2(pc.width, pc.height);
+        float2 uv  = (float2(p) + 0.5) / dim;
+        float4 clipCurr = float4(uv * 2.0 - 1.0, dC, 1.0);
+        float4 clipPrev = mul(pc.reproj, clipCurr);
+        if (abs(clipPrev.w) > 1e-6) {
+            float2 prevUV = (clipPrev.xy / clipPrev.w) * 0.5 + 0.5;
+            float2 geoFwd = float2(p) - prevUV * dim;         // static-scene prev->curr, px
+            float disagree = saturate(length(Ffwd - geoFwd) / 6.0);
+            occ = max(occ, disagree);
+        }
     }
     gRefinedBwd[p] = Fbwd;
     gConfidence[p] = conf;

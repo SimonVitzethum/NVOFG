@@ -141,6 +141,13 @@ VkDescriptorSetLayoutBinding bind(uint32_t b, VkDescriptorType t) {
     return {b, t, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
 }
 
+struct RefinePush {
+    float reproj[16];
+    uint32_t width, height, gridW, gridH, gridSize, flags;
+    float sigma, nearP, farP;
+};
+enum { REFINE_FLAG_COST = 1u, REFINE_FLAG_BIDIR = 2u, REFINE_FLAG_MOTION = 4u, REFINE_FLAG_DEPTH = 8u };
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -300,7 +307,7 @@ NvofgResult ensurePipeline(NvofgContext* ctx) {
     for (uint32_t i = 0; i <= 3; ++i) debugB.push_back(bind(i, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE));
     debugB.push_back(bind(4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE));
     if (!createStage(ctx, ctx->prepStage, nvofg_spv_prep, nvofg_spv_prep_size, prepB, 0) ||
-        !createStage(ctx, ctx->refineStage, nvofg_spv_refine, nvofg_spv_refine_size, refineB, 28) ||
+        !createStage(ctx, ctx->refineStage, nvofg_spv_refine, nvofg_spv_refine_size, refineB, sizeof(RefinePush)) ||
         !createStage(ctx, ctx->warpStage, nvofg_spv_warp, nvofg_spv_warp_size, warpB, 16) ||
         !createStage(ctx, ctx->debugStage, nvofg_spv_debug, nvofg_spv_debug_size, debugB, 12)) {
         ctx->setError("failed to create compute pipelines");
@@ -480,8 +487,6 @@ void submitTimeline(VkQueue queue, VkCommandBuffer cmd,
     vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
 }
 
-struct RefinePush { uint32_t width, height, gridW, gridH, gridSize, flags; float sigma; };
-enum { REFINE_FLAG_COST = 1u, REFINE_FLAG_BIDIR = 2u, REFINE_FLAG_MOTION = 4u, REFINE_FLAG_DEPTH = 8u };
 struct WarpPush   { uint32_t width, height; float phase; uint32_t flags; };
 enum { WARP_FLAG_UI = 1u, WARP_FLAG_REACTIVE = 2u, WARP_FLAG_BIDIR = 4u };
 
@@ -688,8 +693,12 @@ NvofgResult nvofg_record_generate(NvofgContext* ctx, const NvofgGenerateInfo* in
         uint32_t rflags = REFINE_FLAG_COST | (ctx->bidir ? REFINE_FLAG_BIDIR : 0u)
                         | (ctx->hasMotion ? REFINE_FLAG_MOTION : 0u)
                         | (ctx->hasDepth ? REFINE_FLAG_DEPTH : 0u);
-        RefinePush rp{W, H, ctx->gridW, ctx->gridH, ctx->gridSize, rflags,
-                      (ctx->quality == NVOFG_QUALITY_HIGH) ? 32.f : 48.f};
+        RefinePush rp{};
+        std::memcpy(rp.reproj, info->reproj, sizeof(rp.reproj));
+        rp.width = W; rp.height = H; rp.gridW = ctx->gridW; rp.gridH = ctx->gridH;
+        rp.gridSize = ctx->gridSize; rp.flags = rflags;
+        rp.sigma = (ctx->quality == NVOFG_QUALITY_HIGH) ? 32.f : 48.f;
+        rp.nearP = info->near_plane; rp.farP = info->far_plane;
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->refineStage.pipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->refineStage.pipeLayout, 0, 1, &ctx->refineSet, 0, nullptr);
         vkCmdPushConstants(cmd, ctx->refineStage.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rp), &rp);
