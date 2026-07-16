@@ -288,8 +288,9 @@ extern "C" RfxResult rfx_record_upscaling(RfxContext* ctx, VkCommandBuffer cmd,
         case RFX_BACKEND_DLAA:     return renderfx::ngxRecordDLAA(ctx, cmd, fc, dst, reset);
         case RFX_BACKEND_DLSS_SR:  return renderfx::ngxRecordDLAA(ctx, cmd, fc, dst, reset);
         case RFX_BACKEND_FSR:      return recordFsr(ctx, cmd, &fc->color, dst);
+        case RFX_BACKEND_XESS:     return renderfx::xessRecordUpscale(ctx, cmd, fc, dst, reset);
         case RFX_BACKEND_NONE:
         case RFX_BACKEND_NATIVE:   return recordNative(ctx, cmd, &fc->color, dst);
-        default:                   return RFX_UNSUPPORTED;  // XeSS reserved
+        default:                   return RFX_UNSUPPORTED;
     }
 }

@@ -20,6 +20,8 @@ RfxResult rfx_create(const RfxCreateInfo* info, RfxContext** out) {
     // Probe the official NGX backend once (design.md §19 fix). Availability gates the
     // DLSS SR/DLAA/RR capability flags below; inert stub when built without -DRENDERFX_NGX.
     renderfx::ngxInit(ctx, &ctx->ngxSr, &ctx->ngxRr);
+    // Probe Intel XeSS (inert stub unless built -DRENDERFX_XESS with a native runtime).
+    renderfx::xessInit(ctx, &ctx->xessAvail);
     *out = ctx;
     return RFX_OK;
 }
@@ -30,6 +32,7 @@ void rfx_destroy(RfxContext* ctx) {
     renderfx::destroyUpscale(ctx);
     renderfx::destroyDebug(ctx);
     renderfx::ngxShutdown(ctx);
+    renderfx::xessShutdown(ctx);
     if (ctx->nvofg) nvofg_destroy(ctx->nvofg);
     delete ctx;
 }
@@ -44,7 +47,7 @@ RfxResult rfx_query_capabilities(RfxContext* ctx, RfxCapabilities* outCaps) {
     // Portable shader FG works on any Vulkan GPU. NGX SR/DLAA/RR reflect the probe done
     // at rfx_create; FSR is our own portable EASU/RCAS shader (any Vulkan GPU).
     renderfx::buildCapabilities(ofa, /*shader*/ true, outCaps, ctx->ngxSr, ctx->ngxRr,
-                                /*fsr*/ true, /*xess*/ false);
+                                /*fsr*/ true, ctx->xessAvail);
     ctx->caps = *outCaps;
     return RFX_OK;
 }

@@ -23,7 +23,8 @@ add_library(renderfx
   src/context.cpp
   src/upscale.cpp
   src/rr_debug.cpp
-  src/ngx.cpp)
+  src/ngx.cpp
+  src/xess.cpp)
 add_dependencies(renderfx renderfx_shaders)
 target_include_directories(renderfx
   PUBLIC  include
@@ -47,6 +48,34 @@ if(RENDERFX_NGX AND EXISTS "${RFX_NGX_LIB}")
   target_link_libraries(renderfx PRIVATE ${RFX_NGX_LIB} stdc++ dl)
 elseif(RENDERFX_NGX)
   message(WARNING "renderfx: RENDERFX_NGX set but ${RFX_NGX_LIB} not found; NGX disabled")
+endif()
+
+# -------------------------------------------------------------------------------
+# Optional Intel XeSS backend (temporal super-resolution). ADR 0007: Intel ships no
+# native-Linux XeSS runtime today (Windows libxess.dll only); this project is native-
+# Linux + no-Wine, so XeSS reports unsupported here. The integration (src/xess.cpp) is
+# written against Intel's official vendored headers and turns on where a native XeSS
+# library exists (Intel Arc Linux host, or a future Linux .so): drop it beside the
+# headers and configure with -DRENDERFX_XESS + -DRFX_XESS_LIB=<path/to/libxess.so>.
+# -------------------------------------------------------------------------------
+option(RENDERFX_XESS "Build the Intel XeSS backend (needs a native XeSS runtime)" OFF)
+set(RFX_XESS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/xess")
+if(RENDERFX_XESS AND EXISTS "${RFX_XESS_DIR}/include/xess/xess_vk.h" AND RFX_XESS_LIB)
+  message(STATUS "renderfx: XeSS backend enabled (${RFX_XESS_LIB})")
+  target_include_directories(renderfx PRIVATE ${RFX_XESS_DIR}/include)
+  target_compile_definitions(renderfx PRIVATE RENDERFX_XESS)
+  target_link_libraries(renderfx PRIVATE ${RFX_XESS_LIB})
+elseif(RENDERFX_XESS)
+  message(WARNING "renderfx: RENDERFX_XESS set but no native XeSS runtime (RFX_XESS_LIB); XeSS disabled")
+endif()
+
+# API-correctness compile-check of the real XeSS path against the vendored headers, even
+# without a linkable runtime (verifies the integration stays in sync with xess_vk.h).
+if(NOT NVOFG_LIBRARY_ONLY AND EXISTS "${RFX_XESS_DIR}/include/xess/xess_vk.h")
+  add_library(renderfx_xess_apicheck OBJECT EXCLUDE_FROM_ALL src/xess.cpp)
+  target_include_directories(renderfx_xess_apicheck PRIVATE include ${CMAKE_SOURCE_DIR}/include ${NVOFG_SHADER_GEN_DIR} ${RFX_XESS_DIR}/include)
+  target_compile_definitions(renderfx_xess_apicheck PRIVATE RENDERFX_XESS)
+  target_link_libraries(renderfx_xess_apicheck PRIVATE Vulkan::Vulkan)
 endif()
 
 if(NOT NVOFG_LIBRARY_ONLY)

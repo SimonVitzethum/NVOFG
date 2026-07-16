@@ -42,7 +42,7 @@ const RfxBackendCaps kTable[] = {
      RFX_STAGE_COUNT, RFX_FAMILY_GENERIC, "FSR", "FSR-style edge-adaptive spatial upscaler (EASU)"},
     {RFX_BACKEND_XESS, RFX_STAGE_UPSCALING, RFX_FAMILY_XESS, 1, F_HDR | F_RST | F_TENS, 0, 0, 1, 75, 22,
      RFX_INPUT_COLOR | RFX_INPUT_MOTION | RFX_INPUT_DEPTH | RFX_INPUT_JITTER,
-     RFX_STAGE_COUNT, RFX_FAMILY_GENERIC, "XeSS", "Intel XeSS (reserved)"},
+     RFX_STAGE_COUNT, RFX_FAMILY_GENERIC, "XeSS", "Intel XeSS temporal SR (needs native runtime)"},
 
     // ---- Ray Reconstruction (requires a DLSS upscaler in NVIDIA's stack) ----
     {RFX_BACKEND_DLSS_RR, RFX_STAGE_RAY_RECONSTRUCTION, RFX_FAMILY_DLSS, 1,

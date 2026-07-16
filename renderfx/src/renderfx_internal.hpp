@@ -25,6 +25,13 @@ RfxResult ngxRecordDLAA(RfxContext* ctx, VkCommandBuffer cmd, const RfxFrameCont
 RfxResult ngxRecordRR(RfxContext* ctx, VkCommandBuffer cmd, const RfxFrameContext* fc,
                       const RfxImageDesc* output, uint32_t reset);
 
+// --- Intel XeSS backend (temporal super-resolution). Real with -DRENDERFX_XESS + a
+// native XeSS runtime; inert stub otherwise (ADR 0007 — no Linux runtime ships today). ---
+bool xessInit(RfxContext* ctx, bool* avail);
+void xessShutdown(RfxContext* ctx);
+RfxResult xessRecordUpscale(RfxContext* ctx, VkCommandBuffer cmd, const RfxFrameContext* fc,
+                            const RfxImageDesc* dst, uint32_t reset);
+
 // A RenderFX-owned scratch image (e.g. the temporal-upscaler history ping-pong).
 struct OwnedImage {
     VkImage image = VK_NULL_HANDLE;
@@ -53,6 +60,10 @@ struct RfxContext {
     void* ngx = nullptr;
     bool  ngxSr = false;   // DLSS Super Resolution + DLAA available on this device
     bool  ngxRr = false;   // DLSS Ray Reconstruction available on this device
+
+    // Intel XeSS backend state (opaque renderfx::XessState*, owned by xess.cpp).
+    void* xess = nullptr;
+    bool  xessAvail = false;
 
     // Native upscaling backend (built lazily, records into the app's command buffer).
     VkShaderModule        upSm = VK_NULL_HANDLE;
