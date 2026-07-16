@@ -16,10 +16,14 @@ add_library(nvofg_warnings INTERFACE)
 target_compile_options(nvofg_warnings INTERFACE
   $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall -Wextra -Wpedantic>)
 
+# NVOFG_LIBRARY_ONLY builds just libnvofg (used by the Rust crates' build.rs).
+option(NVOFG_LIBRARY_ONLY "Build only the nvofg library (skip spikes/examples/tests)" OFF)
+
 # ---------------------------------------------------------------------------
 # M0 support probe: prove the native VK_NV_optical_flow path on this machine.
 # Standalone; depends only on the Vulkan loader. Not linked into the library.
 # ---------------------------------------------------------------------------
+if(NOT NVOFG_LIBRARY_ONLY)
 add_executable(nvofg_probe src/spike/probe.cpp)
 target_include_directories(nvofg_probe PRIVATE include)
 target_link_libraries(nvofg_probe PRIVATE Vulkan::Vulkan nvofg_warnings)
@@ -27,6 +31,7 @@ target_link_libraries(nvofg_probe PRIVATE Vulkan::Vulkan nvofg_warnings)
 # M0 (full): run one hardware optical-flow execute and dump the flow field.
 add_executable(nvofg_flow_dump src/spike/flow_dump.cpp)
 target_link_libraries(nvofg_flow_dump PRIVATE Vulkan::Vulkan nvofg_warnings)
+endif()
 
 # ---------------------------------------------------------------------------
 # libnvofg — the frame-generation library (C ABI in include/nvofg.h).
@@ -57,8 +62,9 @@ target_link_libraries(nvofg PUBLIC Vulkan::Vulkan PRIVATE nvofg_warnings)
 set_target_properties(nvofg PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION 0)
 
 # ---------------------------------------------------------------------------
-# Tests
+# Tests / examples (skipped for library-only builds)
 # ---------------------------------------------------------------------------
+if(NOT NVOFG_LIBRARY_ONLY)
 enable_testing()
 add_executable(nvofg_test_lifecycle tests/test_lifecycle.cpp)
 target_link_libraries(nvofg_test_lifecycle PRIVATE nvofg Vulkan::Vulkan)
@@ -68,5 +74,6 @@ add_test(NAME lifecycle COMMAND nvofg_test_lifecycle)
 add_executable(nvofg_headless_interp examples/headless_interp.cpp)
 target_link_libraries(nvofg_headless_interp PRIVATE nvofg Vulkan::Vulkan)
 add_test(NAME headless_interp COMMAND nvofg_headless_interp)
+endif()  # NOT NVOFG_LIBRARY_ONLY
 
-# The Rust crates (nvofg-sys, nvofg) are wired in at M3.
+# Rust crates live under crates/ (nvofg-sys links this library via build.rs).

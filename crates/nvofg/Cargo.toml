@@ -1,0 +1,15 @@
+[package]
+name = "nvofg"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Native Linux Vulkan frame generation on the NVIDIA Optical Flow Accelerator (VK_NV_optical_flow). Safe wrapper."
+repository = "https://github.com/SimonVitzethum/nvofg"
+
+[dependencies]
+ash = { version = "0.38", default-features = false, features = ["debug"] }
+nvofg-sys = { version = "0.1.0", path = "../nvofg-sys" }
+
+[dev-dependencies]
+# The examples load the Vulkan loader at runtime.
+ash = { version = "0.38", features = ["loaded", "std", "debug"] }
