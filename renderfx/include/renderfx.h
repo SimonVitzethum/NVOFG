@@ -297,11 +297,16 @@ RfxResult rfx_record_frame_generation(RfxContext*, const RfxFrameContext* fc,
                                       const RfxFrameSync* input_ready /*nullable*/,
                                       RfxFrameSync* out_sync);
 
-/* Upscaling stage: record the selected upscaler into the app's command buffer (RenderFX
- * owns no graph). `src` is at render resolution, `dst` at present resolution; both must
- * be in GENERAL layout. Today the functional backend is Native (bilinear). */
+/* Upscaling stage: record the *committed* upscaler into the app's command buffer
+ * (RenderFX owns no graph). The source is `fc->color` (render resolution); `dst` is the
+ * present-resolution target; both must be in GENERAL layout. Dispatches to the backend
+ * chosen by rfx_commit — Native (bilinear) and Temporal (TAAU, uses fc->motion) are
+ * functional today. Temporal keeps a RenderFX-owned history; set `fc` reset semantics
+ * via `reset` on the first frame / camera cut through GenerateInfo-style flags is not
+ * needed here — pass reset=1 for the first frame. */
 RfxResult rfx_record_upscaling(RfxContext*, VkCommandBuffer cmd,
-                               const RfxImageDesc* src, const RfxImageDesc* dst);
+                               const RfxFrameContext* fc, const RfxImageDesc* dst,
+                               uint32_t reset);
 
 /* Union of features across the supported backends of the given stage on this context. */
 uint64_t rfx_query_stage_features(RfxContext*, RfxStage);

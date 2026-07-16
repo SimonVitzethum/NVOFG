@@ -44,6 +44,7 @@ RfxResult rfx_query_capabilities(RfxContext* ctx, RfxCapabilities* outCaps) {
 
 RfxResult rfx_commit(RfxContext* ctx, const RfxSelection* sel) {
     if (!ctx || !sel || !sel->valid) return RFX_INVALID_ARGUMENT;
+    ctx->upscaleBackend = sel->backend[RFX_STAGE_UPSCALING];
     RfxBackendId fg = sel->backend[RFX_STAGE_FRAME_GENERATION];
     ctx->fgBackend = fg;
 

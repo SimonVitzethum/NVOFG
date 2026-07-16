@@ -9,6 +9,8 @@
 set(RENDERFX_SHADERS "")
 nvofg_add_shader(RENDERFX_SHADERS SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/upscale_native.slang
                  ENTRY main SYMBOL rfx_spv_upscale_native)
+nvofg_add_shader(RENDERFX_SHADERS SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/upscale_temporal.slang
+                 ENTRY main SYMBOL rfx_spv_upscale_temporal)
 add_custom_target(renderfx_shaders DEPENDS ${RENDERFX_SHADERS})
 
 add_library(renderfx
