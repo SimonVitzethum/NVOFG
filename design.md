@@ -729,3 +729,98 @@ None of the above changes the current implementation. The only *actionable now, 
 items are the ABI-extensibility guardrails in §15.1/§15.4 — and even those can wait until
 the first real second consumer exists, since the public structs are already clean subsets
 of the Frame Context vocabulary.
+
+---
+
+## 18. Capability discovery & backend dispatch (RenderFX) — refinements
+
+§13–§17 settle the shape: a **separate**, Linux-first RenderFX that owns no render graph
+(§15.2 stage-plugin model), composes nvofg as one Frame-Generation backend (§13), uses NGX
+for DLSS SR/DLAA/RR (§16), and exposes **one API with interchangeable backends**. This
+section records the follow-up asks — a Vulkan-style capability query and an automatic
+**backend dispatcher** — and refines two points where the literal proposal should be
+improved. The governing principle, elevated here as primary:
+
+> **Unify the API, never the implementation.** The application programs against stages and
+> a Frame Context; which backend executes a stage is a runtime detail it need not know —
+> but *may* inspect and override.
+
+### 18.1 Capability discovery — yes, but *inspectable policy + override*, not opaque magic
+A Vulkan-style capability query is the right model, and nvofg already embodies the
+module-level version of it: `nvofg_query_support` / `NvofgCaps` are **cheap, side-effect-
+free**, and report not a bare bool but *tiers and features* (OFA vs shader, bidir, cost,
+hint, grid, max res). RenderFX's `RenderFXCapabilities` should be the **aggregation** of
+each module's own such query — RenderFX is an *aggregator*, not a reimplementation of every
+vendor probe. This keeps modules independent and RenderFX thin (fractal capabilities).
+
+The **refinement**: the request's `enable_dlss()/enable_rr()` → "RenderFX automatically
+chooses the best backend" should not become an *opaque* auto-selector. That is not the
+Vulkan model — Vulkan **enumerates and lets you pick with enough information to pick well**;
+it does not silently choose your physical device. Pure auto-selection removes legitimate
+application control:
+- an app may prefer **FSR even on NVIDIA** for cross-machine visual consistency;
+- an app may **avoid a proprietary blob** for licensing or reproducibility;
+- an app may weight **latency over quality** (or vice-versa), or pin a backend for A/B
+  testing and golden images.
+
+So the better contract is **capability query → app states a *policy/preference* →
+RenderFX returns a *recommended, fully-inspectable selection* → app may override/pin**:
+
+```text
+caps        = renderfx_query(frame_context_available, device)   // side-effect-free
+preference  = { quality|balanced|perf, allow_proprietary, vendor_pin?, latency_budget }
+selection   = renderfx_resolve(caps, preference)   // deterministic, inspectable, overridable
+```
+
+`selection` is data the app can read (which backend per stage, and *why*), not hidden
+state. Auto-selection is then just "resolve with the default policy" — convenient, but
+never a black box. This is strictly more capable than the literal proposal and still gives
+the one-liner ergonomics for apps that don't care.
+
+Each capability entry must carry more than "supported": a **quality/tier class**, a rough
+**cost/latency** hint, and — tying back to §15.1 — the **Frame Context inputs the backend
+requires**, so the app can produce *only* what the chosen selection needs.
+
+### 18.2 Backend dispatch is a *set-resolution* problem, not per-stage independent picks
+This is the one place the naive dispatcher (`Capability Discovery → Backend Selection →
+Execution`, picking each stage's local best) is **subtly wrong**, and the correction
+matters. Stages are **not independent** — real cross-stage constraints and bundles exist:
+- NVIDIA's **RR requires DLSS SR** (RR replaces the SR upscale; you can't run NGX RR under
+  an FSR upscaler);
+- **FSR frame generation pairs with FSR upscaling**; a hypothetical **DLSS-G bundles SR+FG**;
+- backends share history/jitter conventions that must agree across the temporal stages.
+
+A dispatcher that greedily picks each stage's best in isolation can therefore produce an
+**invalid combination** (e.g. FSR-upscale + NGX-RR). The correct model is that the
+dispatcher **resolves a compatible *set* across all active stages**, respecting declared
+bundles/constraints, and **reports conflicts** rather than silently mixing incompatible
+backends. Concretely, each backend declares its cross-stage requirements as part of its
+capability record; `renderfx_resolve` performs constraint satisfaction over the active
+stages, not `argmax` per stage.
+
+This is more work than the linear pipeline the proposal sketches, but it is the difference
+between a dispatcher that *works* and one that produces subtly broken frames. Document it
+as a first-class requirement of the dispatcher, not an afterthought.
+
+### 18.3 "No vendor APIs in the public interface" vs. naming backends
+A capability enum will contain identifiers like `DLSS_SR`, `FSR`, `nvofg`, `XeSS`. That is
+**not** a violation of the hardware-independence rule (§15.4): a vendor name as a *backend
+identifier* is fine; what must never leak is a vendor *API surface* (`NVSDK_NGX_*`,
+`cudaX`, `NvOF*` types) into the RenderFX/nvofg public headers. The app selects
+`FrameGeneration = nvofg` by an opaque handle/enum and drives it through the uniform stage
+interface; it never touches nvofg's, NGX's, or CUDA's own types. This distinction is what
+lets §16's hybrid (NGX + open + native) sit behind one clean API.
+
+### 18.4 Net
+- **Capability discovery:** adopt, as an aggregation of each module's existing cheap query
+  (nvofg already provides its own); expose **policy + inspectable recommended selection +
+  override**, not an opaque auto-picker.
+- **Backend dispatch:** adopt, but as **cross-stage set resolution** with declared
+  constraints/bundles and conflict reporting — never independent per-stage `argmax`.
+- **Everything else** (unified-API-not-implementation, NGX-for-SR/RR, nvofg-stays-
+  specialized-and-composed, Linux-first, no vendor types in the public surface) is
+  affirmed as already concluded in §13–§17.
+
+As before: **no implementation change now.** These are guardrails so that when the RenderFX
+project is eventually built, its capability/dispatch layer is right the first time and
+nvofg slots in as a backend unchanged.
