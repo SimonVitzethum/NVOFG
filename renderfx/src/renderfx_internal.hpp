@@ -25,8 +25,9 @@ struct RfxContext {
     bool registered = false;
     uint64_t framesGenerated = 0;   // runtime statistics counter
 
-    // The committed upscaling backend (dispatched by rfx_record_upscaling).
+    // The committed per-stage backends (dispatched by the record functions).
     RfxBackendId upscaleBackend = RFX_BACKEND_NONE;
+    RfxBackendId rrBackend = RFX_BACKEND_NONE;
 
     // Native upscaling backend (built lazily, records into the app's command buffer).
     VkShaderModule        upSm = VK_NULL_HANDLE;

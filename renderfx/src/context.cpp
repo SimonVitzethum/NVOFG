@@ -45,6 +45,7 @@ RfxResult rfx_query_capabilities(RfxContext* ctx, RfxCapabilities* outCaps) {
 RfxResult rfx_commit(RfxContext* ctx, const RfxSelection* sel) {
     if (!ctx || !sel || !sel->valid) return RFX_INVALID_ARGUMENT;
     ctx->upscaleBackend = sel->backend[RFX_STAGE_UPSCALING];
+    ctx->rrBackend = sel->backend[RFX_STAGE_RAY_RECONSTRUCTION];
     RfxBackendId fg = sel->backend[RFX_STAGE_FRAME_GENERATION];
     ctx->fgBackend = fg;
 
@@ -118,6 +119,38 @@ RfxResult rfx_record_frame_generation(RfxContext* ctx, const RfxFrameContext* fc
 uint64_t rfx_query_stage_features(RfxContext* ctx, RfxStage stage) {
     if (!ctx) return 0;
     return rfx_stage_features(&ctx->caps, stage);
+}
+
+static RfxBackendId committedBackend(RfxContext* ctx, RfxStage stage) {
+    switch (stage) {
+        case RFX_STAGE_UPSCALING:          return ctx->upscaleBackend;
+        case RFX_STAGE_RAY_RECONSTRUCTION: return ctx->rrBackend;
+        case RFX_STAGE_FRAME_GENERATION:   return ctx->fgBackend;
+        default:                           return RFX_BACKEND_NONE;
+    }
+}
+
+uint32_t rfx_missing_inputs(RfxContext* ctx, RfxStage stage, const RfxFrameContext* fc) {
+    if (!ctx || !fc) return 0;
+    RfxBackendId b = committedBackend(ctx, stage);
+    if (b == RFX_BACKEND_NONE) return 0;
+    return rfx_backend_required_inputs(b) & ~fc->provided_inputs;
+}
+
+RfxResult rfx_record_ray_reconstruction(RfxContext* ctx, VkCommandBuffer /*cmd*/,
+                                        const RfxFrameContext* fc, const RfxImageDesc* output) {
+    if (!ctx || !fc || !output) return RFX_INVALID_ARGUMENT;
+    switch (ctx->rrBackend) {
+        case RFX_BACKEND_DLSS_RR:
+            // NGX Ray Reconstruction. Built only with -DRENDERFX_NGX and a present NGX
+            // runtime + DLSS-RR model (design.md §16). Absent here -> unsupported; the
+            // resolver never selects it when unsupported, so this is a safety net.
+            return RFX_UNSUPPORTED;
+        case RFX_BACKEND_NONE:
+            return RFX_OK;   // stage disabled: nothing to do
+        default:
+            return RFX_UNSUPPORTED;
+    }
 }
 
 RfxResult rfx_get_statistics(RfxContext* ctx, RfxStatistics* out) {

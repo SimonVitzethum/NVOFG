@@ -192,6 +192,46 @@ int main() {
         REQUIRE(rrf == 0, "RR stage features empty (no RR backend supported yet)");
     }
 
+    // N) RR backend GBuffer requirements + missing-input diagnostics (pure).
+    {
+        uint32_t req = rfx_backend_required_inputs(RFX_BACKEND_DLSS_RR);
+        REQUIRE((req & RFX_INPUT_ROUGHNESS) && (req & RFX_INPUT_ALBEDO_DIFFUSE) &&
+                (req & RFX_INPUT_ALBEDO_SPECULAR) && (req & RFX_INPUT_NORMALS),
+                "DLSS RR requires roughness + diffuse/specular albedo + normals");
+        uint32_t provided = RFX_INPUT_COLOR | RFX_INPUT_DEPTH | RFX_INPUT_MOTION;  // no GBuffer
+        uint32_t missing = req & ~provided;
+        REQUIRE((missing & RFX_INPUT_NORMALS) && (missing & RFX_INPUT_ROUGHNESS) &&
+                !(missing & RFX_INPUT_DEPTH),
+                "missing-input diagnostics flag the absent GBuffer channels only");
+    }
+
+    // O) RR interoperates with DLAA + FG in one resolved set (full NVIDIA stack), and
+    //    surfaces through pipeline inspection + explanation.
+    {
+        RfxCapabilities c; renderfx::buildCapabilities(true, true, &c);
+        setSupported(c, RFX_BACKEND_DLAA, 1);
+        setSupported(c, RFX_BACKEND_DLSS_RR, 1);
+        RfxPreference p = basePref();
+        p.stages_enabled = (1u << RFX_STAGE_UPSCALING) | (1u << RFX_STAGE_RAY_RECONSTRUCTION)
+                         | (1u << RFX_STAGE_FRAME_GENERATION);
+        RfxSelection s;
+        REQUIRE(rfx_resolve(&c, &p, &s) == RFX_OK && s.valid, "resolve OK (DLAA + RR + FG)");
+        REQUIRE(s.backend[RFX_STAGE_UPSCALING] == RFX_BACKEND_DLAA, "Upscaling -> DLAA");
+        REQUIRE(s.backend[RFX_STAGE_RAY_RECONSTRUCTION] == RFX_BACKEND_DLSS_RR,
+                "RR -> DLSS RR (compatible with the DLSS upscaler)");
+        REQUIRE(s.backend[RFX_STAGE_FRAME_GENERATION] == RFX_BACKEND_NVOFG, "FG -> nvofg");
+        // RR's explanation includes the cross-stage constraint reason.
+        bool constraintReason = false;
+        const RfxStageExplanation& e = s.explanation[RFX_STAGE_RAY_RECONSTRUCTION];
+        for (uint32_t i = 0; i < e.reason_count; ++i)
+            if (e.reasons[i] == RFX_REASON_CONSTRAINT_SATISFIED) constraintReason = true;
+        REQUIRE(constraintReason, "RR explanation notes the upscaler-compatibility constraint");
+        char buf[512]; rfx_format_pipeline(&s, buf, sizeof buf);
+        REQUIRE(std::strstr(buf, "dlaa") && std::strstr(buf, "dlss_rr") && std::strstr(buf, "nvofg"),
+                "pipeline inspection lists DLAA + RR + FG");
+        std::printf("---\n%s---\n", buf);
+    }
+
     std::printf("ALL RENDERFX RESOLVER CHECKS PASSED\n");
     return 0;
 }

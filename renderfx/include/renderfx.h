@@ -308,6 +308,22 @@ RfxResult rfx_record_upscaling(RfxContext*, VkCommandBuffer cmd,
                                const RfxFrameContext* fc, const RfxImageDesc* dst,
                                uint32_t reset);
 
+/* Ray Reconstruction stage: record the *committed* RR backend into the app's command
+ * buffer. Consumes the shared Frame Context (color/motion/depth/roughness/diffuse+
+ * specular albedo/normals/exposure/jitter/reproj). The only backend today is DLSS RR
+ * (NGX). When NGX / the trained model is unavailable it returns RFX_UNSUPPORTED and the
+ * rest of the pipeline is unaffected — never a special case elsewhere in the framework. */
+RfxResult rfx_record_ray_reconstruction(RfxContext*, VkCommandBuffer cmd,
+                                        const RfxFrameContext* fc, const RfxImageDesc* output);
+
+/* Inputs a backend REQUIRES, as an RFX_INPUT_* bitmask (from the capability table). */
+uint32_t rfx_backend_required_inputs(RfxBackendId backend);
+
+/* Diagnostics: which inputs the committed backend for `stage` requires but the Frame
+ * Context does not provide (RFX_INPUT_* bitmask; 0 = all satisfied). Invaluable for
+ * validating RR's GBuffer inputs. */
+uint32_t rfx_missing_inputs(RfxContext*, RfxStage stage, const RfxFrameContext* fc);
+
 /* Union of features across the supported backends of the given stage on this context. */
 uint64_t rfx_query_stage_features(RfxContext*, RfxStage);
 

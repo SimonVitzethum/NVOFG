@@ -93,6 +93,12 @@ void buildCapabilities(bool nvofgOfa, bool nvofgShader, RfxCapabilities* out) {
 
 }  // namespace renderfx
 
+extern "C" uint32_t rfx_backend_required_inputs(RfxBackendId backend) {
+    for (uint32_t i = 0; i < kTableCount; ++i)
+        if (kTable[i].id == backend) return kTable[i].required_inputs;
+    return 0;
+}
+
 extern "C" uint64_t rfx_stage_features(const RfxCapabilities* caps, RfxStage stage) {
     if (!caps) return 0;
     uint64_t f = 0;
