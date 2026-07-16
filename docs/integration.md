@@ -1,0 +1,57 @@
+# Integrating nvofg
+
+A minimal, current guide for wiring nvofg into a native Linux Vulkan engine. Mirrors
+`design.md` §6 and reflects the AUTOMATIC-mode sync model (ADR 0003).
+
+## Device requirements
+
+At **device creation** the app must enable, in addition to whatever it already uses:
+
+| Requirement | Why |
+|---|---|
+| Device extension `VK_NV_optical_flow` | the OFA backend. Get the list from `nvofg_required_device_extensions()`. |
+| Feature `VkPhysicalDeviceOpticalFlowFeaturesNV.opticalFlow` | enables the OFA. |
+| Feature `timelineSemaphore` (`VkPhysicalDeviceVulkan12Features` or core 1.3) | nvofg's cross-stage sync semaphore. |
+| Feature `shaderStorageImageWriteWithoutFormat` | the warp stage writes the (arbitrary-format) output storage image. |
+| One queue from the **optical-flow queue family** | the OFA executes there. Discover it with `nvofg_optical_flow_queue_family()`. |
+
+nvofg calls `nvofg_query_support()` / `nvofg_create()` and returns `NVOFG_UNSUPPORTED`
+if the OFA is absent, so the graceful 1× fallback (G6) is a single branch.
+
+## Registered images
+
+Allocate and register, at swapchain create / resize:
+
+- **prev / curr color** — copies of the final frame nvofg reads. Create with at least
+  `SAMPLED_BIT` (nvofg samples them). Register via `nvofg_register_color()`.
+- **output** — a storage image nvofg writes the interpolated frame into. Create with
+  `STORAGE_BIT` (+ whatever you need to present/copy it). Register via
+  `nvofg_register_output()`.
+- **aux (optional)** — depth / motion / ui_mask / reactive / material_id via
+  `nvofg_register_aux()` (consumed from M2 on).
+
+## Per frame
+
+```c
+NvofgGenerateInfo gi = {0};
+gi.phase = 0.5f;                       // 2x
+gi.prev_layout = /* layout prev color is in */;
+gi.curr_layout = /* layout curr color is in */;
+gi.input_timeline = colorsReadyTimeline;  // signalled when prev/curr finished rendering
+gi.input_value    = colorsReadyValue;     // (VK_NULL_HANDLE handle => already ordered)
+
+NvofgFrameSync sync;
+if (nvofg_record_generate(ctx, &gi, &sync) == NVOFG_OK) {
+    // present the interpolated image, waiting on (sync.semaphore, sync.value),
+    // then present curr color.
+}
+```
+
+nvofg owns all internal command buffers, layout transitions, and queue submits in
+AUTOMATIC mode. The app only signals *colors ready* and waits on the returned timeline
+point before presenting the interpolated frame. See `examples/headless_interp.cpp` for a
+complete, self-contained driver.
+
+## Frame pacing
+Cap base fps to `displayHz / multiplier` and keep VSync off (or use the optional pacer,
+§7). Added latency ≈ one base frame; there is no Reflex on native Linux.

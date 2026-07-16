@@ -93,11 +93,16 @@ int main() {
     VkPhysicalDeviceOpticalFlowFeaturesNV of{};
     of.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPTICAL_FLOW_FEATURES_NV;
     of.opticalFlow = VK_TRUE;
+    // nvofg creates a timeline semaphore -> the app must enable the feature.
+    VkPhysicalDeviceVulkan12Features v12{};
+    v12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    v12.timelineSemaphore = VK_TRUE;
+    v12.pNext = &of;
     uint32_t reqCount = 0;
     const char* const* reqExts = nvofg_required_device_extensions(&reqCount);
     VkDeviceCreateInfo dci{};
     dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-    dci.pNext = &of;
+    dci.pNext = &v12;
     dci.queueCreateInfoCount = qciCount;
     dci.pQueueCreateInfos = qcis;
     dci.enabledExtensionCount = reqCount;

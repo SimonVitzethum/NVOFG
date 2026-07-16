@@ -164,12 +164,14 @@ NvofgResult ensurePipeline(NvofgContext* ctx) {
                      VK_OPTICAL_FLOW_USAGE_INPUT_BIT_NV, fams, famCount) ||
         !createImage(ctx, ctx->lumaCurr, W, H, VK_FORMAT_R8_UNORM, kLumaUsage,
                      VK_OPTICAL_FLOW_USAGE_INPUT_BIT_NV, fams, famCount) ||
+        // SAMPLED_BIT is required so a VkImageView can be created for OFA binding
+        // (a view needs a view-compatible usage bit; TRANSFER_SRC alone is not).
         !createImage(ctx, ctx->flowImg, ctx->gridW, ctx->gridH, VK_FORMAT_R16G16_SFIXED5_NV,
-                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_OPTICAL_FLOW_USAGE_OUTPUT_BIT_NV,
-                     fams, famCount) ||
+                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                     VK_OPTICAL_FLOW_USAGE_OUTPUT_BIT_NV, fams, famCount) ||
         !createImage(ctx, ctx->costImg, ctx->gridW, ctx->gridH, VK_FORMAT_R8_UINT,
-                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_OPTICAL_FLOW_USAGE_COST_BIT_NV,
-                     fams, famCount) ||
+                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                     VK_OPTICAL_FLOW_USAGE_COST_BIT_NV, fams, famCount) ||
         !createImage(ctx, ctx->refinedFlow, W, H, VK_FORMAT_R16G16_SFLOAT,
                      VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, 0, nullptr, 1) ||
         !createImage(ctx, ctx->confidence, W, H, VK_FORMAT_R8_UNORM,
