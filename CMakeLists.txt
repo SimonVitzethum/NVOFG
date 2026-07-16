@@ -55,7 +55,8 @@ add_custom_target(nvofg_shaders DEPENDS ${NVOFG_SHADER_HEADERS})
 
 add_library(nvofg
   src/context.cpp
-  src/pipeline.cpp)
+  src/pipeline.cpp
+  src/pacer.cpp)
 add_dependencies(nvofg nvofg_shaders)
 target_include_directories(nvofg
   PUBLIC  include
@@ -71,6 +72,10 @@ enable_testing()
 add_executable(nvofg_test_lifecycle tests/test_lifecycle.cpp)
 target_link_libraries(nvofg_test_lifecycle PRIVATE nvofg Vulkan::Vulkan)
 add_test(NAME lifecycle COMMAND nvofg_test_lifecycle)
+
+add_executable(nvofg_test_pacer tests/test_pacer.cpp)
+target_link_libraries(nvofg_test_pacer PRIVATE nvofg)
+add_test(NAME pacer COMMAND nvofg_test_pacer)
 
 # Headless 2x interpolation example doubles as an integration test.
 add_executable(nvofg_headless_interp examples/headless_interp.cpp)

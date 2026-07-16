@@ -94,5 +94,28 @@ link it via `NVOFG_LIB_DIR` (default `<repo>/build`). See
 `crates/nvofg/examples/support.rs`.
 
 ## Frame pacing
-Cap base fps to `displayHz / multiplier` and keep VSync off (or use the optional pacer,
-§7). Added latency ≈ one base frame; there is no Reflex on native Linux.
+Cap base fps to `displayHz / multiplier` and keep VSync off. Added latency ≈ one base
+frame; there is no Reflex on native Linux.
+
+The optional **pacer** (`nvofg_pacer.h`, design §7) evenly spaces the `[gen] real …`
+sequence so it doesn't present in bursts. It touches no Vulkan — call it right before
+each `vkQueuePresentKHR` (real or generated):
+
+```c
+NvofgPacerConfig pc = { .display_hz = 120.0, .multiplier = 2 };
+NvofgPacer* pacer = nvofg_pacer_create(&pc);   // cap base fps to nvofg_pacer_base_fps_cap()
+// per presented frame:
+nvofg_pacer_wait_slot(pacer);   // blocks until the next evenly-spaced display slot
+vkQueuePresentKHR(...);
+// on a hitch / resize / vsync change: nvofg_pacer_reset(pacer);
+```
+
+Or, with `VK_KHR_present_wait`, read `nvofg_pacer_next_slot_time()` and pass it as the
+present target instead of sleeping.
+
+## Portability tiers
+- **Tier A (default, NVIDIA):** hardware OFA via `VK_NV_optical_flow`.
+- **Tier B (any Vulkan GPU):** portable block-match shader flow — lower quality, no OFA.
+  Set `NVOFG_FLAG_FORCE_SHADER_FLOW`, or nvofg auto-selects it when no OFA is present.
+- **Optional CUDA Tensor-Core backend** (`NVOFG_ENABLE_CUDA`, behind the CNN
+  interpolator boundary): see ADR 0004.
