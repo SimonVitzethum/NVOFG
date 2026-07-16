@@ -40,6 +40,8 @@ nvofg_add_shader(NVOFG_SHADER_HEADERS SOURCE ${CMAKE_SOURCE_DIR}/src/shaders/ref
                  ENTRY main SYMBOL nvofg_spv_refine)
 nvofg_add_shader(NVOFG_SHADER_HEADERS SOURCE ${CMAKE_SOURCE_DIR}/src/shaders/warp.slang
                  ENTRY main SYMBOL nvofg_spv_warp)
+nvofg_add_shader(NVOFG_SHADER_HEADERS SOURCE ${CMAKE_SOURCE_DIR}/src/shaders/debug.slang
+                 ENTRY main SYMBOL nvofg_spv_debug)
 add_custom_target(nvofg_shaders DEPENDS ${NVOFG_SHADER_HEADERS})
 
 add_library(nvofg

@@ -205,9 +205,16 @@ const char* nvofg_last_error(NvofgContext* ctx) {
 }
 
 NvofgResult nvofg_set_debug_view(NvofgContext* ctx, NvofgDebugView view,
-                                 const NvofgImageDesc* /*target*/) {
+                                 const NvofgImageDesc* target) {
     if (!ctx) return NVOFG_INVALID_ARGUMENT;
     ctx->debugView = view;
+    if (target) {
+        ctx->debugTarget = {target->image, target->view, target->format,
+                            target->width, target->height};
+        ctx->haveDebugTarget = true;
+    } else {
+        ctx->haveDebugTarget = false;
+    }
     return NVOFG_OK;
 }
 

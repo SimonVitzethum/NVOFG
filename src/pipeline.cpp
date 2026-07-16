@@ -15,6 +15,7 @@
 #include "nvofg_spv_prep.spv.h"
 #include "nvofg_spv_refine.spv.h"
 #include "nvofg_spv_warp.spv.h"
+#include "nvofg_spv_debug.spv.h"
 
 namespace {
 
@@ -275,22 +276,26 @@ NvofgResult ensurePipeline(NvofgContext* ctx) {
     for (uint32_t i = 4; i <= 7; ++i) warpB.push_back(bind(i, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE));
     warpB.push_back(bind(8, VK_DESCRIPTOR_TYPE_SAMPLER));
     warpB.push_back(bind(9, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE));
+    std::vector<B> debugB;
+    for (uint32_t i = 0; i <= 3; ++i) debugB.push_back(bind(i, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE));
+    debugB.push_back(bind(4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE));
     if (!createStage(ctx, ctx->prepStage, nvofg_spv_prep, nvofg_spv_prep_size, prepB, 0) ||
         !createStage(ctx, ctx->refineStage, nvofg_spv_refine, nvofg_spv_refine_size, refineB, 28) ||
-        !createStage(ctx, ctx->warpStage, nvofg_spv_warp, nvofg_spv_warp_size, warpB, 16)) {
+        !createStage(ctx, ctx->warpStage, nvofg_spv_warp, nvofg_spv_warp_size, warpB, 16) ||
+        !createStage(ctx, ctx->debugStage, nvofg_spv_debug, nvofg_spv_debug_size, debugB, 12)) {
         ctx->setError("failed to create compute pipelines");
         return NVOFG_INTERNAL;
     }
 
     // --- descriptor pool + sets ---
     VkDescriptorPoolSize sizes[] = {
-        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 16},
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8},
+        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 20},
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 10},
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4},
         {VK_DESCRIPTOR_TYPE_SAMPLER, 2}};
     VkDescriptorPoolCreateInfo dpci{};
     dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    dpci.maxSets = 4;
+    dpci.maxSets = 5;
     dpci.poolSizeCount = 4;
     dpci.pPoolSizes = sizes;
     if (vkCreateDescriptorPool(ctx->device, &dpci, nullptr, &ctx->descPool) != VK_SUCCESS)
@@ -307,7 +312,8 @@ NvofgResult ensurePipeline(NvofgContext* ctx) {
     if (!alloc(ctx->prepStage.setLayout, ctx->prepPrevSet) ||
         !alloc(ctx->prepStage.setLayout, ctx->prepCurrSet) ||
         !alloc(ctx->refineStage.setLayout, ctx->refineSet) ||
-        !alloc(ctx->warpStage.setLayout, ctx->warpSet))
+        !alloc(ctx->warpStage.setLayout, ctx->warpSet) ||
+        !alloc(ctx->debugStage.setLayout, ctx->debugSet))
         return NVOFG_INTERNAL;
 
     // --- command pools ---
@@ -355,7 +361,7 @@ void destroyPipeline(NvofgContext* ctx) {
     if (ctx->computePool) vkDestroyCommandPool(d, ctx->computePool, nullptr);
     if (ctx->ofPool) vkDestroyCommandPool(d, ctx->ofPool, nullptr);
     if (ctx->descPool) vkDestroyDescriptorPool(d, ctx->descPool, nullptr);
-    for (Stage* s : {&ctx->prepStage, &ctx->refineStage, &ctx->warpStage}) {
+    for (Stage* s : {&ctx->prepStage, &ctx->refineStage, &ctx->warpStage, &ctx->debugStage}) {
         if (s->pipeline) vkDestroyPipeline(d, s->pipeline, nullptr);
         if (s->pipeLayout) vkDestroyPipelineLayout(d, s->pipeLayout, nullptr);
         if (s->setLayout) vkDestroyDescriptorSetLayout(d, s->setLayout, nullptr);
@@ -650,6 +656,21 @@ NvofgResult nvofg_record_generate(NvofgContext* ctx, const NvofgGenerateInfo* in
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->warpStage.pipeLayout, 0, 1, &ctx->warpSet, 0, nullptr);
         vkCmdPushConstants(cmd, ctx->warpStage.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(wp), &wp);
         vkCmdDispatch(cmd, gx, gy, 1);
+
+        // Optional debug visualisation into an app-provided target.
+        if (ctx->debugView != NVOFG_DEBUG_NONE && ctx->haveDebugTarget) {
+            writeImg(ctx->debugSet, 0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, ctx->refinedFlow.view, G, VK_NULL_HANDLE);
+            writeImg(ctx->debugSet, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, ctx->refinedFlowBwd.view, G, VK_NULL_HANDLE);
+            writeImg(ctx->debugSet, 2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, ctx->confidence.view, G, VK_NULL_HANDLE);
+            writeImg(ctx->debugSet, 3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, ctx->occlusion.view, G, VK_NULL_HANDLE);
+            writeImg(ctx->debugSet, 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, ctx->debugTarget.view, G, VK_NULL_HANDLE);
+            imgBarrier(cmd, ctx->debugTarget.image, VK_IMAGE_LAYOUT_UNDEFINED, G, 0, VK_ACCESS_SHADER_WRITE_BIT);
+            struct DbgPush { uint32_t width, height, mode; } dp{W, H, (uint32_t)ctx->debugView};
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->debugStage.pipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->debugStage.pipeLayout, 0, 1, &ctx->debugSet, 0, nullptr);
+            vkCmdPushConstants(cmd, ctx->debugStage.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(dp), &dp);
+            vkCmdDispatch(cmd, gx, gy, 1);
+        }
         submitTimeline(ctx->queue, cmd, ctx->timeline, v2, ctx->timeline, v3);
     }
 

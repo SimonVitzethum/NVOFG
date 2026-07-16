@@ -177,6 +177,11 @@ int main(int argc, char** argv) {
     NvofgAuxDesc aux{}; aux.ui_mask=&ui0; aux.motion=&mv0;
     if (nvofg_register_aux(ctx,&aux)!=NVOFG_OK){ std::fprintf(stderr,"register_aux failed\n"); return 3; }
 
+    // Debug visualisation target: request the forward flow view.
+    Img dbgImg = mkImg(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    NvofgImageDesc dbg0{dbgImg.image,dbgImg.view,VK_FORMAT_R8G8B8A8_UNORM,W,H};
+    nvofg_set_debug_view(ctx, NVOFG_DEBUG_FLOW_FWD, &dbg0);
+
     NvofgGenerateInfo gi{}; gi.phase=0.5f; gi.prev_layout=VK_IMAGE_LAYOUT_GENERAL; gi.curr_layout=VK_IMAGE_LAYOUT_GENERAL;
     gi.input_timeline=VK_NULL_HANDLE;  // colors already uploaded+idle
     NvofgFrameSync sync{};
@@ -230,7 +235,7 @@ int main(int argc, char** argv) {
 
     vkUnmapMemory(dev,rbm); vkDestroyBuffer(dev,rb,nullptr); vkFreeMemory(dev,rbm,nullptr);
     nvofg_destroy(ctx);
-    for (Img* im : {&prev,&curr,&outI,&uiImg,&mvImg}){ vkDestroyImageView(dev,im->view,nullptr); vkDestroyImage(dev,im->image,nullptr); vkFreeMemory(dev,im->mem,nullptr); }
+    for (Img* im : {&prev,&curr,&outI,&uiImg,&mvImg,&dbgImg}){ vkDestroyImageView(dev,im->view,nullptr); vkDestroyImage(dev,im->image,nullptr); vkFreeMemory(dev,im->mem,nullptr); }
     vkDestroyCommandPool(dev,pool,nullptr); vkDestroyDevice(dev,nullptr); vkDestroyInstance(instance,nullptr);
     return ok ? 0 : 4;
 }
