@@ -109,6 +109,7 @@ struct NvofgContext {
     // --- motion-vector hint (ENABLE_HINT) ---
     bool useHint = false;
     nvofg::Image  hintImg;              // SFIXED5 at hint grid
+    nvofg::Buffer hintBuf;             // packed S10.5 written by hintStage, copied to hintImg
     nvofg::Stage  hintStage;           // converts app MVs -> S10.5 hint
     VkDescriptorSet hintSet = VK_NULL_HANDLE;
 

@@ -16,6 +16,7 @@
 #include "nvofg_spv_refine.spv.h"
 #include "nvofg_spv_warp.spv.h"
 #include "nvofg_spv_debug.spv.h"
+#include "nvofg_spv_hint.spv.h"
 
 namespace {
 
@@ -156,6 +157,7 @@ NvofgResult ensurePipeline(NvofgContext* ctx) {
     ctx->gridW = (W + ctx->gridSize - 1) / ctx->gridSize;
     ctx->gridH = (H + ctx->gridSize - 1) / ctx->gridSize;
     ctx->bidir = (ctx->flags & NVOFG_FLAG_BIDIRECTIONAL) && ctx->caps.bidirectional;
+    ctx->useHint = (ctx->flags & NVOFG_FLAG_USE_MOTION) && ctx->hasMotion && ctx->caps.hint_support;
     const uint32_t fams[2] = {ctx->queueFamily, ctx->ofFamily};
     const uint32_t famCount = (ctx->queueFamily == ctx->ofFamily) ? 1 : 2;
 
@@ -210,6 +212,18 @@ NvofgResult ensurePipeline(NvofgContext* ctx) {
         return NVOFG_OUT_OF_MEMORY;
     }
 
+    // Hint resources (MV pre-pass): packed buffer + SFIXED5 hint image at hint grid.
+    if (ctx->useHint) {
+        if (!createImage(ctx, ctx->hintImg, ctx->gridW, ctx->gridH, VK_FORMAT_R16G16_SFIXED5_NV,
+                         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                         VK_OPTICAL_FLOW_USAGE_HINT_BIT_NV, fams, famCount) ||
+            !createBuffer(ctx, ctx->hintBuf, (VkDeviceSize)ctx->gridW * ctx->gridH * 4,
+                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) {
+            ctx->setError("failed to allocate hint resources");
+            return NVOFG_OUT_OF_MEMORY;
+        }
+    }
+
     // 1x1 fallback images bound where an aux/bidir input is absent.
     const VkImageUsageFlags kDummy = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (!createImage(ctx, ctx->dummyR8, 1, 1, VK_FORMAT_R8_UNORM, kDummy, 0, nullptr, 1) ||
@@ -226,12 +240,14 @@ NvofgResult ensurePipeline(NvofgContext* ctx) {
     sci.flowVectorFormat = VK_FORMAT_R16G16_SFIXED5_NV;
     sci.costFormat = VK_FORMAT_R8_UINT;
     sci.outputGridSize = VK_OPTICAL_FLOW_GRID_SIZE_4X4_BIT_NV;
-    sci.hintGridSize = VK_OPTICAL_FLOW_GRID_SIZE_UNKNOWN_NV;
+    sci.hintGridSize = ctx->useHint ? VK_OPTICAL_FLOW_GRID_SIZE_4X4_BIT_NV
+                                    : VK_OPTICAL_FLOW_GRID_SIZE_UNKNOWN_NV;
     sci.performanceLevel = (ctx->quality == NVOFG_QUALITY_HIGH) ? VK_OPTICAL_FLOW_PERFORMANCE_LEVEL_SLOW_NV
                         : (ctx->quality == NVOFG_QUALITY_PERF)  ? VK_OPTICAL_FLOW_PERFORMANCE_LEVEL_FAST_NV
                                                                 : VK_OPTICAL_FLOW_PERFORMANCE_LEVEL_MEDIUM_NV;
     sci.flags = VK_OPTICAL_FLOW_SESSION_CREATE_ENABLE_COST_BIT_NV;
-    if (ctx->bidir) sci.flags |= VK_OPTICAL_FLOW_SESSION_CREATE_BOTH_DIRECTIONS_BIT_NV;
+    if (ctx->bidir)   sci.flags |= VK_OPTICAL_FLOW_SESSION_CREATE_BOTH_DIRECTIONS_BIT_NV;
+    if (ctx->useHint) sci.flags |= VK_OPTICAL_FLOW_SESSION_CREATE_ENABLE_HINT_BIT_NV;
     if (ctx->of.createSession(ctx->device, &sci, nullptr, &ctx->session) != VK_SUCCESS) {
         ctx->setError("vkCreateOpticalFlowSessionNV failed");
         return NVOFG_INTERNAL;
@@ -249,6 +265,10 @@ NvofgResult ensurePipeline(NvofgContext* ctx) {
                           ctx->flowBwdImg.view, VK_IMAGE_LAYOUT_GENERAL);
         ctx->of.bindImage(ctx->device, ctx->session, VK_OPTICAL_FLOW_SESSION_BINDING_POINT_BACKWARD_COST_NV,
                           ctx->costBwdImg.view, VK_IMAGE_LAYOUT_GENERAL);
+    }
+    if (ctx->useHint) {
+        ctx->of.bindImage(ctx->device, ctx->session, VK_OPTICAL_FLOW_SESSION_BINDING_POINT_HINT_NV,
+                          ctx->hintImg.view, VK_IMAGE_LAYOUT_GENERAL);
     }
 
     // --- sampler ---
@@ -286,6 +306,14 @@ NvofgResult ensurePipeline(NvofgContext* ctx) {
         ctx->setError("failed to create compute pipelines");
         return NVOFG_INTERNAL;
     }
+    if (ctx->useHint) {
+        std::vector<B> hintBd = {bind(0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE),
+                                 bind(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)};
+        if (!createStage(ctx, ctx->hintStage, nvofg_spv_hint, nvofg_spv_hint_size, hintBd, 20)) {
+            ctx->setError("failed to create hint pipeline");
+            return NVOFG_INTERNAL;
+        }
+    }
 
     // --- descriptor pool + sets ---
     VkDescriptorPoolSize sizes[] = {
@@ -295,7 +323,7 @@ NvofgResult ensurePipeline(NvofgContext* ctx) {
         {VK_DESCRIPTOR_TYPE_SAMPLER, 2}};
     VkDescriptorPoolCreateInfo dpci{};
     dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    dpci.maxSets = 5;
+    dpci.maxSets = 6;
     dpci.poolSizeCount = 4;
     dpci.pPoolSizes = sizes;
     if (vkCreateDescriptorPool(ctx->device, &dpci, nullptr, &ctx->descPool) != VK_SUCCESS)
@@ -315,6 +343,7 @@ NvofgResult ensurePipeline(NvofgContext* ctx) {
         !alloc(ctx->warpStage.setLayout, ctx->warpSet) ||
         !alloc(ctx->debugStage.setLayout, ctx->debugSet))
         return NVOFG_INTERNAL;
+    if (ctx->useHint && !alloc(ctx->hintStage.setLayout, ctx->hintSet)) return NVOFG_INTERNAL;
 
     // --- command pools ---
     VkCommandPoolCreateInfo cpci{};
@@ -361,7 +390,7 @@ void destroyPipeline(NvofgContext* ctx) {
     if (ctx->computePool) vkDestroyCommandPool(d, ctx->computePool, nullptr);
     if (ctx->ofPool) vkDestroyCommandPool(d, ctx->ofPool, nullptr);
     if (ctx->descPool) vkDestroyDescriptorPool(d, ctx->descPool, nullptr);
-    for (Stage* s : {&ctx->prepStage, &ctx->refineStage, &ctx->warpStage, &ctx->debugStage}) {
+    for (Stage* s : {&ctx->prepStage, &ctx->refineStage, &ctx->warpStage, &ctx->debugStage, &ctx->hintStage}) {
         if (s->pipeline) vkDestroyPipeline(d, s->pipeline, nullptr);
         if (s->pipeLayout) vkDestroyPipelineLayout(d, s->pipeLayout, nullptr);
         if (s->setLayout) vkDestroyDescriptorSetLayout(d, s->setLayout, nullptr);
@@ -373,7 +402,7 @@ void destroyPipeline(NvofgContext* ctx) {
         if (b->buffer) vkDestroyBuffer(d, b->buffer, nullptr);
         if (b->memory) vkFreeMemory(d, b->memory, nullptr);
     }
-    for (Buffer* b : {&ctx->flowBwdBuf, &ctx->costBwdBuf}) {
+    for (Buffer* b : {&ctx->flowBwdBuf, &ctx->costBwdBuf, &ctx->hintBuf}) {
         if (b->buffer) vkDestroyBuffer(d, b->buffer, nullptr);
         if (b->memory) vkFreeMemory(d, b->memory, nullptr);
     }
@@ -571,6 +600,10 @@ NvofgResult nvofg_record_generate(NvofgContext* ctx, const NvofgGenerateInfo* in
       w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER; w.pImageInfo = &ii;
       vkUpdateDescriptorSets(ctx->device, 1, &w, 0, nullptr); }
     writeImg(ctx->warpSet, 9, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, ctx->output.view, G, VK_NULL_HANDLE);
+    if (ctx->useHint) {
+        writeImg(ctx->hintSet, 0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, ctx->motion.view, G, VK_NULL_HANDLE);
+        writeBuf(ctx->hintSet, 1, ctx->hintBuf.buffer, ctx->hintBuf.size);
+    }
 
     const uint64_t base = ctx->timelineValue;
     const uint64_t v1 = base + 1, v2 = base + 2, v3 = base + 3;
@@ -589,6 +622,26 @@ NvofgResult nvofg_record_generate(NvofgContext* ctx, const NvofgGenerateInfo* in
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->prepStage.pipeLayout,
                                 0, 1, &ctx->prepCurrSet, 0, nullptr);
         vkCmdDispatch(cmd, gx, gy, 1);
+
+        // MV hint pre-pass: encode app MVs into the OFA S10.5 hint image.
+        if (ctx->useHint) {
+            const uint32_t hgx = (ctx->gridW + 7) / 8, hgy = (ctx->gridH + 7) / 8;
+            struct HintPush { uint32_t gridW, gridH, gridSize, width, height; }
+                hp{ctx->gridW, ctx->gridH, ctx->gridSize, W, H};
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->hintStage.pipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->hintStage.pipeLayout, 0, 1, &ctx->hintSet, 0, nullptr);
+            vkCmdPushConstants(cmd, ctx->hintStage.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(hp), &hp);
+            vkCmdDispatch(cmd, hgx, hgy, 1);
+            VkBufferMemoryBarrier bb{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, nullptr,
+                VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, ctx->hintBuf.buffer, 0, ctx->hintBuf.size};
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &bb, 0, nullptr);
+            imgBarrier(cmd, ctx->hintImg.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+            VkBufferImageCopy hc{}; hc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            hc.imageExtent = {ctx->gridW, ctx->gridH, 1};
+            vkCmdCopyBufferToImage(cmd, ctx->hintBuf.buffer, ctx->hintImg.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &hc);
+            imgBarrier(cmd, ctx->hintImg.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, G, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT);
+        }
         submitTimeline(ctx->queue, cmd, info->input_timeline, info->input_value, ctx->timeline, v1);
     }
 
@@ -603,7 +656,9 @@ NvofgResult nvofg_record_generate(NvofgContext* ctx, const NvofgGenerateInfo* in
         }
         VkOpticalFlowExecuteInfoNV ei{};
         ei.sType = VK_STRUCTURE_TYPE_OPTICAL_FLOW_EXECUTE_INFO_NV;
-        ei.flags = VK_OPTICAL_FLOW_EXECUTE_DISABLE_TEMPORAL_HINTS_BIT_NV;
+        // Single pair: disable the OFA's internal temporal-hint reuse. When we supply
+        // an external MV hint, leave hints enabled so the hardware uses it.
+        ei.flags = ctx->useHint ? 0u : VK_OPTICAL_FLOW_EXECUTE_DISABLE_TEMPORAL_HINTS_BIT_NV;
         ctx->of.cmdExecute(cmd, ctx->session, &ei);
         submitTimeline(ctx->ofQueue, cmd, ctx->timeline, v1, ctx->timeline, v2);
     }
