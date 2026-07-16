@@ -10,47 +10,60 @@
 
 namespace {
 
-// Fields: id, stage, family, supported(0->set later), proprietary, deterministic,
-//         quality_tier, cost_hint, required_inputs, requires_family_stage,
-//         requires_family, name, note.
+// Fields: id, stage, family, backend_version, features, supported(0->set later),
+//         proprietary, deterministic, quality_tier, cost_hint, required_inputs,
+//         requires_family_stage, requires_family, name, note.
+#define F_HDR   RFX_FEATURE_HDR
+#define F_RST   RFX_FEATURE_TEMPORAL_RESET
+#define F_REACT RFX_FEATURE_REACTIVE_MASK
+#define F_MATID RFX_FEATURE_MATERIAL_IDS
+#define F_GBUF  RFX_FEATURE_GBUFFER
+#define F_TENS  RFX_FEATURE_TENSOR_BACKEND
+#define F_AEXP  RFX_FEATURE_AUTO_EXPOSURE
+#define F_ASYNC RFX_FEATURE_ASYNC
+#define F_STATS RFX_FEATURE_STATISTICS
+
 const RfxBackendCaps kTable[] = {
     // ---- Upscaling ----
-    {RFX_BACKEND_NATIVE, RFX_STAGE_UPSCALING, RFX_FAMILY_GENERIC, 0, 0, 1, 20, 5,
+    {RFX_BACKEND_NATIVE, RFX_STAGE_UPSCALING, RFX_FAMILY_GENERIC, 1, 0, 0, 0, 1, 20, 5,
      RFX_INPUT_COLOR, RFX_STAGE_COUNT, RFX_FAMILY_GENERIC,
      "Native (bilinear)", "built-in vendor-neutral upscale"},
-    {RFX_BACKEND_TEMPORAL, RFX_STAGE_UPSCALING, RFX_FAMILY_GENERIC, 0, 0, 1, 50, 15,
+    {RFX_BACKEND_TEMPORAL, RFX_STAGE_UPSCALING, RFX_FAMILY_GENERIC, 1, F_RST, 0, 0, 1, 50, 15,
      RFX_INPUT_COLOR | RFX_INPUT_MOTION | RFX_INPUT_DEPTH | RFX_INPUT_JITTER | RFX_INPUT_REPROJ,
      RFX_STAGE_COUNT, RFX_FAMILY_GENERIC, "Temporal", "built-in temporal upscaler (reserved)"},
-    {RFX_BACKEND_DLSS_SR, RFX_STAGE_UPSCALING, RFX_FAMILY_DLSS, 0, 1, 0, 90, 30,
+    {RFX_BACKEND_DLSS_SR, RFX_STAGE_UPSCALING, RFX_FAMILY_DLSS, 1, F_HDR | F_AEXP | F_RST | F_TENS, 0, 1, 0, 90, 30,
      RFX_INPUT_COLOR | RFX_INPUT_MOTION | RFX_INPUT_DEPTH | RFX_INPUT_JITTER,
      RFX_STAGE_COUNT, RFX_FAMILY_GENERIC, "DLSS SR", "NGX Super Resolution (reserved)"},
-    {RFX_BACKEND_DLAA, RFX_STAGE_UPSCALING, RFX_FAMILY_DLSS, 0, 1, 0, 92, 32,
+    {RFX_BACKEND_DLAA, RFX_STAGE_UPSCALING, RFX_FAMILY_DLSS, 1, F_HDR | F_AEXP | F_RST | F_TENS, 0, 1, 0, 92, 32,
      RFX_INPUT_COLOR | RFX_INPUT_MOTION | RFX_INPUT_DEPTH | RFX_INPUT_JITTER,
      RFX_STAGE_COUNT, RFX_FAMILY_GENERIC, "DLAA", "NGX DLAA (reserved)"},
-    {RFX_BACKEND_FSR, RFX_STAGE_UPSCALING, RFX_FAMILY_FSR, 0, 0, 1, 70, 20,
+    {RFX_BACKEND_FSR, RFX_STAGE_UPSCALING, RFX_FAMILY_FSR, 1, F_HDR | F_RST, 0, 0, 1, 70, 20,
      RFX_INPUT_COLOR | RFX_INPUT_MOTION | RFX_INPUT_DEPTH | RFX_INPUT_JITTER,
      RFX_STAGE_COUNT, RFX_FAMILY_GENERIC, "FSR", "AMD FidelityFX SR (reserved)"},
-    {RFX_BACKEND_XESS, RFX_STAGE_UPSCALING, RFX_FAMILY_XESS, 0, 0, 1, 75, 22,
+    {RFX_BACKEND_XESS, RFX_STAGE_UPSCALING, RFX_FAMILY_XESS, 1, F_HDR | F_RST | F_TENS, 0, 0, 1, 75, 22,
      RFX_INPUT_COLOR | RFX_INPUT_MOTION | RFX_INPUT_DEPTH | RFX_INPUT_JITTER,
      RFX_STAGE_COUNT, RFX_FAMILY_GENERIC, "XeSS", "Intel XeSS (reserved)"},
 
     // ---- Ray Reconstruction (requires a DLSS upscaler in NVIDIA's stack) ----
-    {RFX_BACKEND_DLSS_RR, RFX_STAGE_RAY_RECONSTRUCTION, RFX_FAMILY_DLSS, 0, 1, 0, 90, 45,
+    {RFX_BACKEND_DLSS_RR, RFX_STAGE_RAY_RECONSTRUCTION, RFX_FAMILY_DLSS, 1,
+     F_HDR | F_GBUF | F_MATID | F_RST | F_TENS, 0, 1, 0, 90, 45,
      RFX_INPUT_COLOR | RFX_INPUT_DEPTH | RFX_INPUT_MOTION | RFX_INPUT_ROUGHNESS |
          RFX_INPUT_ALBEDO_DIFFUSE | RFX_INPUT_ALBEDO_SPECULAR | RFX_INPUT_NORMALS,
      RFX_STAGE_UPSCALING, RFX_FAMILY_DLSS, "DLSS RR", "NGX Ray Reconstruction (reserved; needs DLSS SR)"},
 
     // ---- Frame Generation ----
-    {RFX_BACKEND_NVOFG, RFX_STAGE_FRAME_GENERATION, RFX_FAMILY_NVOFG, 0, 0, 1, 60, 30,
+    {RFX_BACKEND_NVOFG, RFX_STAGE_FRAME_GENERATION, RFX_FAMILY_NVOFG, 1,
+     F_HDR | F_REACT | F_MATID | F_RST | F_ASYNC | F_STATS, 0, 0, 1, 60, 30,
      RFX_INPUT_COLOR | RFX_INPUT_DEPTH | RFX_INPUT_MOTION | RFX_INPUT_REPROJ,
      RFX_STAGE_COUNT, RFX_FAMILY_GENERIC, "nvofg (OFA)", "native OFA frame generation"},
-    {RFX_BACKEND_SHADER_FG, RFX_STAGE_FRAME_GENERATION, RFX_FAMILY_GENERIC, 0, 0, 1, 40, 35,
+    {RFX_BACKEND_SHADER_FG, RFX_STAGE_FRAME_GENERATION, RFX_FAMILY_GENERIC, 1,
+     F_REACT | F_MATID | F_RST, 0, 0, 1, 40, 35,
      RFX_INPUT_COLOR | RFX_INPUT_DEPTH | RFX_INPUT_MOTION,
      RFX_STAGE_COUNT, RFX_FAMILY_GENERIC, "nvofg (shader)", "portable shader frame generation (Tier B)"},
-    {RFX_BACKEND_DLSS_FG, RFX_STAGE_FRAME_GENERATION, RFX_FAMILY_DLSS, 0, 1, 0, 85, 35,
+    {RFX_BACKEND_DLSS_FG, RFX_STAGE_FRAME_GENERATION, RFX_FAMILY_DLSS, 1, F_HDR | F_RST | F_TENS, 0, 1, 0, 85, 35,
      RFX_INPUT_COLOR | RFX_INPUT_DEPTH | RFX_INPUT_MOTION,
      RFX_STAGE_UPSCALING, RFX_FAMILY_DLSS, "DLSS FG", "NGX DLSS-G (Windows-gated; reserved)"},
-    {RFX_BACKEND_FSR_FG, RFX_STAGE_FRAME_GENERATION, RFX_FAMILY_FSR, 0, 0, 1, 70, 30,
+    {RFX_BACKEND_FSR_FG, RFX_STAGE_FRAME_GENERATION, RFX_FAMILY_FSR, 1, F_HDR | F_RST, 0, 0, 1, 70, 30,
      RFX_INPUT_COLOR | RFX_INPUT_DEPTH | RFX_INPUT_MOTION,
      RFX_STAGE_UPSCALING, RFX_FAMILY_FSR, "FSR FG", "FSR frame generation (reserved; pairs with FSR)"},
 };
@@ -62,6 +75,8 @@ namespace renderfx {
 
 void buildCapabilities(bool nvofgOfa, bool nvofgShader, RfxCapabilities* out) {
     std::memset(out, 0, sizeof(*out));
+    out->api_version = RFX_API_VERSION;
+    out->capability_schema_version = RFX_CAPABILITY_SCHEMA_VERSION;
     out->count = kTableCount;
     for (uint32_t i = 0; i < kTableCount; ++i) {
         out->backends[i] = kTable[i];
@@ -77,6 +92,15 @@ void buildCapabilities(bool nvofgOfa, bool nvofgShader, RfxCapabilities* out) {
 }
 
 }  // namespace renderfx
+
+extern "C" uint64_t rfx_stage_features(const RfxCapabilities* caps, RfxStage stage) {
+    if (!caps) return 0;
+    uint64_t f = 0;
+    for (uint32_t i = 0; i < caps->count; ++i)
+        if (caps->backends[i].stage == stage && caps->backends[i].supported)
+            f |= caps->backends[i].features;
+    return f;
+}
 
 extern "C" {
 

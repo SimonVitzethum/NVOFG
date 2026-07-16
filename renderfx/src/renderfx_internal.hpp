@@ -15,4 +15,5 @@ struct RfxContext {
     RfxBackendId fgBackend = RFX_BACKEND_NONE;
     NvofgContext* nvofg = nullptr;
     bool registered = false;
+    uint64_t framesGenerated = 0;   // runtime statistics counter
 };

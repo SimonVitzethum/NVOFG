@@ -26,6 +26,13 @@ extern "C" {
 
 #define RFX_VERSION 1
 
+/* Capability versioning (evolve without API breaks): the app checks these to know how
+ * to interpret the capability schema and each backend's revision. New backend
+ * generations (DLSS SR v2/v3, RR revisions, FSR/XeSS gens) bump backend_version and add
+ * feature bits — never new boolean fields sprinkled through the API. */
+#define RFX_API_VERSION                1
+#define RFX_CAPABILITY_SCHEMA_VERSION  1
+
 typedef enum RfxResult {
     RFX_OK = 0,
     RFX_UNSUPPORTED,
@@ -93,6 +100,25 @@ enum {
 
 typedef enum RfxQuality { RFX_QUALITY_PERF = 0, RFX_QUALITY_BALANCED, RFX_QUALITY_QUALITY } RfxQuality;
 
+/* Backend feature bits (design.md §18) — a query-oriented alternative to a boolean
+ * explosion. New capabilities become new bits; the ABI does not change. A 64-bit mask
+ * is finite; growth beyond it relies on RFX_CAPABILITY_SCHEMA_VERSION + struct
+ * extensibility. Query per backend (RfxBackendCaps.features) or per stage
+ * (rfx_query_stage_features). */
+enum {
+    RFX_FEATURE_HDR            = 1ull << 0,  /* HDR / scRGB color path                */
+    RFX_FEATURE_ASYNC          = 1ull << 1,  /* runs on a separate/async queue        */
+    RFX_FEATURE_TEMPORAL_RESET = 1ull << 2,  /* honours a per-frame history reset     */
+    RFX_FEATURE_REACTIVE_MASK  = 1ull << 3,  /* consumes a reactive mask              */
+    RFX_FEATURE_MATERIAL_IDS   = 1ull << 4,  /* consumes material/object ids          */
+    RFX_FEATURE_GBUFFER        = 1ull << 5,  /* consumes a GBuffer (albedo/normals/…) */
+    RFX_FEATURE_TENSOR_BACKEND = 1ull << 6,  /* uses Tensor Cores (cooperative/CUDA)  */
+    RFX_FEATURE_AUTO_EXPOSURE  = 1ull << 7,  /* handles exposure internally           */
+    RFX_FEATURE_STATISTICS     = 1ull << 8,  /* populates RfxStatistics               */
+    RFX_FEATURE_DYNAMIC_RES    = 1ull << 9,  /* supports dynamic resolution           */
+    /* bits 10..63 reserved for future features */
+};
+
 /* -------------------------------------------------------------------------- */
 /* Shared Frame Context — the renderer produces these once; every stage reuses */
 /* them. ABI-versioned (struct_size/version) so fields append without breaks.  */
@@ -127,6 +153,8 @@ typedef struct RfxBackendCaps {
     RfxBackendId     id;
     RfxStage         stage;
     RfxBackendFamily family;
+    uint32_t         backend_version;  /* revision of this backend (SR v2/v3, …) */
+    uint64_t         features;         /* RFX_FEATURE_* bitmask                 */
     uint32_t         supported;        /* 1/0 on this device+build            */
     uint32_t         proprietary;      /* needs a vendor blob/model           */
     uint32_t         deterministic;    /* reproducible output (for debug/golden) */
@@ -142,9 +170,16 @@ typedef struct RfxBackendCaps {
 } RfxBackendCaps;
 
 typedef struct RfxCapabilities {
+    uint32_t       api_version;               /* = RFX_API_VERSION                */
+    uint32_t       capability_schema_version; /* = RFX_CAPABILITY_SCHEMA_VERSION  */
     uint32_t       count;
+    uint32_t       _pad;
     RfxBackendCaps backends[RFX_BACKEND_COUNT];
 } RfxCapabilities;
+
+/* Union of features across the supported backends of a stage (design.md §18 —
+ * feature queries, not a boolean explosion). Pure. */
+uint64_t rfx_stage_features(const RfxCapabilities* caps, RfxStage stage);
 
 /* -------------------------------------------------------------------------- */
 /* The four explicit concepts (design.md §18):                                 */
@@ -261,6 +296,31 @@ RfxResult rfx_record_frame_generation(RfxContext*, const RfxFrameContext* fc,
                                       VkImageLayout color_layout,
                                       const RfxFrameSync* input_ready /*nullable*/,
                                       RfxFrameSync* out_sync);
+
+/* Union of features across the supported backends of the given stage on this context. */
+uint64_t rfx_query_stage_features(RfxContext*, RfxStage);
+
+/* -------------------------------------------------------------------------- */
+/* Optional runtime statistics (design.md §18) — a lightweight container the    */
+/* active backends *populate*, NOT a profiler. RenderFX owns no command buffers  */
+/* (engine-owned graph), so GPU timings are provided by backends that expose     */
+/* timestamps (RFX_FEATURE_STATISTICS); unmeasured fields are 0 (unknown).       */
+/* -------------------------------------------------------------------------- */
+typedef struct RfxStatistics {
+    uint32_t schema_version;    /* = RFX_CAPABILITY_SCHEMA_VERSION */
+    uint32_t _pad;
+    uint64_t frames_generated;  /* interpolated frames produced (real counter) */
+    /* Per-stage GPU time, microseconds; 0.0 = not measured by the active backend. */
+    double   total_gpu_us;
+    double   frame_gen_us;
+    double   optical_flow_us;
+    double   tensor_us;
+    double   ray_recon_us;
+    double   upscaling_us;
+    double   backend_latency_us;
+} RfxStatistics;
+
+RfxResult rfx_get_statistics(RfxContext*, RfxStatistics* out);
 
 const char* rfx_backend_name(RfxBackendId);   /* stable string id (for serialization) */
 const char* rfx_stage_name(RfxStage);

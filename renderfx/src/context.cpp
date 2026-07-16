@@ -108,6 +108,23 @@ RfxResult rfx_record_frame_generation(RfxContext* ctx, const RfxFrameContext* fc
     if (r != NVOFG_OK) return RFX_INTERNAL;
     out_sync->semaphore = sync.semaphore;
     out_sync->value = sync.value;
+    ctx->framesGenerated++;
+    return RFX_OK;
+}
+
+uint64_t rfx_query_stage_features(RfxContext* ctx, RfxStage stage) {
+    if (!ctx) return 0;
+    return rfx_stage_features(&ctx->caps, stage);
+}
+
+RfxResult rfx_get_statistics(RfxContext* ctx, RfxStatistics* out) {
+    if (!ctx || !out) return RFX_INVALID_ARGUMENT;
+    std::memset(out, 0, sizeof(*out));
+    out->schema_version = RFX_CAPABILITY_SCHEMA_VERSION;
+    out->frames_generated = ctx->framesGenerated;
+    // GPU-time fields stay 0 (unknown): RenderFX owns no command buffers, so timings
+    // must come from backends exposing timestamps (RFX_FEATURE_STATISTICS). nvofg does
+    // not yet expose per-stage GPU timing — reserved for a future backend revision.
     return RFX_OK;
 }
 

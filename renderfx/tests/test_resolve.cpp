@@ -172,6 +172,26 @@ int main() {
         std::printf("---\n%s---\n", buf);
     }
 
+    // M) Capability versioning + feature queries (pure, headless).
+    {
+        RfxCapabilities c; renderfx::buildCapabilities(true, true, &c);
+        REQUIRE(c.api_version == RFX_API_VERSION &&
+                c.capability_schema_version == RFX_CAPABILITY_SCHEMA_VERSION,
+                "capability versioning present");
+        uint64_t fgf = rfx_stage_features(&c, RFX_STAGE_FRAME_GENERATION);
+        REQUIRE((fgf & RFX_FEATURE_REACTIVE_MASK) && (fgf & RFX_FEATURE_MATERIAL_IDS),
+                "FG stage features include reactive mask + material ids");
+        REQUIRE((fgf & RFX_FEATURE_STATISTICS) != 0, "FG stage advertises statistics");
+        bool ok = false;
+        for (uint32_t i = 0; i < c.count; ++i)
+            if (c.backends[i].id == RFX_BACKEND_NVOFG)
+                ok = c.backends[i].backend_version >= 1 && (c.backends[i].features & RFX_FEATURE_ASYNC);
+        REQUIRE(ok, "nvofg backend carries version + ASYNC feature");
+        // RR stage exposes GBuffer/material features (for future DLSS RR).
+        uint64_t rrf = rfx_stage_features(&c, RFX_STAGE_RAY_RECONSTRUCTION);
+        REQUIRE(rrf == 0, "RR stage features empty (no RR backend supported yet)");
+    }
+
     std::printf("ALL RENDERFX RESOLVER CHECKS PASSED\n");
     return 0;
 }
