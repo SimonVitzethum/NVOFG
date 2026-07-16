@@ -11,13 +11,16 @@ nvofg_add_shader(RENDERFX_SHADERS SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders
                  ENTRY main SYMBOL rfx_spv_upscale_native)
 nvofg_add_shader(RENDERFX_SHADERS SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/upscale_temporal.slang
                  ENTRY main SYMBOL rfx_spv_upscale_temporal)
+nvofg_add_shader(RENDERFX_SHADERS SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/rr_debug.slang
+                 ENTRY main SYMBOL rfx_spv_rr_debug)
 add_custom_target(renderfx_shaders DEPENDS ${RENDERFX_SHADERS})
 
 add_library(renderfx
   src/backends.cpp
   src/resolve.cpp
   src/context.cpp
-  src/upscale.cpp)
+  src/upscale.cpp
+  src/rr_debug.cpp)
 add_dependencies(renderfx renderfx_shaders)
 target_include_directories(renderfx
   PUBLIC  include
@@ -33,4 +36,8 @@ if(NOT NVOFG_LIBRARY_ONLY)
   add_executable(renderfx_test_upscale tests/test_upscale.cpp)
   target_link_libraries(renderfx_test_upscale PRIVATE renderfx Vulkan::Vulkan)
   add_test(NAME renderfx_upscale COMMAND renderfx_test_upscale)
+
+  add_executable(renderfx_test_rr_debug tests/test_rr_debug.cpp)
+  target_link_libraries(renderfx_test_rr_debug PRIVATE renderfx Vulkan::Vulkan)
+  add_test(NAME renderfx_rr_debug COMMAND renderfx_test_rr_debug)
 endif()

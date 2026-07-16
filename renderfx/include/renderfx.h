@@ -324,6 +324,23 @@ uint32_t rfx_backend_required_inputs(RfxBackendId backend);
  * validating RR's GBuffer inputs. */
 uint32_t rfx_missing_inputs(RfxContext*, RfxStage stage, const RfxFrameContext* fc);
 
+/* RR/GBuffer debug visualisation (design: validate RR inputs). Renders one Frame
+ * Context channel into `output` (a vendor-neutral compute pass into the app's cmd
+ * buffer). If the requested channel is absent from the Frame Context, the output is
+ * flagged magenta — an immediate missing-input diagnostic. */
+typedef enum RfxDebugView {
+    RFX_DEBUG_NONE = 0,
+    RFX_DEBUG_NORMALS,
+    RFX_DEBUG_ROUGHNESS,
+    RFX_DEBUG_DIFFUSE_ALBEDO,
+    RFX_DEBUG_SPECULAR_ALBEDO,
+    RFX_DEBUG_DEPTH,
+    RFX_DEBUG_MOTION,
+} RfxDebugView;
+
+RfxResult rfx_record_debug_view(RfxContext*, VkCommandBuffer cmd, const RfxFrameContext* fc,
+                                const RfxImageDesc* output, RfxDebugView view);
+
 /* Union of features across the supported backends of the given stage on this context. */
 uint64_t rfx_query_stage_features(RfxContext*, RfxStage);
 

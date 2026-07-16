@@ -51,6 +51,19 @@ struct RfxContext {
     bool                  tReady = false;
     uint32_t              frameParity = 0;
     bool                  historyValid = false;
+
+    // RR/GBuffer debug visualisation pipeline (built lazily).
+    VkShaderModule        dbgSm = VK_NULL_HANDLE;
+    VkDescriptorSetLayout dbgSetLayout = VK_NULL_HANDLE;
+    VkPipelineLayout      dbgPipeLayout = VK_NULL_HANDLE;
+    VkPipeline            dbgPipeline = VK_NULL_HANDLE;
+    VkDescriptorPool      dbgPool = VK_NULL_HANDLE;
+    VkDescriptorSet       dbgSet = VK_NULL_HANDLE;
+    renderfx::OwnedImage  dbgDummy;
+    bool                  dbgReady = false;
 };
 
-namespace renderfx { void destroyUpscale(RfxContext* ctx); }
+namespace renderfx {
+void destroyUpscale(RfxContext* ctx);
+void destroyDebug(RfxContext* ctx);
+}  // namespace renderfx
