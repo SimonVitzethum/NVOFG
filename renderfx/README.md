@@ -39,23 +39,54 @@ capability table already encodes their inputs and cross-stage constraints so the
 without an API change. If NVIDIA ever ships native Linux DLSS-G, it becomes another
 `FrameGeneration` backend with no interface change.
 
+## The four explicit concepts (design.md §18)
+
+```
+Capabilities  (hardware/build)  +  Preferences (app INTENT)  ->  Policy (derived rules)  ->  Selection (explained pipeline)
+```
+
+The app expresses **intent only** — never a pipeline. `RfxPreference` carries goals:
+`quality`, `prioritize_latency`, `allow_proprietary`, `open_source_only`, `deterministic`,
+`power_saver`, `debug`, `vendor_pin`, `stages_enabled`, per-stage `override_backend`.
+`rfx_derive_policy()` turns intent into the effective, **inspectable** `RfxPolicy`
+(scoring weights + exclusions) the resolver applies.
+
+Every choice is **explainable**: `RfxSelection.explanation[stage]` lists reason codes
+(`supported`, `highest quality`, `proprietary allowed`, `open`, `constraint satisfied`,
+`alternative unavailable`, `overridden`, …), and `rfx_format_pipeline()` renders the whole
+resolved pipeline:
+
+```
+RenderFX pipeline (Frame Context ->):
+  Upscaling         : dlss_sr        [supported, highest quality among candidates, proprietary allowed]
+  RayReconstruction : dlss_rr        [supported, compatible with selected upscaler]
+  FrameGeneration   : nvofg          [supported, a higher option was unavailable, open / vendor-neutral]
+  -> Present
+```
+
+Backend **identifiers are a stable ABI** (fixed numeric values; `nvofg == 10`), and
+`rfx_backend_name`/`rfx_backend_from_name` round-trip for serializing configs/presets.
+
 ## Usage sketch
 
 ```c
 RfxContext* ctx; rfx_create(&info, &ctx);
 RfxCapabilities caps; rfx_query_capabilities(ctx, &caps);   // side-effect free
 
-RfxPreference pref = { .quality = RFX_QUALITY_QUALITY, .allow_proprietary = 1 };
+RfxPreference pref = {0};                          // express intent, not a pipeline
+pref.quality = RFX_QUALITY_QUALITY; pref.allow_proprietary = 1;
 pref.stages_enabled = (1u<<RFX_STAGE_FRAME_GENERATION);
 for (int s=0;s<RFX_STAGE_COUNT;++s) pref.override_backend[s] = RFX_BACKEND_COUNT; // auto
 
-RfxSelection sel; rfx_resolve(&caps, &pref, &sel);   // pure; inspect sel.backend[...]/reason[...]
-rfx_commit(ctx, &sel);                                // creates the chosen backends (nvofg)
+RfxSelection sel; rfx_resolve(&caps, &pref, &sel);  // pure; inspect sel.backend[]/explanation[]
+char buf[512]; rfx_format_pipeline(&sel, buf, sizeof buf);  // debug view
+rfx_commit(ctx, &sel);                               // creates the chosen backends (nvofg)
 // per frame: rfx_record_frame_generation(ctx, &frame_context, &prev, &out, 0.5f, ...);
 ```
 
-`rfx_resolve` is a **pure function** — see `tests/test_resolve.cpp` (headless) for the
-policy, override, and cross-stage-constraint coverage.
+`rfx_resolve` / `rfx_derive_policy` are **pure functions** — `tests/test_resolve.cpp`
+(headless) covers policy, intents, overrides, cross-stage constraints, explanations, and
+serialization.
 
 ## Build
 

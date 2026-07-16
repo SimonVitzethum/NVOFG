@@ -103,6 +103,75 @@ int main() {
                 "FG -> FSR FG (bundle with FSR upscaler)");
     }
 
+    // G) Explanations: FG=nvofg is supported; DLSS FG exists but is unavailable here.
+    {
+        RfxCapabilities c; renderfx::buildCapabilities(true, true, &c);
+        RfxPreference p = basePref();
+        p.stages_enabled = 1u << RFX_STAGE_FRAME_GENERATION;
+        RfxSelection s; rfx_resolve(&c, &p, &s);
+        const RfxStageExplanation& e = s.explanation[RFX_STAGE_FRAME_GENERATION];
+        bool hasSupported = false, hasAltUnavail = false;
+        for (uint32_t i = 0; i < e.reason_count; ++i) {
+            if (e.reasons[i] == RFX_REASON_SUPPORTED) hasSupported = true;
+            if (e.reasons[i] == RFX_REASON_ALTERNATIVE_UNAVAILABLE) hasAltUnavail = true;
+        }
+        REQUIRE(e.backend == RFX_BACKEND_NVOFG && hasSupported, "explanation: nvofg supported");
+        REQUIRE(hasAltUnavail, "explanation: alternative unavailable (DLSS FG higher tier, absent)");
+    }
+
+    // H) Intent 'open_source_only' excludes proprietary DLSS even if supported.
+    {
+        RfxCapabilities c; renderfx::buildCapabilities(true, true, &c);
+        setSupported(c, RFX_BACKEND_DLSS_SR, 1);
+        RfxPreference p = basePref(); p.open_source_only = 1;
+        p.stages_enabled = 1u << RFX_STAGE_UPSCALING;
+        RfxSelection s; rfx_resolve(&c, &p, &s);
+        REQUIRE(s.backend[RFX_STAGE_UPSCALING] == RFX_BACKEND_NATIVE,
+                "open_source_only -> Native (DLSS excluded)");
+    }
+
+    // I) Intent 'deterministic' excludes non-deterministic (neural) backends.
+    {
+        RfxCapabilities c; renderfx::buildCapabilities(true, true, &c);
+        setSupported(c, RFX_BACKEND_DLSS_SR, 1);
+        RfxPreference p = basePref(); p.deterministic = 1;
+        p.stages_enabled = 1u << RFX_STAGE_UPSCALING;
+        RfxSelection s; rfx_resolve(&c, &p, &s);
+        REQUIRE(s.backend[RFX_STAGE_UPSCALING] != RFX_BACKEND_DLSS_SR,
+                "deterministic -> excludes DLSS (non-deterministic)");
+    }
+
+    // J) Policy derivation is explicit and inspectable.
+    {
+        RfxPreference p = basePref(); p.quality = RFX_QUALITY_PERF; p.power_saver = 1; p.open_source_only = 1;
+        RfxPolicy pol;
+        REQUIRE(rfx_derive_policy(&p, &pol) == RFX_OK, "derive_policy OK");
+        REQUIRE(pol.exclude_proprietary == 1, "policy: open_source_only -> exclude_proprietary");
+        REQUIRE(pol.cost_weight >= 4, "policy: perf+power_saver -> high cost weight");
+    }
+
+    // K) Stable serializable identifiers: name<->id round-trips for every backend.
+    {
+        bool ok = true;
+        for (int i = 0; i < RFX_BACKEND_COUNT; ++i)
+            if (rfx_backend_from_name(rfx_backend_name((RfxBackendId)i)) != (RfxBackendId)i) ok = false;
+        REQUIRE(ok, "backend name<->id round-trips (stable serialization)");
+        REQUIRE(RFX_BACKEND_NVOFG == 10, "stable numeric id (nvofg == 10)");
+    }
+
+    // L) Pipeline inspection: format the resolved pipeline.
+    {
+        RfxCapabilities c; renderfx::buildCapabilities(true, true, &c);
+        RfxPreference p = basePref();
+        p.stages_enabled = 1u << RFX_STAGE_FRAME_GENERATION;
+        RfxSelection s; rfx_resolve(&c, &p, &s);
+        char buf[512];
+        uint32_t n = rfx_format_pipeline(&s, buf, sizeof(buf));
+        REQUIRE(n > 0 && std::strstr(buf, "nvofg") && std::strstr(buf, "Present"),
+                "format_pipeline renders the resolved pipeline");
+        std::printf("---\n%s---\n", buf);
+    }
+
     std::printf("ALL RENDERFX RESOLVER CHECKS PASSED\n");
     return 0;
 }

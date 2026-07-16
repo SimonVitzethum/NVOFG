@@ -35,38 +35,43 @@ typedef enum RfxResult {
     RFX_INTERNAL,
 } RfxResult;
 
-/* Logical pipeline stages (design.md §15.2). Present is the app's own concern. */
+/* Logical pipeline stages (design.md §15.2). Present is the app's own concern.
+ * Values are STABLE across releases (never reordered) — safe to serialize. */
 typedef enum RfxStage {
-    RFX_STAGE_UPSCALING = 0,
-    RFX_STAGE_RAY_RECONSTRUCTION,
-    RFX_STAGE_FRAME_GENERATION,
-    RFX_STAGE_COUNT,
+    RFX_STAGE_UPSCALING          = 0,
+    RFX_STAGE_RAY_RECONSTRUCTION = 1,
+    RFX_STAGE_FRAME_GENERATION   = 2,
+    RFX_STAGE_COUNT              = 3,
 } RfxStage;
 
-/* Backend identifiers. Vendor names are identifiers only — the *interface* is uniform. */
+/* Backend identifiers. Vendor names are identifiers only — the *interface* is uniform.
+ * **Numeric values are a STABLE public ABI**: never renumbered or reordered, only
+ * appended. Applications may serialize them (configs/presets/project files); prefer the
+ * string form (rfx_backend_name / rfx_backend_from_name) for human-readable persistence.
+ * IDs never depend on registration order. */
 typedef enum RfxBackendId {
-    RFX_BACKEND_NONE = 0,     /* stage disabled                                         */
-    RFX_BACKEND_NATIVE,       /* built-in pass-through / bilinear (no vendor tech)       */
-    RFX_BACKEND_TEMPORAL,     /* built-in temporal upscaler/AA                           */
-    RFX_BACKEND_DLSS_SR,      /* NGX DLSS Super Resolution                               */
-    RFX_BACKEND_DLAA,         /* NGX DLAA                                                */
-    RFX_BACKEND_DLSS_RR,      /* NGX Ray Reconstruction                                  */
-    RFX_BACKEND_DLSS_FG,      /* NGX DLSS Frame Generation (Windows-gated today)         */
-    RFX_BACKEND_FSR,          /* AMD FidelityFX Super Resolution                         */
-    RFX_BACKEND_FSR_FG,       /* FSR Frame Generation                                    */
-    RFX_BACKEND_XESS,         /* Intel XeSS                                              */
-    RFX_BACKEND_NVOFG,        /* native OFA/shader frame generation (this project)       */
-    RFX_BACKEND_SHADER_FG,    /* portable shader frame generation (nvofg Tier B)         */
-    RFX_BACKEND_COUNT,
+    RFX_BACKEND_NONE      = 0,   /* stage disabled                                   */
+    RFX_BACKEND_NATIVE    = 1,   /* built-in pass-through / bilinear (no vendor tech) */
+    RFX_BACKEND_TEMPORAL  = 2,   /* built-in temporal upscaler/AA                     */
+    RFX_BACKEND_DLSS_SR   = 3,   /* NGX DLSS Super Resolution                         */
+    RFX_BACKEND_DLAA      = 4,   /* NGX DLAA                                          */
+    RFX_BACKEND_DLSS_RR   = 5,   /* NGX Ray Reconstruction                            */
+    RFX_BACKEND_DLSS_FG   = 6,   /* NGX DLSS Frame Generation (Windows-gated today)   */
+    RFX_BACKEND_FSR       = 7,   /* AMD FidelityFX Super Resolution                   */
+    RFX_BACKEND_FSR_FG    = 8,   /* FSR Frame Generation                              */
+    RFX_BACKEND_XESS      = 9,   /* Intel XeSS                                        */
+    RFX_BACKEND_NVOFG     = 10,  /* native OFA frame generation (this project)        */
+    RFX_BACKEND_SHADER_FG = 11,  /* portable shader frame generation (nvofg Tier B)   */
+    RFX_BACKEND_COUNT     = 12,  /* keep last; only ever grows                        */
 } RfxBackendId;
 
 /* Vendor/algorithm families — used for cross-stage constraints (design.md §18.2). */
 typedef enum RfxBackendFamily {
     RFX_FAMILY_GENERIC = 0,
-    RFX_FAMILY_DLSS,
-    RFX_FAMILY_FSR,
-    RFX_FAMILY_XESS,
-    RFX_FAMILY_NVOFG,
+    RFX_FAMILY_DLSS    = 1,
+    RFX_FAMILY_FSR     = 2,
+    RFX_FAMILY_XESS    = 3,
+    RFX_FAMILY_NVOFG   = 4,
 } RfxBackendFamily;
 
 /* Frame Context input bits (design.md §15.1). A backend declares which it needs; the
@@ -124,6 +129,7 @@ typedef struct RfxBackendCaps {
     RfxBackendFamily family;
     uint32_t         supported;        /* 1/0 on this device+build            */
     uint32_t         proprietary;      /* needs a vendor blob/model           */
+    uint32_t         deterministic;    /* reproducible output (for debug/golden) */
     uint32_t         quality_tier;     /* rough 0..100 (higher = better)      */
     uint32_t         cost_hint;        /* rough relative GPU cost             */
     uint32_t         required_inputs;  /* RFX_INPUT_* mask                    */
@@ -141,28 +147,78 @@ typedef struct RfxCapabilities {
 } RfxCapabilities;
 
 /* -------------------------------------------------------------------------- */
-/* Policy + resolution (design.md §18.1/§18.2). resolve is a PURE function of   */
-/* (capabilities, preference) — deterministic, inspectable, headless-testable.  */
+/* The four explicit concepts (design.md §18):                                 */
+/*   Capabilities  (what the hardware/build can do)   -> RfxCapabilities        */
+/*   Preferences   (the app's INTENT, never a pipeline) -> RfxPreference        */
+/*   Policy        (the effective rules derived from intent) -> RfxPolicy        */
+/*   Selection     (the resolved, explained pipeline) -> RfxSelection           */
+/* The app expresses intent; RenderFX owns backend selection.                   */
 /* -------------------------------------------------------------------------- */
+
+/* Application INTENT. The app states goals; it never constructs a pipeline. */
 typedef struct RfxPreference {
-    RfxQuality       quality;
-    uint32_t         allow_proprietary;   /* 1 = may use NGX/blobs               */
-    RfxBackendFamily vendor_pin;          /* RFX_FAMILY_GENERIC = no pin          */
+    RfxQuality       quality;             /* quality target                       */
+    uint32_t         prioritize_latency;  /* 1 = favour low latency over quality  */
+    uint32_t         allow_proprietary;   /* 1 = may use vendor blobs/models      */
+    uint32_t         open_source_only;    /* 1 = only open/vendor-neutral backends*/
+    uint32_t         deterministic;       /* 1 = only reproducible backends       */
+    uint32_t         power_saver;         /* 1 = minimise GPU cost (battery)      */
+    uint32_t         debug;               /* 1 = prefer reference/native, verbose */
+    RfxBackendFamily vendor_pin;          /* RFX_FAMILY_GENERIC = no vendor pin   */
     uint32_t         stages_enabled;      /* bitmask (1u << RfxStage)             */
-    /* Per-stage explicit override; RFX_BACKEND_COUNT = auto-select. Pins a backend. */
-    RfxBackendId     override_backend[RFX_STAGE_COUNT];
+    RfxBackendId     override_backend[RFX_STAGE_COUNT]; /* RFX_BACKEND_COUNT = auto */
 } RfxPreference;
 
+/* Effective POLICY derived from the preferences — the concrete rules the resolver
+ * applies. Exposed so the app/debugger can inspect *why* selection behaved as it did. */
+typedef struct RfxPolicy {
+    int              quality_weight;      /* scoring weight for quality_tier      */
+    int              cost_weight;         /* scoring penalty for cost_hint        */
+    uint32_t         exclude_proprietary; /* derived: open_source_only||!allow    */
+    uint32_t         require_deterministic;
+    RfxBackendFamily vendor_pin;
+    uint32_t         prefer_native;       /* debug: bias toward native/reference  */
+} RfxPolicy;
+
+/* Derive the effective policy from intent (pure, inspectable). */
+RfxResult rfx_derive_policy(const RfxPreference* pref, RfxPolicy* out);
+
+/* Per-stage explanation: the chosen backend and the reasons for it (design.md §18 —
+ * every selection is explainable). */
+#define RFX_MAX_REASONS 6
+typedef enum RfxReason {
+    RFX_REASON_SUPPORTED = 0,          /* backend is available on this device+build */
+    RFX_REASON_HIGHEST_QUALITY,        /* best quality among the valid candidates    */
+    RFX_REASON_LOWEST_COST,            /* cheapest among candidates (perf/battery)   */
+    RFX_REASON_PROPRIETARY_ALLOWED,    /* uses a vendor model; policy permitted it   */
+    RFX_REASON_OPEN_SOURCE,            /* vendor-neutral / no proprietary blob       */
+    RFX_REASON_VENDOR_PINNED,          /* matched the requested vendor pin           */
+    RFX_REASON_PREFERRED_NATIVE,       /* chosen for debug/deterministic preference  */
+    RFX_REASON_DETERMINISTIC,          /* reproducible output (policy required it)   */
+    RFX_REASON_CONSTRAINT_SATISFIED,   /* compatible with another stage's backend    */
+    RFX_REASON_ALTERNATIVE_UNAVAILABLE,/* a higher option was excluded/unsupported   */
+    RFX_REASON_OVERRIDDEN,             /* pinned by the app                          */
+    RFX_REASON_DISABLED_NO_COMPATIBLE, /* stage on, but nothing compatible -> None   */
+    RFX_REASON_STAGE_NOT_REQUESTED,    /* stage not enabled                          */
+} RfxReason;
+
+typedef struct RfxStageExplanation {
+    RfxBackendId backend;
+    uint32_t     reason_count;
+    RfxReason    reasons[RFX_MAX_REASONS];
+} RfxStageExplanation;
+
 typedef struct RfxSelection {
-    uint32_t     valid;                        /* 1 = a compatible set was found  */
-    RfxBackendId backend[RFX_STAGE_COUNT];     /* chosen per stage (NONE = off)   */
-    const char*  reason[RFX_STAGE_COUNT];      /* why this backend                */
-    uint32_t     required_inputs;              /* union the app must produce      */
+    uint32_t            valid;                        /* 1 = a compatible set found     */
+    RfxBackendId        backend[RFX_STAGE_COUNT];     /* the resolved pipeline (by stage) */
+    RfxStageExplanation explanation[RFX_STAGE_COUNT]; /* why each stage chose its backend */
+    uint32_t            required_inputs;              /* union the app must produce     */
 } RfxSelection;
 
-/* Resolve a compatible backend *set* across the enabled stages, honouring policy,
- * overrides, and cross-stage family constraints. Never picks per-stage argmax in
- * isolation. Returns RFX_NO_VALID_SELECTION (and valid=0) if nothing satisfies. */
+/* Resolve a compatible backend *set* across the enabled stages: derives policy from
+ * intent, honours overrides + cross-stage family constraints, and never picks per-stage
+ * argmax. Fills the explanation for each stage. Returns RFX_NO_VALID_SELECTION (valid=0)
+ * if nothing satisfies. Pure function of (capabilities, preference). */
 RfxResult rfx_resolve(const RfxCapabilities* caps, const RfxPreference* pref,
                       RfxSelection* out);
 
@@ -206,8 +262,18 @@ RfxResult rfx_record_frame_generation(RfxContext*, const RfxFrameContext* fc,
                                       const RfxFrameSync* input_ready /*nullable*/,
                                       RfxFrameSync* out_sync);
 
-const char* rfx_backend_name(RfxBackendId);
+const char* rfx_backend_name(RfxBackendId);   /* stable string id (for serialization) */
 const char* rfx_stage_name(RfxStage);
+const char* rfx_reason_text(RfxReason);       /* human-readable reason                 */
+
+/* Stable string <-> id for serializing configs/presets/project files. Returns
+ * RFX_BACKEND_NONE for an unknown name (check with a round-trip if needed). */
+RfxBackendId rfx_backend_from_name(const char* name);
+
+/* Pipeline inspection (design.md §18) — format the resolved pipeline + per-stage
+ * reasons into `buf` (NUL-terminated, truncated to `cap`). Returns bytes written
+ * (excluding NUL). Also available programmatically via RfxSelection.explanation[]. */
+uint32_t rfx_format_pipeline(const RfxSelection* sel, char* buf, uint32_t cap);
 
 #ifdef __cplusplus
 } /* extern "C" */
