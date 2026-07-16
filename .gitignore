@@ -33,3 +33,6 @@ flow_*.png
 # debug flow dumps
 *.ppm
 flow.png
+
+# CUDA build dir
+/build-cuda/

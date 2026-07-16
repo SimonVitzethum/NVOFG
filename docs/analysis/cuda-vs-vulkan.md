@@ -205,9 +205,17 @@ whole-graph execution saves more than the interop tax costs**. Practical rule of
 
 ---
 
+> **Update (ADR 0004).** At the project owner's direction, the CUDA Tensor-Core path is
+> now built as an **optional backend** (`NVOFG_ENABLE_CUDA`, off by default) behind the
+> `NVOFG_INTERP_CNN` interpolator boundary, and the full CUDA↔Vulkan interop + WMMA path is
+> proven on the reference GPU (`src/spike/cuda_tensor.cu`, `src/spike/cuda_vk_interop.cu`).
+> This does **not** change the recommendation below — CUDA stays optional, NVIDIA-only, and
+> behind the pluggable boundary; the size-threshold rule still governs *when* to use it. See
+> [ADR 0004](../adr/0004-cuda-tensor-core-backend.md).
+
 ## Consequences for the codebase
-1. Core stays **Vulkan-only**; no CUDA in the build graph, no CUDA dependency for
-   integrators.
+1. Core stays **Vulkan-only** by default; no CUDA in the build graph unless
+   `NVOFG_ENABLE_CUDA` is set, no CUDA dependency for integrators who don't opt in.
 2. The **modular interpolator** boundary (design req. #8) is also the CUDA/TensorRT
    containment boundary: any future NVIDIA-only learned back-end lives entirely inside one
    interpolator implementation and is selectable at runtime, leaving Tier-B portability

@@ -76,4 +76,22 @@ target_link_libraries(nvofg_headless_interp PRIVATE nvofg Vulkan::Vulkan)
 add_test(NAME headless_interp COMMAND nvofg_headless_interp)
 endif()  # NOT NVOFG_LIBRARY_ONLY
 
+# ---------------------------------------------------------------------------
+# Optional CUDA Tensor-Core backend (design analysis §C/§D, ADR 0004).
+# Off by default so the core stays Vulkan-only and vendor-neutral. When enabled,
+# builds the WMMA + CUDA<->Vulkan-interop spikes that prove the path a future
+# CudaTensorInterpolator (NVOFG_INTERP_CNN) uses.
+# ---------------------------------------------------------------------------
+option(NVOFG_ENABLE_CUDA "Build the optional CUDA Tensor-Core backend" OFF)
+if(NVOFG_ENABLE_CUDA)
+  enable_language(CUDA)
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES native)
+  endif()
+  add_executable(nvofg_cuda_tensor src/spike/cuda_tensor.cu)
+  add_executable(nvofg_cuda_vk_interop src/spike/cuda_vk_interop.cu)
+  target_link_libraries(nvofg_cuda_vk_interop PRIVATE Vulkan::Vulkan)
+  message(STATUS "nvofg: CUDA Tensor-Core backend enabled (arch ${CMAKE_CUDA_ARCHITECTURES})")
+endif()
+
 # Rust crates live under crates/ (nvofg-sys links this library via build.rs).
