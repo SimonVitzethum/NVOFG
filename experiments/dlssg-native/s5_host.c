@@ -25,6 +25,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <malloc.h>
 #include <time.h>
 #include <ucontext.h>
 #include <unistd.h>
@@ -84,7 +85,7 @@ MSABI static void* s_GetProcessHeap(void){return g_heap;}
 MSABI static void* s_HeapAlloc(void* h,u32 f,u64 s){(void)h;return(f&8)?calloc(1,s):malloc(s);}
 MSABI static void* s_HeapReAlloc(void* h,u32 f,void* p,u64 s){(void)h;(void)f;return realloc(p,s);}
 MSABI static int   s_HeapFree(void* h,u32 f,void* p){(void)h;(void)f;free(p);return 1;}
-MSABI static u64   s_HeapSize(void* h,u32 f,void* p){(void)h;(void)f;(void)p;return 0;}
+MSABI static u64   s_HeapSize(void* h,u32 f,void* p){(void)h;(void)f;return p?malloc_usable_size(p):0;}
 MSABI static void* s_HeapCreate(u32 a,u64 b,u64 c){(void)a;(void)b;(void)c;return g_heap;}
 MSABI static int   s_HeapDestroy(void* h){(void)h;return 1;}
 MSABI static void* s_LocalAlloc(u32 f,u64 s){return(f&0x40)?calloc(1,s):malloc(s);}
@@ -148,7 +149,11 @@ MSABI static int s_DRS_CreateSession(void** ph){ if(ph)*ph=(void*)0x1D25; return
 MSABI static int s_DRS_LoadSettings(void* h){ (void)h; return 0; }
 MSABI static int s_DRS_DestroySession(void* h){ (void)h; return 0; }
 MSABI static int s_DRS_GetBaseProfile(void* h,void** ph){ (void)h; if(ph)*ph=(void*)0x1B45E; return 0; }
-MSABI static int s_DRS_GetSetting(void* h,void* p,u32 id,void* out){ (void)h;(void)p;(void)id;(void)out; return 0xBAD00004; } // SETTING_NOT_FOUND -> NGX uses default
+MSABI static int s_DRS_GetSetting(void* h,void* p,u32 id,void* out){ (void)h;(void)p;(void)id;(void)out; return -160; } // NVAPI_SETTING_NOT_FOUND (nvapi status, NOT an NGX code) -> NGX uses default
+MSABI static int s_DRS_FindApplicationByName(void* sess,void* appName,void** phProfile,void* pApp){ (void)sess;(void)appName;(void)pApp; if(phProfile)*phProfile=(void*)0x1B45E; return 0; } // dxvk-nvapi returns Ok
+// NVDRS_PROFILE = {version@0, profileName[2048]@4 (NvU16 inline), gpuSupport, isPredefined, numOfApps, numOfSettings}.
+// dxvk-nvapi zeroes profileName (=> valid empty wstring, not NULL) + the trailing fields. That's what NGX wcslen's.
+MSABI static int s_DRS_GetProfileInfo(void* sess,void* prof,u8* p){ (void)sess;(void)prof; if(!p) return (int)0xBAD00005; memset(p+4,0,4096+16); return 0; }
 MSABI static int s_SYS_GetDriverAndBranchVersion(u32* pver,char* branch){ if(pver)*pver=61043; /*610.43*/ if(branch){const char* b="r610_00";int i=0;for(;b[i]&&i<63;i++)branch[i]=b[i];branch[i]=0;} return 0; }
 // Back the fake nvapi handles with REAL zeroed memory, so if NGX dereferences a handle
 // (the Windows nvapi handles are internally pointers) it lands in valid memory, not a crash.
@@ -179,7 +184,9 @@ MSABI static void* s_nvapi_QueryInterface(u32 id){
         case 0x0694D52E: f=(void*)s_DRS_CreateSession; nm="DRS_CreateSession"; break;
         case 0x375DBD6B: f=(void*)s_DRS_LoadSettings; nm="DRS_LoadSettings"; break;
         case 0xDA8466A0: f=(void*)s_DRS_GetBaseProfile; nm="DRS_GetBaseProfile"; break;
-        case 0x0DD462FB: f=(void*)s_DRS_DestroySession; nm="DRS_DestroySession"; break;
+        case 0xDAD9CFF8: f=(void*)s_DRS_DestroySession; nm="DRS_DestroySession"; break;
+        case 0xEEE566B2: f=(void*)s_DRS_FindApplicationByName; nm="DRS_FindApplicationByName"; break;
+        case 0x61CD6FD6: f=(void*)s_DRS_GetProfileInfo; nm="DRS_GetProfileInfo"; break;
         case 0x73BF8338: f=(void*)s_DRS_GetSetting; nm="DRS_GetSetting"; break;
         case 0x2926AAAD: f=(void*)s_SYS_GetDriverAndBranchVersion; nm="SYS_GetDriverAndBranchVersion"; break;
         case 0xE5AC921F: f=(void*)s_EnumPhysicalGPUs; nm="EnumPhysicalGPUs"; break;
@@ -390,14 +397,36 @@ int main(void){
         // load the NGX core host; it LoadLibrary's its siblings (logged)
         Module* h=load_module("_nvngx.dll");
         if(!h){ logs("host load failed\n"); _exit(3); }
+        static u16 wpath[80]; const char* dp=WINE; int i=0; for(;dp[i]&&i<79;i++) wpath[i]=(u8)dp[i]; wpath[i]=0;  // UTF-16 (2-byte) path
+
+        // LIGHTER query first: NVSDK_NGX_VULKAN_GetFeatureRequirements(FrameGeneration) — the
+        // same call that returned GREEN under Proton. It takes only instance+pd, NOT the full
+        // Init/adapter-correlation path (dxvk-nvapi's GetLogicalGpuInfo/LUID is never touched
+        // here). Tests whether our native nvapi bridge (arch=Blackwell) is enough for the
+        // driver to report FG available NATIVELY. FeatureRequirement = {FeatureSupported@0(u32),
+        // MinHWArch@4(u32), MinOS[255]}; FeatureDiscoveryInfo = {SDKVer,FeatureID,Ident(32),path,info}.
+        typedef int MSABI(*gfr_t)(void*,void*,const void*,void*);
+        gfr_t GFR=(gfr_t)module_export(h,"NVSDK_NGX_VULKAN_GetFeatureRequirements");
+        if(GFR){
+            struct { u32 sdkVer,featureId,idType,pad; u64 appId,u1,u2; const void* dataPath; const void* featInfo; } fdi;
+            memset(&fdi,0,sizeof fdi); fdi.sdkVer=0x15; fdi.featureId=11; fdi.idType=0; fdi.appId=0x1337ULL; fdi.dataPath=wpath;
+            struct { u32 fsupp,minhw; char minos[256]; } frq; memset(&frq,0,sizeof frq);
+            logs("\n[calling native NVSDK_NGX_VULKAN_GetFeatureRequirements(FrameGeneration=11) ...]\n");
+            int rr=GFR((void*)g_inst,(void*)g_pd,&fdi,&frq);
+            char b[160]; snprintf(b,sizeof b,"[native FG requirements: result=0x%08X FeatureSupported=0x%X (0=SUPPORTED) MinHWArch=0x%X MinOS=%.16s]\n",
+                (unsigned)rr,frq.fsupp,frq.minhw,frq.minos); logs(b);
+        } else logs("GetFeatureRequirements export missing\n");
+
+        // Full Init (the heavier path that still crashes in adapter correlation — kept for
+        // the CreateFeature work). Skipped for the requirements test.
         typedef int MSABI(*init_t)(const char*,int,const char*,const u16*,void*,void*,void*,void*,void*,const void*,unsigned);
         init_t Init=(init_t)module_export(h,"NVSDK_NGX_VULKAN_Init_ProjectID");
-        if(!Init){ logs("Init_ProjectID export missing\n"); _exit(4); }
-        static u16 wpath[80]; const char* dp=WINE; int i=0; for(;dp[i]&&i<79;i++) wpath[i]=(u8)dp[i]; wpath[i]=0;  // UTF-16 (2-byte) path
-        logs("\n[calling NVSDK_NGX_VULKAN_Init_ProjectID on the natively-loaded host ...]\n");
-        int r=Init("a0b1c2d3-1234-5678-9abc-def012345678",0,"1.0",wpath,
-                   (void*)g_inst,(void*)g_pd,(void*)g_dev,(void*)my_gipa,(void*)my_gdpa,0,0x15);
-        { char b[80]; snprintf(b,sizeof b,"\n[NGX Init returned 0x%08X]\n",(unsigned)r); logs(b);}
+        if(Init && getenv("RUN_INIT")){
+            logs("\n[calling NVSDK_NGX_VULKAN_Init_ProjectID ...]\n");
+            int r=Init("a0b1c2d3-1234-5678-9abc-def012345678",0,"1.0",wpath,
+                       (void*)g_inst,(void*)g_pd,(void*)g_dev,(void*)my_gipa,(void*)my_gdpa,0,0x15);
+            char b[80]; snprintf(b,sizeof b,"[NGX Init returned 0x%08X]\n",(unsigned)r); logs(b);
+        }
         _exit(0);
     }
     int stx; waitpid(pid,&stx,0);

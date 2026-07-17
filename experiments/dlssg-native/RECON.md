@@ -313,6 +313,43 @@ complete **reference** for every adapter struct we synthesise — we port what W
 NGX, instead of guessing. Gate 3 green flips the strategy from "should we keep digging?" to "finish
 the native adapter layer, using Wine as the oracle for each struct."
 
+## S5(d) — reference extraction from Proton + native nvapi bridge aligned
+
+With Gate 3 green, extracted the **exact reference** by running `ngxfg_probe.exe` under GE-Proton with
+`DXVK_NVAPI_LOG_LEVEL=trace` — the precise `NvAPI_*` sequence NGX makes for
+`GetFeatureRequirements(FrameGeneration)`, with each call's args + return:
+
+```
+Initialize -> SYS_GetDriverAndBranchVersion -> EnumPhysicalGPUs -> DRS_CreateSession/LoadSettings/
+GetBaseProfile -> DRS_GetSetting(0x10e41df2 -> "Setting not found") -> GPU_GetArchInfo ->
+GetLogicalGPUFromPhysicalGPU -> GPU_GetLogicalGpuInfo (OK) -> DRS_FindApplicationByName ->
+DRS_GetProfileInfo (OK) -> DRS_DestroySession -> DRS_GetSetting(... "not found") ...
+```
+
+Key reference facts (the derivation rules, per the user's "rule not value" discipline):
+- **`GPU_GetLogicalGpuInfo` returns OK under Proton** — and dxvk-nvapi's version returns *Error* when
+  `deviceLUIDValid==false`. So **under Proton the Vulkan `deviceLUID` is VALID** (DXVK's device enables
+  it); natively it is **0** (measured). This is the one value Proton revealed: the native path must
+  **synthesize a consistent LUID** (same bytes in `VkPhysicalDeviceIDProperties.deviceLUID` and in
+  `GetLogicalGpuInfo`'s `pOSAdapterId`), because the driver won't provide one.
+- **`DRS_GetSetting` returns "Setting not found"** = `NVAPI_SETTING_NOT_FOUND = -160` (an *NvAPI_Status*,
+  not an NGX code). **Fixed a real bug**: our bridge returned `0xBAD00004` (an NGX result) which NGX
+  misinterpreted as an nvapi status. Now `-160`.
+- `DRS_GetProfileInfo` zeroes `profileName` (valid empty wstring). Implemented.
+
+Bridged the full DRS set (`FindApplicationByName`, `GetProfileInfo`, `DestroySession`, correct
+`GetSetting` status) matching dxvk-nvapi. Native `GetFeatureRequirements` now advances through the
+entire nvapi sequence.
+
+**Current native wall (S5d):** the crash moved out of nvapi entirely — into NGX's own
+**path resolution**: the faulting site builds the string `"NVIDIA"` + … and the adjacent literal is
+`"error: NGXGetPath failed"`. So NGX's **`NGXGetPath`** (locating its model/config files from the
+ApplicationDataPath via the Win32 file APIs) **fails natively** (under Proton, Wine's filesystem makes
+it succeed), and NGX then crashes building the error string. The next layer is a **minimal Windows
+filesystem/path shim** (make `NGXGetPath` succeed, or the ApplicationDataPath resolve) — reference
+again available from the Proton run. This is engineering with a known-green endpoint (Gate 3), not a
+feasibility risk.
+
 ## Next step (now justified)
 
 **S5** (the crux): load the NGX host PEs (`nvngx.dll` + `_nvngx.dll`) under the same loader (they
