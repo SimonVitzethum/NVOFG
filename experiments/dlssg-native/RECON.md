@@ -588,6 +588,27 @@ weight loading, the CUDA↔Vulkan interop path, the `EvaluateFeature` float/SSE-
 same one-value-fix shape, but there will be many, and the Init struct internals need per-invocation
 gdb isolation rather than a single boundary diff. Checkpointed here for a scope decision.
 
+## S6a — Init grind: first blocker cleared, pattern confirmed (2026-07-17)
+
+Advanced `Init_ProjectID` one full crash and confirmed the shape of the phase:
+
+- **Crash #1 (`0xceee`) CLEARED.** Init does `GetModuleHandleExA(FROM_ADDRESS, <its own return
+  address>)` to identify the *app* module, then processes that module's path. Natively the caller is
+  `s5_host` (not a PE), so our FROM_ADDRESS stub returned the dummy module → a code pointer (`InGDPA`)
+  got copied into a struct and dereferenced. Fix: FROM_ADDRESS now **fails** (ERROR_MOD_NOT_FOUND)
+  for addresses not inside a loaded PE — under Proton the app IS a PE (succeeds); the native
+  equivalent of a non-PE caller is "module not found", which makes Init skip the app-path processing
+  (`0xd659 je`). Snippet self-lookups still succeed (the snippet IS a PE in `g_mod`).
+- **Crash #2 (`0xa1f3`) — next blocker.** A `wcslen` loop (`cmp %ax,(%rdx,%r8,2)`) on a **null wide
+  string** (`rdx=0`), inside helper `0x18000a130` (called from `0x18000b8b4`): `rdx = *(*[rsp+0x80])`
+  — an internal struct's wide-string field is null.
+
+**Pattern, now empirical:** Init is a **sequence of string/path/config shim fixes**. Each blocker is a
+struct/string field NGX expects Wine to have populated (module paths, registry strings, config) that
+our minimal shims leave null/garbage, and each fix advances to the next. Same one-value shape as the
+capability fixes, but there are **many** of them before Init returns, then CreateFeature, then the
+`EvaluateFeature` float-ABI. The multi-week functional estimate is holding — measured, not guessed.
+
 ## Legal
 
 `nvngx_dlssg.dll` is NVIDIA-licensed and shipped for the driver's Wine/Proton runtime. This
