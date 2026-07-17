@@ -1,80 +1,87 @@
-# Plan 1 — Own native Frame Generation (the shippable path)
+# Plan A — native learned Frame Generation (execution plan)
 
-The product path. Loads **no NVIDIA binary**, uses **our/open weights**, is legally clean to ship
-(no §69e limits, no Authenticode bypass, no NVIDIA clearance needed). Path B stays private interop
-research and, crucially, serves here as an **offline quality reference** to train/ablate against.
+The shippable path to close the quality gap to DLSS-G **natively and legally**: an own learned
+interpolator/extrapolator that loads **no NVIDIA binary**, runs on-device, and drops into the
+`NVOFG_INTERP_CNN` backend that already exists in the API. Path B stays private research and serves
+only as an **offline quality reference**.
 
-## The head start (why "bald ready" is realistic)
+## What already exists (so this is execution, not green-field)
 
-nvofg **already has a working, legally-clean native frame generator**: `VK_NV_optical_flow` (the OFA)
-produces motion vectors and the Slang warp shader (`src/shaders/warp.slang`) synthesises the
-intermediate frame. That is Phase 0 — done. "Ready soon" is **productionising that classical path**;
-the learned model is a quality upgrade layered on top, not a prerequisite for a first shippable
-release.
+- **Classical native FG is done and best-in-class** (design.md, RenderFX ROADMAP): OFA
+  (`VK_NV_optical_flow`) flow + the `prep → OFA → refine → warp → composite` pipeline, with UI /
+  reactive / material masks, bidirectional/occlusion, HDR, quality tiers, debug views, and a pacer.
+  It ships today; **the learned model layers on top of it, it is not a prerequisite.**
+- **The design is done — design.md §21**: architecture (SoftSplat forward-warp + gated-conv fusion,
+  ~0.26–1.0M params, ExtraNet/ExtraSS/GFFE lineage), the extrapolation-first latency decision, the
+  10–50× size lever (we supply MV+depth+OFA flow, so the net doesn't learn flow), the data plan,
+  losses, and the <2–3 ms @1080p budget. **This doc executes §21; it does not re-design it.**
+- **The runtime boundary is built and proven — ADR 0004**: the `NVOFG_INTERP_CNN` interpolator
+  boundary; an optional CUDA Tensor-Core backend gated by `NVOFG_ENABLE_CUDA` (OFF by default);
+  CUDA↔Vulkan interop (external memory + timeline semaphores) and Tensor-Core WMMA both proven by the
+  `src/spike/cuda_tensor.cu` and `src/spike/cuda_vk_interop.cu` spikes. `VK_KHR_cooperative_matrix`
+  is the vendor-neutral default path.
+- **The API hook exists**: `NvofgInterpolator::NVOFG_INTERP_CNN` is reserved in `include/nvofg.h`;
+  selecting it must Just Work once a backend is wired.
 
-## Phased plan
+**The gap = (1) the trained model, (2) its on-device inference backend, (3) the data + training +
+validation pipeline.** Everything else is in place.
 
-### Phase 0 — classical native FG  ✅ have it
-OFA optical flow + Slang warp interpolation. Engine-agnostic, native, ships legally.
+## Track 1 — buildable NOW (no training server): make trained weights drop-in
 
-### Phase 1 — productionise the classical path  → **the near-term MVP (weeks, no server needed)**
-Turn the working warp into a shippable feature. No ML, no external compute — pure engineering on
-what already runs:
-1. **Quality passes** — the visible-artefact list, in priority order (image quality > stability):
-   - Disocclusion / occlusion handling (holes at object edges) — bidirectional warp + hole-fill.
-   - Motion-vector cleanup (OFA flow → confidence mask, reject/blend low-confidence regions).
-   - UI/HUD exclusion (don't warp overlays — a mask input or a late composite).
-   - Ghosting/edge fringing reduction; clamp to plausible colour neighbourhood.
-2. **Pacing** — `VK_NV_low_latency2` (Reflex) present metering so the generated frame is scheduled
-   between real frames (without pacing the extra frame adds latency instead of smoothness). This is
-   ordinary native Vulkan and **overlaps directly with the Path B present stage** — do it once, use
-   it for both.
-3. **API / integration** — clean RenderFX hook (prev+curr color, optional MVs/depth from the app;
-   fall back to OFA-only when the app provides nothing), on/off, 1 generated frame first.
-4. **Validation harness** — a fixed set of rendered sequences + metrics (PSNR/SSIM/LPIPS/VMAF vs the
-   true intermediate frame, plus a warp-consistency metric) so quality is measured, not eyeballed.
-   This harness is reused unchanged in Phase 2/3.
+Each milestone builds, passes a headless test, is Vulkan-validation-clean, and is committed
+separately (RenderFX ROADMAP discipline). Priority: correctness > image quality > perf.
 
-**Exit of Phase 1 = a shippable native FG.** Not DLSS-G quality yet, but real, legal, and running.
+- **A1. `CudaTensorInterpolator` scaffold** behind `NVOFG_INTERP_CNN` / `NVOFG_ENABLE_CUDA`.
+  Load a weights file, run the fusion-net forward pass (WMMA/coopmat) over the already-computed
+  inputs (warped color(s), fwd/bwd flow, occlusion/confidence, depth, MV, disocclusion + UI/reactive
+  masks), **residual-add the warped RGB**, write the registered output. **Start with an identity /
+  passthrough "model"** (emits the classical warp) so the entire path — registration, interop, sync,
+  output — is exercised and headless-verified (0 VUIDs) *before* any weights exist. Real weights then
+  drop in with no plumbing changes. Mirror a **coopmat path** (vendor-neutral) next to the CUDA one.
+- **A2. Data-capture harness.** Offline tool: render/capture sequences at **2× target fps** so every
+  other frame is GT, dumping per-frame color + MV + depth + UI/reactive masks → training triplets.
+  Coordinate the capture format with the RMC/Minecraft consumer (other agent). Target: tens of
+  thousands of triplets across varied motion (pans, fast entities, transparency).
+- **A3. Model + training pipeline (PyTorch).** Implement §21.4's SoftSplat forward-warp + gated-conv
+  fusion net and §21.6's losses (Charbonnier + LPIPS + census/warp + light GAN + temporal; UI/reactive
+  masked out, disocclusion up-weighted). Data loaders: Vimeo-90K/X4K bootstrap + rendered fine-tune.
+  **Validate end-to-end at tiny scale** (overfit a few clips) to prove the pipeline before any big run.
+- **A4. Validation harness (gates every quality claim).** Golden metrics vs the GT in-between frame:
+  PSNR/SSIM/**LPIPS**/VMAF + a temporal-stability metric. Compares warp-only vs learned vs (privately)
+  the Path B reference on a fixed clip set. Reused unchanged by all of Track 2.
+- **A5. Weight export/import.** Trained model → the fp16 layout the `CudaTensorInterpolator` /
+  coopmat path loads (WMMA/coopmat tile layout, versioned header).
 
-### Phase 2 — the learned interpolator/extrapolator  → **needs the 5080 server (~100–200 h)**
-Layer a small learned model on top of the warp (predict a residual/refinement, not the whole frame
-— cheaper, more stable, and the OFA warp already gives a strong prior):
-- **Architecture:** compact CNN (or tiny transformer) over `VK_KHR_cooperative_matrix` (Tensor
-  cores), **extrapolation-first** (ExtraNet / ExtraSS / GFFE lineage — extrapolate the next frame from
-  history, lower latency than interpolation which must hold a frame). ~0.4–1M params, budgeted to fit
-  the per-frame time budget at target resolutions.
-- **Inputs:** warped candidate (from Phase 0), OFA flow + confidence, prev/curr color, optional
-  depth + app motion vectors. **Output:** residual correction + a blend/hole mask.
-- **Data:** rendered sequences with ground-truth intermediate frames + MVs + depth (our own renders;
-  optionally augment with open datasets). **Path B provides an additional reference target** — a
-  legitimate interoperability use (compare our output to NVIDIA's on identical inputs, offline).
-- **Loss:** perceptual (LPIPS) + L1 + warp/temporal-consistency + edge/disocclusion-weighted terms.
-- **Training:** the 5080 server, ~100–200 h; iterate architecture against the Phase-1 harness.
-- **Inference:** coopmat path in RenderFX; runs as a refinement pass after the warp.
+## Track 2 — training (gated on the RTX 5070/5080 server, ~10²–10³ GPU-h per §21.7)
 
-### Phase 3 — quality parity push
-Use Path B's output (private, offline) as the quality target for ablations; close the gap on the
-hardest cases (fast motion, thin structures, transparency, UI). Scale to 2–3 generated frames if the
-pacing + quality budget allows.
+- **B1.** Vimeo-90K/X4K pretraining of the RGB synthesis net.
+- **B2.** Rendered-data fine-tune with real MV/depth/masks (the A2 captures).
+- **B3.** Ship **extrapolation as the primary mode** (predict next frame from past only → **no added
+  latency**, no flip-metering dependence — §21.2); add the **interpolation mode** (bidirectional OFA
+  flow, cleaner disocclusion) as the quality/offline fallback.
+- **B4.** fp16 + `VK_KHR_cooperative_matrix` (Tensor Cores) to hit **<2–3 ms @1080p**; optional
+  TensorRT backend above the size threshold (ADR 0004).
+- **B5.** Quality iteration against the A4 harness + the Path B reference; close the disocclusion /
+  ghosting / shading-correction cases where classical warp fails.
 
-## Sequencing vs Path B (do these now, in this order)
+## Sequencing — the immediate next steps (all Track 1, no server needed)
 
-1. **Phase 1.2 pacing (`VK_NV_low_latency2`) first** — it is needed by *both* Plan 1 and Path B, is
-   pure native Vulkan, and unblocks a real end-to-end FG loop immediately.
-2. **Phase 1.1 quality passes** — turns the warp into something shippable; each pass is measurable on
-   the harness.
-3. **Phase 1.4 harness** in parallel — it gates everything downstream and is cheap to stand up.
-4. When the **5080 server** lands → Phase 2 training, with Path B as the offline reference target.
+1. **A1 scaffold first** — identity model through `NVOFG_INTERP_CNN`, headless-verified. This makes
+   the whole rest drop-in and is the single highest-leverage build step.
+2. **A4 harness in parallel** — nothing about quality is claimed without it.
+3. **A3 model + training pipeline** — validated at tiny scale so the server run is turnkey.
+4. **A2 data capture** — coordinate format with the RMC agent.
+5. When the server lands → Track 2.
 
-Path B's functional grind (Init → CreateFeature → EvaluateFeature) continues in parallel *as research
-only*; its value to the product is (a) the pacing work shared with Phase 1.2 and (b) the reference
-frames for Phase 2/3 training — not a shipped dependency.
+**Note on pacing.** Because the **primary path is extrapolation (no held-back frame → no added
+latency)**, `VK_NV_low_latency2` pacing is **only** needed for the secondary *interpolation* mode —
+so it is a later, lower-priority item, not the critical path. (This supersedes the earlier
+"pacing first" note.)
 
 ## Definition of "ready"
 
-- **MVP-ready (Phase 1):** native FG on by a flag, paced, artefact-managed on the common cases,
-  measured on the harness, integrated in RenderFX. Ships without any NVIDIA code and without a
-  trained model.
-- **Quality-ready (Phase 2+):** learned refinement closes most of the gap to DLSS-G on the harness
-  metrics.
+- **Track-1-ready:** `NVOFG_INTERP_CNN` selectable end-to-end with an identity model, headless-clean;
+  training pipeline validated at small scale; harness live. Ships nothing user-visible yet but makes
+  the model turnkey.
+- **v1-ready:** extrapolation model trained, <2–3 ms @1080p, **visibly better than classical warp**
+  on the harness, no NVIDIA code, no clearance needed — the shippable product.
