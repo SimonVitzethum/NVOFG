@@ -57,7 +57,8 @@ add_library(nvofg
   src/context.cpp
   src/pipeline.cpp
   src/pacer.cpp
-  src/cnn_model.cpp)
+  src/cnn_model.cpp
+  src/cnn_infer.cpp)
 add_dependencies(nvofg nvofg_shaders)
 target_include_directories(nvofg
   PUBLIC  include
