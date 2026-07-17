@@ -582,6 +582,23 @@ VkCommandBuffer beginCmd(NvofgContext* ctx, VkCommandPool pool) {
 }
 
 // Submit `cmd`, waiting on/ signalling timeline points.
+// --- NVOFG_INTERP_CNN drop-in point (Plan A; ADR 0004; design.md §21.4) ---------------------
+// The learned interpolator is a *residual refinement on the classical warp*: prep -> OFA -> refine
+// -> warp produce the candidate frame and all the inputs a small fusion net (SoftSplat/ExtraNet
+// lineage) needs — fwd/bwd flow, occlusion/confidence, depth, MV, disocclusion + UI/reactive masks;
+// the net only corrects ghosting and fills disocclusion holes the warp leaves. Everything upstream
+// is unchanged, so this is a true drop-in: the CudaTensorInterpolator (NVOFG_ENABLE_CUDA, WMMA) or a
+// VK_KHR_cooperative_matrix backend runs its forward pass here, reading the warp output + aux and
+// writing the refined output, with a residual add of the warped RGB.
+//
+// SCAFFOLD (Plan A A1): the *identity model* is a no-op — the warp output already IS the result — so
+// selecting NVOFG_INTERP_CNN works end to end and produces the classical warp today. Real weights
+// drop in here with no change to registration, sync, or the C ABI.
+static void recordCnnRefine(NvofgContext* ctx, VkCommandBuffer cmd) {
+    if (ctx->interpolator != NVOFG_INTERP_CNN) return;
+    (void)cmd;  // identity model: warp output is the candidate; learned backend inserts its pass here
+}
+
 void submitTimeline(VkQueue queue, VkCommandBuffer cmd,
                     VkSemaphore waitSem, uint64_t waitVal,
                     VkSemaphore sigSem, uint64_t sigVal) {
@@ -762,6 +779,7 @@ NvofgResult nvofg_record_generate(NvofgContext* ctx, const NvofgGenerateInfo* in
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->warpStage.pipeLayout, 0, 1, &ctx->warpSet, 0, nullptr);
         vkCmdPushConstants(cmd, ctx->warpStage.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(wp), &wp);
         vkCmdDispatch(cmd, gx, gy, 1);
+        recordCnnRefine(ctx, cmd);   // NVOFG_INTERP_CNN drop-in (identity today)
 
         if (ctx->debugView != NVOFG_DEBUG_NONE && ctx->haveDebugTarget) {
             imgBarrier(cmd, ctx->debugTarget.image, VK_IMAGE_LAYOUT_UNDEFINED, G, 0, VK_ACCESS_SHADER_WRITE_BIT);
@@ -889,6 +907,7 @@ NvofgResult nvofg_record_generate(NvofgContext* ctx, const NvofgGenerateInfo* in
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->warpStage.pipeLayout, 0, 1, &ctx->warpSet, 0, nullptr);
         vkCmdPushConstants(cmd, ctx->warpStage.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(wp), &wp);
         vkCmdDispatch(cmd, gx, gy, 1);
+        recordCnnRefine(ctx, cmd);   // NVOFG_INTERP_CNN drop-in (identity today)
 
         // Optional debug visualisation into an app-provided target.
         if (ctx->debugView != NVOFG_DEBUG_NONE && ctx->haveDebugTarget) {
@@ -946,6 +965,7 @@ NvofgResult nvofg_record_warp(NvofgContext* ctx, float phase,
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->warpStage.pipeLayout, 0, 1, &ctx->warpSet, 0, nullptr);
     vkCmdPushConstants(cmd, ctx->warpStage.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(wp), &wp);
     vkCmdDispatch(cmd, gx, gy, 1);
+    recordCnnRefine(ctx, cmd);   // NVOFG_INTERP_CNN drop-in (identity today)
     submitTimeline(ctx->queue, cmd, wait_sem, wait_val, ctx->timeline, v1);
 
     ctx->slotSignal[slot] = v1;

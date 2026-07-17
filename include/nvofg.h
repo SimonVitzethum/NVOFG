@@ -54,7 +54,8 @@ typedef enum NvofgMode {
 /* Which synthesis back-end turns flow into pixels (see design: modular interpolator). */
 typedef enum NvofgInterpolator {
     NVOFG_INTERP_WARP = 0,    /* classical occlusion-aware forward/backward warp   */
-    NVOFG_INTERP_CNN,         /* reserved: small learned model (cooperative matrix) */
+    NVOFG_INTERP_CNN,         /* learned residual on the warp (coop-matrix/CUDA);
+                                 selectable now, runs the identity model today (Plan A A1) */
     NVOFG_INTERP_TRANSFORMER, /* reserved                                          */
 } NvofgInterpolator;
 
