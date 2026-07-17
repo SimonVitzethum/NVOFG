@@ -53,16 +53,20 @@ def evaluate(ckpt, data_dir, device='cuda', modes=('interp',)):
         else:
             print(f"[{mode}] no ckpt -> identity model (== warp), expect ~0 delta")
         agg = collections.defaultdict(lambda: collections.defaultdict(list))
+        pht = collections.defaultdict(lambda: collections.defaultdict(list))  # per-phase (multiplier)
         for batch in loader:
             out, cand, target = forward_batch(m, batch, device)
             out = out.clamp(0, 1); cand = cand.clamp(0, 1); target = target.clamp(0, 1)
             reg = regimes(batch, cand, target, device)
+            tv = batch['t'].reshape(-1)
             for i, r in enumerate(reg):
                 o, c, t = out[i:i+1], cand[i:i+1], target[i:i+1]
-                agg[r]['warp_psnr'].append(psnr(c, t).item())
-                agg[r]['model_psnr'].append(psnr(o, t).item())
+                wp, mp = psnr(c, t).item(), psnr(o, t).item()
+                agg[r]['warp_psnr'].append(wp); agg[r]['model_psnr'].append(mp)
                 agg[r]['warp_lpips'].append(lpfn(c * 2 - 1, t * 2 - 1).item())
                 agg[r]['model_lpips'].append(lpfn(o * 2 - 1, t * 2 - 1).item())
+                key = round(float(tv[i]), 2)                       # phase t=j/K -> multiplier bucket
+                pht[key]['warp_psnr'].append(wp); pht[key]['model_psnr'].append(mp)
         mean = lambda v: sum(v) / max(1, len(v))
         print(f"\n=== mode={mode} : model vs warp, per regime ===")
         print(f"{'regime':10} {'n':>4} {'PSNR warp→model':>22} {'LPIPS warp→model':>24}")
@@ -73,6 +77,19 @@ def evaluate(ckpt, data_dir, device='cuda', modes=('interp',)):
             wp, mp = mean(agg[r]['warp_psnr']), mean(agg[r]['model_psnr'])
             wl, ml = mean(agg[r]['warp_lpips']), mean(agg[r]['model_lpips'])
             print(f"{r:10} {n:>4}   {wp:6.2f} -> {mp:6.2f} ({mp-wp:+.2f})   {wl:6.3f} -> {ml:6.3f} ({ml-wl:+.3f})")
+        # #5 per-phase uniformity: the phase-conditioned net must serve every multiplier (small t=near
+        # a real frame .. large t=deep in-between) — a big spread means some multipliers are underserved.
+        print(f"\n=== mode={mode} : per-phase (t=j/K), model vs warp — uniformity across 2x..Kx ===")
+        print(f"{'t':>6} {'n':>5}  {'warp':>7} {'model':>7} {'gain':>7}")
+        gains = []
+        for key in sorted(pht):
+            n = len(pht[key]['warp_psnr'])
+            wp, mp = mean(pht[key]['warp_psnr']), mean(pht[key]['model_psnr'])
+            gains.append(mp)
+            print(f"{key:6.2f} {n:>5}  {wp:7.2f} {mp:7.2f} {mp-wp:+7.2f}")
+        if gains:
+            print(f"model PSNR spread across phases: {max(gains)-min(gains):.2f} dB "
+                  f"(min {min(gains):.2f} @worst phase — lower spread = more uniform multiplier support)")
 
 
 if __name__ == '__main__':

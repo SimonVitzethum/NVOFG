@@ -24,24 +24,50 @@ def _shift(img, dx, dy):
     return F.grid_sample(img, grid, align_corners=True, padding_mode='border')
 
 
-def measure_offset(cand, gt, rng=1.5, step=0.1, border=8):
-    """Global sub-pixel shift d that best maps cand onto gt (robust to local disocclusion noise:
-    a consistent shift dominates the global error; local holes add unbiased noise)."""
+def measure_offset(cand, gt, valid=None, rng=1.5, step=0.1, border=8, trim=0.2):
+    """Global sub-pixel shift d that best maps cand onto gt.
+
+    A capture-convention offset shifts the WHOLE frame systematically; disocclusion holes, moving
+    hard edges and reactive/particle pixels are LOCAL and BIASED (the candidate has the wrong content
+    there no matter how well the capture is aligned), so a plain mean-L1 fit is pulled off by them.
+    We measure the shift only on the reliably-reconstructable majority:
+      * `valid` (optional [B,1,H,W] in {0,1}) drops known-invalid pixels (UI, reactive/particles);
+      * a trimmed mean drops the worst `trim` fraction of the remaining residuals (disocclusion/edges).
+    This is strictly more correct for real captures too — you never judged alignment on pixels that
+    legitimately can't be reconstructed."""
     c = cand[..., border:-border, border:-border]
+    v = None if valid is None else valid[..., border:-border, border:-border]
+    # brightness-invariant: per-frame shading/exposure is MULTIPLICATIVE and would otherwise let the
+    # best-fit shift move to compensate a brightness mismatch (a false offset). Normalize each frame
+    # by its own mean so the measure sees only the geometric shift. Correct for real captures too
+    # (exposure/auto-brightness changes between frames must not read as misalignment).
+    cn = c / c.mean(dim=[2, 3], keepdim=True).clamp(min=1e-4)
     best = (0.0, 0.0); best_e = float('inf')
     ds = torch.arange(-rng, rng + 1e-6, step).tolist()
     for dy in ds:
         for dx in ds:
             g = _shift(gt, dx, dy)[..., border:-border, border:-border]
-            e = (c - g).abs().mean().item()
+            g = g / g.mean(dim=[2, 3], keepdim=True).clamp(min=1e-4)
+            err = (cn - g).abs().mean(1, keepdim=True)          # per-pixel, mean over channels
+            if v is not None:
+                err = err[v > 0.5]
+            else:
+                err = err.reshape(-1)
+            if err.numel() == 0:
+                continue
+            if 0.0 < trim < 1.0 and err.numel() > 16:          # robust: keep the best (1-trim) fraction
+                k = int(err.numel() * (1.0 - trim))
+                err = torch.topk(err, k, largest=False).values
+            e = err.mean().item()
             if e < best_e:
                 best_e, best = e, (dx, dy)
     return best, best_e
 
 
-def alignment_gate(cand, gt, tol=0.15):
-    """Returns (passed, offset_px, magnitude). Fail if the systematic shift exceeds `tol` px."""
-    (dx, dy), _ = measure_offset(cand, gt)
+def alignment_gate(cand, gt, valid=None, tol=0.15):
+    """Returns (passed, offset_px, magnitude). Fail if the systematic shift exceeds `tol` px.
+    `valid` optionally excludes UI/reactive pixels (see measure_offset)."""
+    (dx, dy), _ = measure_offset(cand, gt, valid=valid)
     mag = (dx * dx + dy * dy) ** 0.5
     return mag <= tol, (dx, dy), mag
 
