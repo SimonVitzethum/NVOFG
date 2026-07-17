@@ -68,12 +68,13 @@ static void logs(const char* s){ (void)write(2,s,strlen(s)); }
 static void logn(const char* a,const char* b){ logs(a); logs(b); logs("\n"); }
 
 // ---- module registry ----
-typedef struct { char name[64]; u8* base; u64 imgbase; u32 exp_rva,exp_sz; int loaded; } Module;
+typedef struct { char name[64]; u8* base; u64 imgbase; u32 exp_rva,exp_sz; u32 size; int loaded; } Module;
 static Module g_mod[16]; static int g_nmod=0;
 static u8* g_code; static size_t g_codeoff;
 static __thread void* g_tls[2048]; static __thread int g_lasterr; static int g_tlsnext=1; static u8 g_heap[1];
 static u64 g_hcount=0x2000;
 static u8 g_teb[0x2000],g_peb[0x800]; static void* g_tlsslots[512];   // fake Windows TEB + PE-TLS array
+volatile void* g_dbg_nvngx_base;   // set to _nvngx mapped base; gdb reads it to anchor base+offset breaks
 static pthread_t g_wthreads[256]; static volatile int g_nwthreads;   // real worker-thread handle table
 static void* make_trap(const char* name);   // fwd (defined below)
 static void* make_ms2sysv(void* target);     // fwd (defined below)
@@ -130,7 +131,13 @@ MSABI static int s_InitOnceExecuteOnce(void* o,void* f,void* p,void** c){(void)p
 static u32 putw16(u16* b,u32 sz,const char* s){ u32 n=strlen(s); if(!b||sz==0) return n; u32 i=0; for(;i<n&&i<sz-1;i++) b[i]=(u8)s[i]; b[i]=0; return i; }
 MSABI static u32 s_GetSystemDirectoryW(u16* b,u32 sz){ return putw16(b,sz,"C:\\Windows\\System32"); }
 MSABI static u32 s_GetWindowsDirectoryW(u16* b,u32 sz){ return putw16(b,sz,"C:\\Windows"); }
-MSABI static u32 s_GetModuleFileNameW(void* m,u16* b,u32 sz){ (void)m; return putw16(b,sz,"C:\\game\\game.exe"); }
+// The snippet's GetFeatureRequirements does GetModuleHandleExA(FROM_ADDRESS, <own addr>) ->
+// GetModuleFileNameW(that handle) to discover its OWN module path, then processes it; a wrong
+// module/path there makes it return 0xBAD00002. Return the REAL module for a handle.
+MSABI static u32 s_GetModuleFileNameW(void* m,u16* b,u32 sz){
+    for(int i=0;i<g_nmod;i++) if(g_mod[i].base==(u8*)m && g_mod[i].name[0]){
+        char p[320]; snprintf(p,sizeof p,"C:\\Windows\\System32\\%s",g_mod[i].name); return putw16(b,sz,p); }
+    return putw16(b,sz,"C:\\game\\game.exe"); }
 MSABI static u32 s_GetModuleFileNameA(void* m,char* b,u32 sz){ (void)m; const char* s="C:\\game\\game.exe"; u32 n=strlen(s); if(!b||!sz)return n; u32 i=0; for(;i<n&&i<sz-1;i++)b[i]=s[i]; b[i]=0; return i; }
 MSABI static int s_VerifyVersionInfoW(void* a,u32 b,u64 c){ (void)a;(void)b;(void)c; return 1; }
 MSABI static u64 s_VerSetConditionMask(u64 m,u32 t,u8 c){ (void)t;(void)c; return m?m:1; }
@@ -321,9 +328,18 @@ MSABI static int s_GPU_GetBusType(void* g,u32* t){ (void)g; if(t)*t=3; /*PCI_EXP
 // VkPhysicalDeviceIDProperties) and the nvapi OS-AdapterId, so NGX's adapter correlation matches.
 // DERIVED from the fixed deviceUUID (set in s_vkGPDP2) — deterministic + stable across process
 // runs + collision-free, in case NGX uses the LUID as a cache key for its model/config files.
-static u8 g_luid[8]={0x70,0x50,0xB1,0xAC,0x4E,0x11,0x00,0x00};  // fallback until GPDP2 fills it
+// MEASURED from dxvk-nvapi GetLogicalGpuInfo under Proton (version 0x10238): OSAdapterId =
+// f2 03 00 00 00 00 00 00 (a small Windows-style LUID, LowPart=0x3F2). Use dxvk's EXACT value for
+// all three LUID surfaces (vk deviceLUID, D3DKMT adapter LUID, nvapi OS-adapter id) so the native
+// evaluator's LUID inputs are byte-identical to Proton, not just self-consistent.
+static u8 g_luid[8]={0xF2,0x03,0x00,0x00,0x00,0x00,0x00,0x00};
 // NV_LOGICAL_GPU_DATA: version@0, pOSAdapterId@8, physicalGpuCount@16, physicalGpuHandles@24.
-MSABI static int s_GPU_GetLogicalGpuInfo(void* lgpu,u8* d){ (void)lgpu; logs("[LGI entered]\n"); if(!d) return 0;
+MSABI static int s_GPU_GetLogicalGpuInfo(void* lgpu,u8* d){ (void)lgpu; if(!d) return 0;
+    // MEASURE the exact NV_LOGICAL_GPU_DATA version NGX passes (d[0] = sizeof|ver<<16). Native we're
+    // the callee, so we READ it instead of guessing — then Proton dxvk can be asked with this exact
+    // version to yield the real bytes to diff (the -9 wall was just a wrong guessed version).
+    { char b[96]; u32 v=*(u32*)d; snprintf(b,sizeof b,"[LGI] version=0x%08X (size=%u ver=%u) osidPtr=%p\n",
+        v, v&0xFFFF, v>>16, *(void**)(d+8)); logs(b); }
     void* osid=*(void**)(d+8); if(osid) memcpy(osid,g_luid,8);
     *(u32*)(d+16)=1; *(void**)(d+24)=FAKE_GPU; logs("[LGI filled]\n"); return 0; }
 MSABI static void* s_nvapi_QueryInterface(u32 id){
@@ -388,6 +404,11 @@ MSABI static void* s_LoadLibraryExW(void* n,void* h,u32 f){ (void)h;(void)f; cha
 MSABI static void* s_LoadLibraryA(const char* n){ const char* s=strrchr(n,'\\'); s=s?s+1:n; logn("[LoadLibraryA] ",s);
     Module* m=load_module(s); return m?m->base:(void*)0x140000000ULL; }
 MSABI static int   s_GetModuleHandleExW(u32 f,void* n,void** out){ (void)f;(void)n; if(out)*out=g_mod[0].base; return 1; }
+// GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS (0x4): resolve which loaded module CONTAINS the address.
+// The snippet uses this to find its own module (then its path). Returning the dummy module broke it.
+MSABI static int   s_GetModuleHandleExA(u32 f,void* n,void** out){
+    if((f&4) && n){ for(int i=0;i<g_nmod;i++) if(g_mod[i].base && (u8*)n>=g_mod[i].base && (u8*)n<g_mod[i].base+g_mod[i].size){ if(out)*out=g_mod[i].base; return 1; } }
+    if(out)*out=g_mod[0].base; return 1; }
 
 struct { const char* name; void* fn; } g_stubs[]={
  {"GetProcessHeap",s_GetProcessHeap},{"HeapAlloc",s_HeapAlloc},{"HeapReAlloc",s_HeapReAlloc},{"HeapFree",s_HeapFree},
@@ -402,7 +423,7 @@ struct { const char* name; void* fn; } g_stubs[]={
  {"IsDebuggerPresent",s_IsDebuggerPresent},{"InitializeSListHead",s_InitializeSListHead},{"InterlockedFlushSList",s_ret0p},
  {"GetLastError",s_GetLastError},{"SetLastError",s_SetLastError},
  {"GetModuleHandleW",s_GetModuleHandleW},{"GetModuleHandleA",s_GetModuleHandleW},{"GetProcAddress",s_GetProcAddress},
- {"GetModuleHandleExW",s_GetModuleHandleExW},{"GetModuleHandleExA",s_GetModuleHandleExW},
+ {"GetModuleHandleExW",s_GetModuleHandleExW},{"GetModuleHandleExA",s_GetModuleHandleExA},
  {"LoadLibraryW",s_LoadLibraryExW},{"LoadLibraryExW",s_LoadLibraryExW},{"LoadLibraryA",s_LoadLibraryA},{"LoadLibraryExA",s_LoadLibraryA},
  {"GetStartupInfoW",s_GetStartupInfoW},{"GetCommandLineW",s_GetCommandLineW},{"GetCommandLineA",s_GetCommandLineW},
  {"OutputDebugStringA",s_OutputDebugStringA},
@@ -488,7 +509,7 @@ static Module* load_module(const char* name){
     if(imp){const u8* d=base+imp;for(;;d+=20){u32 oft=rd32(d),nm=rd32(d+12),ft=rd32(d+16);if(!nm&&!ft&&!oft)break;const char* dll=(const char*)(base+nm);const u8* t=base+(oft?oft:ft);u8* iat=base+ft;
         for(;;t+=8,iat+=8){u64 v=rd64(t);if(!v)break;if(v&0x8000000000000000ULL)continue;const char* fn=(const char*)(base+(u32)v+2);void* r=resolve(dll,fn);memcpy(iat,&r,8);}}}
     for(u16 i=0;i<nsec;i++){const u8* s=sec+i*40;u32 va=rd32(s+12),vs=rd32(s+8),ch=rd32(s+36);u32 len=(vs+0xFFF)&~0xFFFu;int prot=PROT_READ;if(ch&0x80000000)prot|=PROT_WRITE;if(ch&0x20000000)prot|=PROT_EXEC;if(va+len<=sizeimg)mprotect(base+va,len,prot);}
-    Module* m=&g_mod[g_nmod++]; strncpy(m->name,name,63); m->base=base; m->imgbase=imgbase; m->exp_rva=expr; m->exp_sz=exps; m->loaded=1;
+    Module* m=&g_mod[g_nmod++]; strncpy(m->name,name,63); m->base=base; m->imgbase=imgbase; m->exp_rva=expr; m->exp_sz=exps; m->size=sizeimg; m->loaded=1;
     // PE-TLS block for this module -> hang off the shared gs:[0x58] TLS array (set in main)
     if(tls){const u8* td=base+tls;u64 start=rd64(td+0),endr=rd64(td+8),idxaddr=rd64(td+16);u32 zf=rd32(td+32);
         u64 raw=endr-start;u8* blk=calloc(1,raw+zf+64);if(raw)memcpy(blk,(void*)start,raw);
@@ -536,11 +557,9 @@ MSABI static void s_vkGPDP2(void* pd,void* pprops){
             // The native NVIDIA Linux driver reports deviceLUIDValid=0. Synthesize a valid LUID
             // DERIVED from the fixed deviceUUID (first 8 bytes) — stable + collision-free — and use
             // the SAME bytes as the nvapi OS-AdapterId (g_luid) so NGX's adapter correlation matches.
-            { int uuidnz=0; for(int k=0;k<8;k++) if(idp->deviceUUID[k]) uuidnz=1;
-              if(uuidnz) memcpy(g_luid,idp->deviceUUID,8); // else keep the non-zero fallback g_luid
-              idp->deviceLUIDValid=1; memcpy(idp->deviceLUID,g_luid,8); idp->deviceNodeMask=1;
-              char q[128]; snprintf(q,sizeof q,"   ID_PROPS FIXED: valid=%u LUID=%02x%02x%02x%02x%02x%02x%02x%02x @idp=%p\n",
-                idp->deviceLUIDValid,g_luid[0],g_luid[1],g_luid[2],g_luid[3],g_luid[4],g_luid[5],g_luid[6],g_luid[7],(void*)idp); logs(q); }
+            // Force validity + dxvk's EXACT LUID bytes (g_luid), so vk deviceLUID == nvapi
+            // OSAdapterId == D3DKMT LUID == what Proton feeds the evaluator, byte-for-byte.
+            idp->deviceLUIDValid=1; memcpy(idp->deviceLUID,g_luid,8); idp->deviceNodeMask=1;
         } else { char c[48]; snprintf(c,sizeof c,"   pNext sType=%u\n",(unsigned)s->sType); logs(c);} } }
 MSABI static void* my_gipa(void* inst,const char* n){ if(n)logn("[gipa] ",n);
     if(n&&!strcmp(n,"vkGetPhysicalDeviceProperties2")) return (void*)s_vkGPDP2;
@@ -580,6 +599,9 @@ int main(void){
         // load the NGX core host; it LoadLibrary's its siblings (logged)
         Module* h=load_module("_nvngx.dll");
         if(!h){ logs("host load failed\n"); _exit(3); }
+        g_dbg_nvngx_base=h->base;  // gdb anchor (ASLR-stable read point for base+offset breakpoints)
+        { char b[80]; snprintf(b,sizeof b,"[_nvngx base=%p  GFR@%p  eval_c1e0@%p  ret_e194@%p]\n",
+            (void*)h->base,(void*)(h->base+0xdf80),(void*)(h->base+0xc1e0),(void*)(h->base+0xe194)); logs(b); }
         static u16 wpath[80]; const char* dp=WINE; int i=0; for(;dp[i]&&i<79;i++) wpath[i]=(u8)dp[i]; wpath[i]=0;  // UTF-16 (2-byte) path
 
         // LIGHTER query first: NVSDK_NGX_VULKAN_GetFeatureRequirements(FrameGeneration) — the

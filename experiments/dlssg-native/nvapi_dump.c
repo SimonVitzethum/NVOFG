@@ -53,19 +53,20 @@ int main(void){
     void* logical=0; int rl = GetLog? GetLog(gpu,&logical) : -999;
     L("GetLogicalGPUFromPhysicalGPU -> %d logical=%p\n", rl, logical);
     if(logical && LogInfo){
-        // NV_LOGICAL_GPU_DATA: version@0, pOSAdapterId@8, physicalGpuCount@16, physicalGpuHandles@24.
-        // Brute-force the struct version (size|ver<<16) until dxvk-nvapi accepts it (returns 0).
-        unsigned sizes[]={32,536,528,552,40,24, 0};
-        for(int vi=0; sizes[vi]; ++vi) for(int ver=1; ver<=2; ++ver){
-            unsigned char buf[1024]; memset(buf,0,sizeof buf);
-            unsigned char osid[16]; memset(osid,0xEE,sizeof osid);   // sentinel: see if dxvk overwrites
-            *(unsigned*)(buf+0) = sizes[vi] | (ver<<16);
-            *(void**)(buf+8) = osid;
-            int r = LogInfo(logical, buf);
-            if(r==0){
-                L("GPU_GetLogicalGpuInfo(sz=%u v%d) -> 0 : count=%u  OSAdapterId=%02x%02x%02x%02x%02x%02x%02x%02x\n",
-                  sizes[vi],ver,*(unsigned*)(buf+16), osid[0],osid[1],osid[2],osid[3],osid[4],osid[5],osid[6],osid[7]);
-            }
+        // EXACT version measured at our native stub: 0x00010238 (size=568, ver=1).
+        unsigned char buf[1024]; memset(buf,0,sizeof buf);
+        unsigned char osid[16]; memset(osid,0xEE,sizeof osid);   // sentinel: did dxvk overwrite it?
+        *(unsigned*)(buf+0) = 0x00010238;                        // 568 | (1<<16)
+        *(void**)(buf+8) = osid;                                 // pOSAdapterId
+        int r = LogInfo(logical, buf);
+        L("GPU_GetLogicalGpuInfo(0x10238) -> %d\n", r);
+        L("  OSAdapterId = %02x%02x%02x%02x%02x%02x%02x%02x\n",
+          osid[0],osid[1],osid[2],osid[3],osid[4],osid[5],osid[6],osid[7]);
+        // dump the whole 568-byte struct in 8-byte rows so we can diff every field vs our stub
+        for(int off=0; off<568; off+=16){
+            L("  +%03x: %02x%02x%02x%02x %02x%02x%02x%02x  %02x%02x%02x%02x %02x%02x%02x%02x\n", off,
+              buf[off+0],buf[off+1],buf[off+2],buf[off+3],buf[off+4],buf[off+5],buf[off+6],buf[off+7],
+              buf[off+8],buf[off+9],buf[off+10],buf[off+11],buf[off+12],buf[off+13],buf[off+14],buf[off+15]);
         }
     }
     L("DONE\n");
