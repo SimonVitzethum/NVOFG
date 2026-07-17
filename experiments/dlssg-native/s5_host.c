@@ -133,6 +133,13 @@ MSABI static u32 s_GetModuleFileNameA(void* m,char* b,u32 sz){ (void)m; const ch
 MSABI static int s_VerifyVersionInfoW(void* a,u32 b,u64 c){ (void)a;(void)b;(void)c; return 1; }
 MSABI static u64 s_VerSetConditionMask(u64 m,u32 t,u8 c){ (void)t;(void)c; return m?m:1; }
 MSABI static u32 s_GetFullPathNameW(const u16* n,u32 sz,u16* buf,void** fp){ (void)fp; u32 i=0; if(buf)for(;n[i]&&i<sz-1;i++)buf[i]=n[i]; if(buf)buf[i]=0; return i; }
+// --- S5e file-API trace: log the exact paths NGX asks for during NGXGetPath, so we can tell
+// whether it wants a WRITABLE DIRECTORY (scenario A) or concrete MODEL FILES (scenario B). ---
+static void wlog(const char* tag,const void* w){ char b[320]; const u16* p=w; int i=0; if(p) for(;p[i]&&i<319;i++) b[i]=(char)(p[i]&0xFF); b[i]=0; logn(tag,b); }
+MSABI static void* s_CreateFileW(void* name,u32 a,u32 s,void* sa,u32 cd,u32 fa,void* t){ (void)a;(void)s;(void)sa;(void)cd;(void)fa;(void)t; wlog("[CreateFileW] ",name); return (void*)-1; } // INVALID_HANDLE_VALUE
+MSABI static u32   s_GetFileAttributesW(void* name){ wlog("[GetFileAttributesW] ",name); return 0xFFFFFFFF; }                 // INVALID_FILE_ATTRIBUTES
+MSABI static int   s_GetFileAttributesExW(void* name,u32 lvl,void* info){ (void)lvl;(void)info; wlog("[GetFileAttributesExW] ",name); return 0; } // FALSE
+MSABI static void* s_FindFirstFileExW(void* name,u32 a,void* d,u32 b,void* c,u32 e){ (void)a;(void)d;(void)b;(void)c;(void)e; wlog("[FindFirstFileExW] ",name); return (void*)-1; }
 // --- nvapi shim (S5c): the host resolves NvAPI_* via nvapi_QueryInterface(id). First pass:
 // log every requested interface id and hand back a 0-returning stub (NVAPI_OK) so the host
 // keeps querying and we can enumerate the full set it needs for GPU-arch detection. ---
@@ -153,7 +160,7 @@ MSABI static int s_DRS_GetSetting(void* h,void* p,u32 id,void* out){ (void)h;(vo
 MSABI static int s_DRS_FindApplicationByName(void* sess,void* appName,void** phProfile,void* pApp){ (void)sess;(void)appName;(void)pApp; if(phProfile)*phProfile=(void*)0x1B45E; return 0; } // dxvk-nvapi returns Ok
 // NVDRS_PROFILE = {version@0, profileName[2048]@4 (NvU16 inline), gpuSupport, isPredefined, numOfApps, numOfSettings}.
 // dxvk-nvapi zeroes profileName (=> valid empty wstring, not NULL) + the trailing fields. That's what NGX wcslen's.
-MSABI static int s_DRS_GetProfileInfo(void* sess,void* prof,u8* p){ (void)sess;(void)prof; if(!p) return (int)0xBAD00005; memset(p+4,0,4096+16); return 0; }
+MSABI static int s_DRS_GetProfileInfo(void* sess,void* prof,u8* p){ (void)sess;(void)prof; if(!p) return -5 /*NVAPI_INVALID_ARGUMENT*/; memset(p+4,0,4096+16); return 0; }
 MSABI static int s_SYS_GetDriverAndBranchVersion(u32* pver,char* branch){ if(pver)*pver=61043; /*610.43*/ if(branch){const char* b="r610_00";int i=0;for(;b[i]&&i<63;i++)branch[i]=b[i];branch[i]=0;} return 0; }
 // Back the fake nvapi handles with REAL zeroed memory, so if NGX dereferences a handle
 // (the Windows nvapi handles are internally pointers) it lands in valid memory, not a crash.
@@ -169,9 +176,11 @@ MSABI static int s_GPU_GetPCIIdentifiers(void* g,u32* dev,u32* sub,u32* rev,u32*
 MSABI static int s_GPU_GetFullName(void* g,char* name){ (void)g; const char* s="NVIDIA GeForce RTX 5070 Laptop GPU"; if(name){int i=0;for(;s[i]&&i<63;i++)name[i]=s[i];name[i]=0;} return 0; }
 MSABI static int s_GPU_GetGPUType(void* g,u32* t){ (void)g; if(t)*t=2; /*DGPU*/ return 0; }
 MSABI static int s_GPU_GetBusType(void* g,u32* t){ (void)g; if(t)*t=3; /*PCI_EXPRESS*/ return 0; }
-// A consistent fake Windows adapter LUID, used for BOTH the Vulkan deviceLUID (forced into
+// Synthetic Windows adapter LUID, used for BOTH the Vulkan deviceLUID (forced into
 // VkPhysicalDeviceIDProperties) and the nvapi OS-AdapterId, so NGX's adapter correlation matches.
-static const u8 g_luid[8]={0x70,0x50,0xB1,0xAC,0x4E,0x11,0x00,0x00};
+// DERIVED from the fixed deviceUUID (set in s_vkGPDP2) — deterministic + stable across process
+// runs + collision-free, in case NGX uses the LUID as a cache key for its model/config files.
+static u8 g_luid[8]={0x70,0x50,0xB1,0xAC,0x4E,0x11,0x00,0x00};  // fallback until GPDP2 fills it
 // NV_LOGICAL_GPU_DATA: version@0, pOSAdapterId@8, physicalGpuCount@16, physicalGpuHandles@24.
 MSABI static int s_GPU_GetLogicalGpuInfo(void* lgpu,u8* d){ (void)lgpu; logs("[LGI entered]\n"); if(!d) return 0;
     void* osid=*(void**)(d+8); if(osid) memcpy(osid,g_luid,8);
@@ -264,6 +273,7 @@ struct { const char* name; void* fn; } g_stubs[]={
  {"GetSystemDirectoryW",s_GetSystemDirectoryW},{"GetWindowsDirectoryW",s_GetWindowsDirectoryW},
  {"VerifyVersionInfoW",s_VerifyVersionInfoW},{"VerSetConditionMask",s_VerSetConditionMask},{"GetFullPathNameW",s_GetFullPathNameW},
  {"nvapi_QueryInterface",s_nvapi_QueryInterface},
+ {"CreateFileW",s_CreateFileW},{"GetFileAttributesW",s_GetFileAttributesW},{"GetFileAttributesExW",s_GetFileAttributesExW},{"FindFirstFileExW",s_FindFirstFileExW},
  {0,0}};
 static void* g_stubs_lookup(const char* fn){ for(int i=0;g_stubs[i].name;i++) if(!strcmp(g_stubs[i].name,fn)) return g_stubs[i].fn; return 0; }
 
@@ -356,8 +366,10 @@ MSABI static void s_vkGPDP2(void* pd,void* pprops){
             char c[96]; snprintf(c,sizeof c,"   ID_PROPS: LUIDValid=%u LUID=%02x%02x%02x%02x%02x%02x%02x%02x\n",
                 idp->deviceLUIDValid,idp->deviceLUID[0],idp->deviceLUID[1],idp->deviceLUID[2],idp->deviceLUID[3],
                 idp->deviceLUID[4],idp->deviceLUID[5],idp->deviceLUID[6],idp->deviceLUID[7]); logs(c);
-            // TEST: force a valid Windows-style LUID so the host can 'identify the adapter'.
-            if(!idp->deviceLUIDValid){ idp->deviceLUIDValid=1; memcpy(idp->deviceLUID,g_luid,8); idp->deviceNodeMask=1; }
+            // The native NVIDIA Linux driver reports deviceLUIDValid=0. Synthesize a valid LUID
+            // DERIVED from the fixed deviceUUID (first 8 bytes) — stable + collision-free — and use
+            // the SAME bytes as the nvapi OS-AdapterId (g_luid) so NGX's adapter correlation matches.
+            if(!idp->deviceLUIDValid){ memcpy(g_luid,idp->deviceUUID,8); idp->deviceLUIDValid=1; memcpy(idp->deviceLUID,g_luid,8); idp->deviceNodeMask=1; }
         } else { char c[48]; snprintf(c,sizeof c,"   pNext sType=%u\n",(unsigned)s->sType); logs(c);} } }
 MSABI static void* my_gipa(void* inst,const char* n){ if(n)logn("[gipa] ",n);
     if(n&&!strcmp(n,"vkGetPhysicalDeviceProperties2")) return (void*)s_vkGPDP2;
