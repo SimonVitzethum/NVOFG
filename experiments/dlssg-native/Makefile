@@ -10,8 +10,11 @@ pe_probe: pe_probe.c
 pe_load: pe_load.c
 	$(CC) $(CFLAGS) -o $@ $< -ldl
 
+s5_host: s5_host.c
+	$(CC) $(CFLAGS) -o $@ $< -ldl
+
 .PHONY: run recon clean
-all: pe_probe pe_load
+all: pe_probe pe_load s5_host
 run: pe_probe pe_load
 	./pe_probe $(DLLSG)
 	./pe_load $(DLLSG)
@@ -19,4 +22,4 @@ run: pe_probe pe_load
 recon:
 	winedump -j import $(DLLSG) || true
 clean:
-	rm -f pe_probe pe_load probe_output.txt load_output.txt
+	rm -f pe_probe pe_load s5_host probe_output.txt load_output.txt

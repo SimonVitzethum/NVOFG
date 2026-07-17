@@ -1038,15 +1038,25 @@ ThreadLocalStoragePointer etc.) with **PE-TLS** setup, installed via `arch_prctl
 the Wine TEB mechanism (~40 lines). So **loading + initialising the real DLSS-G snippet natively is
 not the blocker — it works**; no D3D12/DXGI/COM, no exotic dependency.
 
-**Crux now = S5 (host↔snippet ABI).** The snippet exports **0 named functions** — the NGX host does
-not call it by export; the interface is an **internal, undocumented NGX ABI**. Next: load the NGX
-host PEs (`nvngx.dll`/`_nvngx.dll`) under the same loader (they add CRYPT32/bcrypt/ole32/WS2_32 —
-all CRT-shimmable) so `NVSDK_NGX_VULKAN_CreateFeature(FrameGeneration)` reaches the native snippet,
-**or** reverse the host↔snippet entry ABI and drive it from a minimal custom host. Then S6 (ms_abi
-thunks + feed our frame via the snippet's CUDA-Vulkan interop imports) and S4 (Reflex pacing). S5 is
-where Path B still may die; the own model (§21) stays the parallel fallback.
+**S5(a) — the Windows NGX host loads natively too (DONE).** The snippet exports **0 named
+functions**, so the host drives it through an internal NGX ABI. `experiments/dlssg-native/s5_host.c`
+generalises the loader into a **multi-PE loader** (module registry + real `LoadLibrary`/
+`GetProcAddress` + export parsing) and loads the NGX core host `_nvngx.dll`: its **`DllMain` returns
+1** and its **entire `NVSDK_NGX_VULKAN_*` API resolves — `Init`, `Init_ProjectID`, `CreateFeature`,
+`EvaluateFeature`, `GetFeatureRequirements`, `GetCapabilityParameters` all FOUND**. So **both the FG
+snippet and the Windows NGX core host load + init natively on Linux, and the FG-capable API surface
+is reachable.**
 
-*(Working log + probes in `experiments/dlssg-native/RECON.md`, `pe_probe.c` (S1), `pe_load.c` (S2).)*
+**What remains (S5/S6):** (1) call `Init_ProjectID` + `CreateFeature(FrameGeneration)` with a live
+`VkInstance`/`VkDevice`, which needs the **ms_abi→SysV thunks** for the 22 Vulkan + 26 CUDA imports;
+(2) the **nvapi/nvml GPU-arch bridge** the host needs during `Init` (its strings: "GPUArchitecture ==
+Unknown. Need … nvapi … nvml") — bridge to native `libnvidia-ml.so` / a minimal nvapi shim (the
+dxvk-nvapi role) — **this is the next real dependency and possible blocker**; (3) S6 feed our frame
+via the snippet's CUDA-Vulkan interop; (4) S4 Reflex pacing. The own model (§21) stays the parallel
+fallback if the nvapi/nvml bridge proves intractable.
+
+*(Working log + probes in `experiments/dlssg-native/RECON.md`; `pe_probe.c` S1, `pe_load.c` S2,
+`s5_host.c` S5(a).)*
 
 ## 21. Training our own frame-generation model — what it would take
 

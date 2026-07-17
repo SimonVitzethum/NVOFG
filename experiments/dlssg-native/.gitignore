@@ -3,3 +3,4 @@ pe_probe
 # never commit NVIDIA's DLLs
 *.dll
 pe_load
+s5_host

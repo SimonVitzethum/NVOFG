@@ -1,0 +1,226 @@
+// Path B — S5(a): load the Windows NGX host (_nvngx.dll) natively and reach the
+// NVSDK_NGX_VULKAN_* API that can drive the FrameGeneration snippet. Generalises the S2
+// loader (pe_load.c) into a multi-PE loader with a module registry + real
+// LoadLibrary/GetProcAddress + export-table parsing, so the host can pull its siblings.
+//
+// Goal this stage: prove the Windows NGX host loads + inits natively (DllMain), expose
+// its NVSDK_NGX exports, and observe what it dynamically requests during init (expected:
+// nvapi/nvml for GPU-arch detection — the next S5 dependency). We do NOT yet call NGX
+// Init (that needs a live VkDevice + a driver bridge). Runs in a forked child under a
+// SIGSEGV guard; loads the on-disk driver DLLs in place (never vendored).
+//
+// Build: gcc -O2 -o s5_host s5_host.c -ldl   Run: ./s5_host
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t u64;
+#define MSABI __attribute__((ms_abi))
+#define WINE "/usr/lib/nvidia/wine/"
+static u32 rd32(const u8* p){u32 v;memcpy(&v,p,4);return v;}
+static u16 rd16(const u8* p){u16 v;memcpy(&v,p,2);return v;}
+static u64 rd64(const u8* p){u64 v;memcpy(&v,p,8);return v;}
+static void logs(const char* s){ (void)write(2,s,strlen(s)); }
+static void logn(const char* a,const char* b){ logs(a); logs(b); logs("\n"); }
+
+// ---- module registry ----
+typedef struct { char name[64]; u8* base; u64 imgbase; u32 exp_rva,exp_sz; int loaded; } Module;
+static Module g_mod[16]; static int g_nmod=0;
+static u8* g_code; static size_t g_codeoff;
+static __thread void* g_tls[2048]; static __thread int g_lasterr; static int g_tlsnext=1; static u8 g_heap[1];
+static u64 g_hcount=0x2000;
+static u8 g_teb[0x2000],g_peb[0x800]; static void* g_tlsslots[512];   // fake Windows TEB + PE-TLS array
+
+// ---- ms_abi CRT shim (subset proven in pe_load.c) ----
+MSABI static void* s_GetProcessHeap(void){return g_heap;}
+MSABI static void* s_HeapAlloc(void* h,u32 f,u64 s){(void)h;return(f&8)?calloc(1,s):malloc(s);}
+MSABI static void* s_HeapReAlloc(void* h,u32 f,void* p,u64 s){(void)h;(void)f;return realloc(p,s);}
+MSABI static int   s_HeapFree(void* h,u32 f,void* p){(void)h;(void)f;free(p);return 1;}
+MSABI static u64   s_HeapSize(void* h,u32 f,void* p){(void)h;(void)f;(void)p;return 0;}
+MSABI static void* s_HeapCreate(u32 a,u64 b,u64 c){(void)a;(void)b;(void)c;return g_heap;}
+MSABI static int   s_HeapDestroy(void* h){(void)h;return 1;}
+MSABI static void* s_LocalAlloc(u32 f,u64 s){return(f&0x40)?calloc(1,s):malloc(s);}
+MSABI static void* s_LocalFree(void* p){free(p);return 0;}
+MSABI static u32   s_TlsAlloc(void){int i=__sync_fetch_and_add(&g_tlsnext,1);return i<2048?i:0xFFFFFFFF;}
+MSABI static void* s_TlsGetValue(u32 i){g_lasterr=0;return i<2048?g_tls[i]:0;}
+MSABI static int   s_TlsSetValue(u32 i,void* v){if(i<2048){g_tls[i]=v;return 1;}return 0;}
+MSABI static int   s_TlsFree(u32 i){(void)i;return 1;}
+MSABI static u32   s_GetCurrentThreadId(void){return(u32)(u64)pthread_self();}
+MSABI static u32   s_GetCurrentProcessId(void){return(u32)getpid();}
+MSABI static void* s_GetCurrentProcess(void){return(void*)-1;}
+MSABI static void* s_GetCurrentThread(void){return(void*)-2;}
+MSABI static void  s_GetSystemTimeAsFileTime(void* ft){struct timespec t;clock_gettime(CLOCK_REALTIME,&t);u64 v=(u64)t.tv_sec*10000000ULL+t.tv_nsec/100+116444736000000000ULL;memcpy(ft,&v,8);}
+MSABI static int   s_QueryPerformanceCounter(void* x){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);u64 v=(u64)t.tv_sec*1000000000ULL+t.tv_nsec;memcpy(x,&v,8);return 1;}
+MSABI static int   s_QueryPerformanceFrequency(void* x){u64 v=1000000000ULL;memcpy(x,&v,8);return 1;}
+MSABI static void* s_EncodePointer(void* p){return p;}
+MSABI static void* s_DecodePointer(void* p){return p;}
+MSABI static int   s_IsProcessorFeaturePresent(u32 f){(void)f;return 1;}
+MSABI static int   s_IsDebuggerPresent(void){return 0;}
+MSABI static void  s_InitializeSListHead(void* h){memset(h,0,16);}
+MSABI static void* s_ret0p(void){return 0;}
+MSABI static int   s_ret1(void){return 1;}
+MSABI static void  s_noop(void){}
+MSABI static u32   s_GetLastError(void){return(u32)g_lasterr;}
+MSABI static void  s_SetLastError(u32 e){g_lasterr=(int)e;}
+MSABI static void* s_CreateHandle(void){return(void*)__sync_fetch_and_add(&g_hcount,1);}
+MSABI static int   s_CloseHandle(void* h){(void)h;return 1;}
+MSABI static u32   s_WaitForSingleObject(void* h,u32 m){(void)h;(void)m;return 0;}
+MSABI static u64   s_GetTickCount64(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return(u64)t.tv_sec*1000+t.tv_nsec/1000000;}
+MSABI static void  s_GetStartupInfoW(void* si){if(si)memset(si,0,104);}
+MSABI static void* s_GetCommandLineW(void){static const u16 w[]={'a',0};return(void*)w;}
+MSABI static void  s_OutputDebugStringA(const char* s){logn("[dbg] ",s?s:"");}
+static u16 g_env[2]={0,0};
+MSABI static void* s_GetEnvironmentStringsW(void){return g_env;}
+MSABI static int   s_FreeEnvironmentStringsW(void* p){(void)p;return 1;}
+MSABI static u32   s_GetEnvironmentVariableA(const char* n,void* b,u32 s){(void)n;(void)b;(void)s;g_lasterr=203;return 0;}
+MSABI static int s_WideCharToMultiByte(u32 cp,u32 fl,const u16* w,int wl,char* mb,int mbl,void* d,void* u){(void)cp;(void)fl;(void)d;(void)u;int i=0;if(wl<0){int n=0;while(w[n])n++;wl=n+1;}if(mbl==0)return wl;for(;i<wl&&i<mbl;i++)mb[i]=(char)(w[i]&0xFF);return i;}
+MSABI static int s_MultiByteToWideChar(u32 cp,u32 fl,const char* mb,int mbl,u16* w,int wl){(void)cp;(void)fl;int i=0;if(mbl<0){int n=0;while(mb[n])n++;mbl=n+1;}if(wl==0)return mbl;for(;i<mbl&&i<wl;i++)w[i]=(u8)mb[i];return i;}
+MSABI static int s_InitOnceExecuteOnce(void* o,void* f,void* p,void** c){(void)p;(void)c;typedef int MSABI(*t)(void*,void*,void**);if(f)((t)f)(o,p,c);return 1;}
+
+// forward decls
+static void* resolve(const char* dll,const char* fn);
+static void* make_trap(const char* name);
+static Module* load_module(const char* name);
+static void* module_export(Module* m,const char* fn);
+
+// dynamic loader entry points (real)
+MSABI static void* s_GetModuleHandleW(void* n){ (void)n; return g_mod[0].base; }
+MSABI static void* s_GetProcAddress(void* m,const char* n){ if(!n)return 0;
+    for(int i=0;i<g_nmod;i++) if(g_mod[i].base==(u8*)m){ void* e=module_export(&g_mod[i],n); if(e)return e; break; }
+    // fall back to our CRT stub table by name, else a logging trap
+    void* r=resolve("dyn",n); return r; }
+static void wide_basename(const void* w,char* out){ const u16* p=w; int n=0; char tmp[260];
+    for(;p[n]&&n<259;n++) tmp[n]=(char)(p[n]&0xFF); tmp[n]=0; char* s=strrchr(tmp,'\\'); s=s?s+1:tmp; char* s2=strrchr(s,'/'); s=s2?s2+1:s; strcpy(out,s); }
+MSABI static void* s_LoadLibraryExW(void* n,void* h,u32 f){ (void)h;(void)f; char base[260]; wide_basename(n,base);
+    logn("[LoadLibrary] ",base); Module* m=load_module(base); return m?m->base:(void*)0x140000000ULL; }
+MSABI static void* s_LoadLibraryA(const char* n){ const char* s=strrchr(n,'\\'); s=s?s+1:n; logn("[LoadLibraryA] ",s);
+    Module* m=load_module(s); return m?m->base:(void*)0x140000000ULL; }
+MSABI static int   s_GetModuleHandleExW(u32 f,void* n,void** out){ (void)f;(void)n; if(out)*out=g_mod[0].base; return 1; }
+
+struct { const char* name; void* fn; } g_stubs[]={
+ {"GetProcessHeap",s_GetProcessHeap},{"HeapAlloc",s_HeapAlloc},{"HeapReAlloc",s_HeapReAlloc},{"HeapFree",s_HeapFree},
+ {"HeapSize",s_HeapSize},{"HeapCreate",s_HeapCreate},{"HeapDestroy",s_HeapDestroy},{"LocalAlloc",s_LocalAlloc},{"LocalFree",s_LocalFree},
+ {"TlsAlloc",s_TlsAlloc},{"TlsGetValue",s_TlsGetValue},{"TlsSetValue",s_TlsSetValue},{"TlsFree",s_TlsFree},
+ {"FlsAlloc",s_TlsAlloc},{"FlsGetValue",s_TlsGetValue},{"FlsSetValue",s_TlsSetValue},{"FlsFree",s_TlsFree},
+ {"GetCurrentThreadId",s_GetCurrentThreadId},{"GetCurrentProcessId",s_GetCurrentProcessId},
+ {"GetCurrentProcess",s_GetCurrentProcess},{"GetCurrentThread",s_GetCurrentThread},
+ {"GetSystemTimeAsFileTime",s_GetSystemTimeAsFileTime},{"GetSystemTimePreciseAsFileTime",s_GetSystemTimeAsFileTime},
+ {"QueryPerformanceCounter",s_QueryPerformanceCounter},{"QueryPerformanceFrequency",s_QueryPerformanceFrequency},
+ {"EncodePointer",s_EncodePointer},{"DecodePointer",s_DecodePointer},{"IsProcessorFeaturePresent",s_IsProcessorFeaturePresent},
+ {"IsDebuggerPresent",s_IsDebuggerPresent},{"InitializeSListHead",s_InitializeSListHead},{"InterlockedFlushSList",s_ret0p},
+ {"GetLastError",s_GetLastError},{"SetLastError",s_SetLastError},
+ {"GetModuleHandleW",s_GetModuleHandleW},{"GetModuleHandleA",s_GetModuleHandleW},{"GetProcAddress",s_GetProcAddress},
+ {"GetModuleHandleExW",s_GetModuleHandleExW},{"GetModuleHandleExA",s_GetModuleHandleExW},
+ {"LoadLibraryW",s_LoadLibraryExW},{"LoadLibraryExW",s_LoadLibraryExW},{"LoadLibraryA",s_LoadLibraryA},{"LoadLibraryExA",s_LoadLibraryA},
+ {"GetStartupInfoW",s_GetStartupInfoW},{"GetCommandLineW",s_GetCommandLineW},{"GetCommandLineA",s_GetCommandLineW},
+ {"OutputDebugStringA",s_OutputDebugStringA},
+ {"GetEnvironmentStringsW",s_GetEnvironmentStringsW},{"FreeEnvironmentStringsW",s_FreeEnvironmentStringsW},{"GetEnvironmentVariableA",s_GetEnvironmentVariableA},
+ {"WideCharToMultiByte",s_WideCharToMultiByte},{"MultiByteToWideChar",s_MultiByteToWideChar},
+ {"InitOnceExecuteOnce",s_InitOnceExecuteOnce},
+ {"InitializeCriticalSection",s_noop},{"InitializeCriticalSectionEx",s_ret1},{"InitializeCriticalSectionAndSpinCount",s_ret1},
+ {"EnterCriticalSection",s_noop},{"LeaveCriticalSection",s_noop},{"DeleteCriticalSection",s_noop},{"TryEnterCriticalSection",s_ret1},
+ {"InitializeSRWLock",s_noop},{"AcquireSRWLockExclusive",s_noop},{"ReleaseSRWLockExclusive",s_noop},{"TryAcquireSRWLockExclusive",s_ret1},
+ {"AcquireSRWLockShared",s_noop},{"ReleaseSRWLockShared",s_noop},
+ {"InitializeConditionVariable",s_noop},{"WakeConditionVariable",s_noop},{"WakeAllConditionVariable",s_noop},
+ {"SleepConditionVariableCS",s_ret1},{"SleepConditionVariableSRW",s_ret1},
+ {"CreateEventW",s_CreateHandle},{"CreateEventExW",s_CreateHandle},{"CreateEventA",s_CreateHandle},
+ {"CreateSemaphoreW",s_CreateHandle},{"CreateSemaphoreExW",s_CreateHandle},{"CreateMutexW",s_CreateHandle},{"CreateMutexExW",s_CreateHandle},
+ {"CloseHandle",s_CloseHandle},{"WaitForSingleObject",s_WaitForSingleObject},{"WaitForSingleObjectEx",s_WaitForSingleObject},
+ {"SetEvent",s_ret1},{"ResetEvent",s_ret1},{"GetTickCount64",s_GetTickCount64},
+ {"SetUnhandledExceptionFilter",s_ret0p},{"UnhandledExceptionFilter",s_ret1},{"RtlLookupFunctionEntry",s_ret0p},{"RtlPcToFileHeader",s_ret0p},
+ {"GetModuleFileNameW",(void*)s_ret0p},
+ {0,0}};
+static void* g_stubs_lookup(const char* fn){ for(int i=0;g_stubs[i].name;i++) if(!strcmp(g_stubs[i].name,fn)) return g_stubs[i].fn; return 0; }
+
+MSABI static u64 trap_log(const char* name){ logn("[STUB] ",name); return 0; }
+static void* make_trap(const char* name){ u8* p=g_code+g_codeoff,*st=p;
+    *p++=0x48;*p++=0x83;*p++=0xEC;*p++=0x28; *p++=0x48;*p++=0xB9;memcpy(p,&name,8);p+=8;
+    void* lg=(void*)trap_log; *p++=0x48;*p++=0xB8;memcpy(p,&lg,8);p+=8; *p++=0xFF;*p++=0xD0;
+    *p++=0x48;*p++=0x83;*p++=0xC4;*p++=0x28; *p++=0xC3; g_codeoff+=(size_t)(p-st); return st; }
+static void* resolve(const char* dll,const char* fn){ void* s=g_stubs_lookup(fn); if(s)return s;
+    char* nm=malloc(strlen(dll)+strlen(fn)+2); sprintf(nm,"%s:%s",dll,fn); return make_trap(nm); }
+
+static void* module_export(Module* m,const char* fn){ if(!m->exp_rva) return 0; const u8* e=m->base+m->exp_rva;
+    u32 nnames=rd32(e+0x18),funcs=rd32(e+0x1C),names=rd32(e+0x20),ords=rd32(e+0x24);
+    const u8* na=m->base+names; const u8* oa=m->base+ords; const u8* fa=m->base+funcs;
+    for(u32 i=0;i<nnames;i++){ const char* nm=(const char*)(m->base+rd32(na+i*4)); if(!strcmp(nm,fn)){ u16 o=rd16(oa+i*2); return m->base+rd32(fa+o*4);} }
+    return 0; }
+
+// map + relocate + wire imports + exec-protect + run DllMain; register + parse exports.
+static Module* load_module(const char* name){
+    for(int i=0;i<g_nmod;i++) if(!strcasecmp(g_mod[i].name,name)) return &g_mod[i];   // already loaded
+    char path[320]; snprintf(path,sizeof path,WINE"%s",name);
+    int fd=open(path,O_RDONLY); if(fd<0){ logn("[load: not found] ",name); return 0; }
+    struct stat stt; fstat(fd,&stt); u8* file=mmap(NULL,stt.st_size,PROT_READ,MAP_PRIVATE,fd,0); close(fd);
+    if(file==MAP_FAILED||rd16(file)!=0x5A4D) return 0;
+    u32 e=rd32(file+0x3C); const u8* nt=file+e; if(rd32(nt)!=0x4550) return 0;
+    const u8* fh=nt+4; const u8* oh=fh+20; u16 nsec=rd16(fh+2),optsz=rd16(fh+16);
+    u64 imgbase=rd64(oh+24); u32 sizeimg=rd32(oh+56),sizehdr=rd32(oh+60),ndir=rd32(oh+108); const u8* dir=oh+112;
+    u32 expr=ndir>0?rd32(dir+0):0,exps=ndir>0?rd32(dir+4):0,imp=ndir>1?rd32(dir+8):0,rel=ndir>5?rd32(dir+40):0,relsz=ndir>5?rd32(dir+44):0;
+    u32 tls=ndir>9?rd32(dir+72):0, entry=rd32(oh+16);
+    u8* base=mmap(NULL,sizeimg,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    memcpy(base,file,sizehdr); const u8* sec=oh+optsz;
+    for(u16 i=0;i<nsec;i++){const u8* s=sec+i*40;u32 vs=rd32(s+8),va=rd32(s+12),rs=rd32(s+16),rp=rd32(s+20);u32 n=rs<vs?rs:vs;if(va+n<=sizeimg&&rp+n<=stt.st_size)memcpy(base+va,file+rp,n);}
+    int64_t delta=(int64_t)((u64)base-imgbase);
+    if(rel&&delta){const u8* p=base+rel,*end=p+relsz;while(p+8<=end){u32 pg=rd32(p),bl=rd32(p+4);if(bl<8)break;for(u32 i=0;i<(bl-8)/2;i++){u16 en=rd16(p+8+i*2);if((en>>12)==10){u8* t=base+pg+(en&0xFFF);u64 v=rd64(t)+delta;memcpy(t,&v,8);}}p+=bl;}}
+    if(imp){const u8* d=base+imp;for(;;d+=20){u32 oft=rd32(d),nm=rd32(d+12),ft=rd32(d+16);if(!nm&&!ft&&!oft)break;const char* dll=(const char*)(base+nm);const u8* t=base+(oft?oft:ft);u8* iat=base+ft;
+        for(;;t+=8,iat+=8){u64 v=rd64(t);if(!v)break;if(v&0x8000000000000000ULL)continue;const char* fn=(const char*)(base+(u32)v+2);void* r=resolve(dll,fn);memcpy(iat,&r,8);}}}
+    for(u16 i=0;i<nsec;i++){const u8* s=sec+i*40;u32 va=rd32(s+12),vs=rd32(s+8),ch=rd32(s+36);u32 len=(vs+0xFFF)&~0xFFFu;int prot=PROT_READ;if(ch&0x80000000)prot|=PROT_WRITE;if(ch&0x20000000)prot|=PROT_EXEC;if(va+len<=sizeimg)mprotect(base+va,len,prot);}
+    Module* m=&g_mod[g_nmod++]; strncpy(m->name,name,63); m->base=base; m->imgbase=imgbase; m->exp_rva=expr; m->exp_sz=exps; m->loaded=1;
+    // PE-TLS block for this module -> hang off the shared gs:[0x58] TLS array (set in main)
+    if(tls){const u8* td=base+tls;u64 start=rd64(td+0),endr=rd64(td+8),idxaddr=rd64(td+16);u32 zf=rd32(td+32);
+        u64 raw=endr-start;u8* blk=calloc(1,raw+zf+64);if(raw)memcpy(blk,(void*)start,raw);
+        u32 slot=(u32)(m-g_mod)+1; if(slot<512){*(u32*)idxaddr=slot; g_tlsslots[slot]=blk;} }
+    // run DllMain
+    typedef int MSABI(*dm_t)(void*,u32,void*); dm_t dm=(dm_t)(base+entry);
+    logn("[loading] ",name); int r=dm((void*)base,1,0);
+    { char b[64]; snprintf(b,sizeof b,"[%s DllMain -> %d, exports@rva=0x%x]\n",name,r,expr); logs(b);}
+    return m;
+}
+
+static void segv(int s,siginfo_t* si,void* u){(void)s;(void)u;char b[19]="0x0000000000000000";u64 a=(u64)si->si_addr;for(int i=0;i<16;i++){int d=(a>>((15-i)*4))&0xF;b[2+i]=d<10?'0'+d:'a'+d-10;}logs("[SIGSEGV @ ");(void)write(2,b,18);logs("]\n");_exit(42);}
+
+int main(void){
+    printf("== Path B / S5(a): load Windows NGX host natively\n");
+    g_code=mmap(NULL,1<<20,PROT_READ|PROT_WRITE|PROT_EXEC,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    // module[0] must exist for GetModuleHandle(self); reserve a dummy base
+    fflush(stdout);
+    pid_t pid=fork();
+    if(pid==0){
+        struct sigaction sa;memset(&sa,0,sizeof sa);sa.sa_sigaction=segv;sa.sa_flags=SA_SIGINFO;
+        sigaction(SIGSEGV,&sa,0);sigaction(SIGILL,&sa,0);sigaction(SIGBUS,&sa,0);sigaction(SIGFPE,&sa,0);
+        memset(g_teb,0,sizeof g_teb);memset(g_peb,0,sizeof g_peb);memset(g_tlsslots,0,sizeof g_tlsslots);
+        *(void**)(g_teb+0x30)=g_teb;*(void**)(g_teb+0x58)=g_tlsslots;*(void**)(g_teb+0x60)=g_peb;
+        u8* sp;__asm__("mov %%rsp,%0":"=r"(sp));*(void**)(g_teb+0x08)=sp+0x100000;*(void**)(g_teb+0x10)=sp-0x400000;
+        syscall(SYS_arch_prctl,0x1001,(unsigned long)g_teb);
+        // load the NGX core host; it will LoadLibrary its siblings (logged)
+        Module* h=load_module("_nvngx.dll");
+        if(!h){ logs("host load failed\n"); _exit(3); }
+        // resolve the FG-capable Vulkan API entry points to prove reachability
+        const char* apis[]={"NVSDK_NGX_VULKAN_Init","NVSDK_NGX_VULKAN_Init_ProjectID",
+            "NVSDK_NGX_VULKAN_Init_Ext2","NVSDK_NGX_VULKAN_CreateFeature","NVSDK_NGX_VULKAN_CreateFeature1",
+            "NVSDK_NGX_VULKAN_EvaluateFeature","NVSDK_NGX_VULKAN_GetFeatureRequirements",
+            "NVSDK_NGX_VULKAN_GetCapabilityParameters",0};
+        logs("\n== NGX Vulkan API exports resolved from the natively-loaded host ==\n");
+        for(int i=0;apis[i];i++){ void* f=module_export(h,apis[i]); char b[128]; snprintf(b,sizeof b,"   %-46s %s\n",apis[i],f?"FOUND":"missing"); logs(b);}
+        logs("\n== next: call Init (needs a live VkDevice + nvapi/nvml bridge) ==\n");
+        _exit(0);
+    }
+    int stx; waitpid(pid,&stx,0);
+    if(WIFEXITED(stx)) printf("\n== child exit %d\n",WEXITSTATUS(stx));
+    else if(WIFSIGNALED(stx)) printf("\n== child signal %d\n",WTERMSIG(stx));
+    printf("== S5(a) verdict: see host DllMain result + dynamic LoadLibrary trace above.\n");
+    return 0;
+}

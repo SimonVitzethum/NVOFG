@@ -81,15 +81,48 @@ no Wine/Proton — reproducibly (3/3 runs, exit 0).** What it took:
 **Conclusion:** loading + initialising the real DLSS-G snippet natively is **not the blocker** — it
 works. No D3D12/DXGI/COM, no exotic dependency; just the bounded CRT surface + the TEB/gs setup.
 
-## S5 — the real crux: host ↔ snippet interface
+## S5 — host ↔ snippet interface
 
-`nvngx_dlssg.dll` exports **0 named functions** (`winedump -j export` → empty). So the NGX host does
-**not** drive the snippet via named exports — the interface is an **internal, undocumented NGX ABI**
-(the host likely hands the snippet a function/context table at a fixed entry, or calls a hardcoded
-RVA). This is now the make-or-break stage: either (a) load the Windows NGX host PEs too (`_nvngx.dll`
-brings crypto/COM/winsock, but they're all CRT-shimmable like S2), or (b) reverse the host↔snippet
-entry ABI and drive the snippet from a minimal custom host. S4 (Reflex pacing) and S6 (feed our
-Vulkan images via the CUDA-interop path the snippet imports) follow.
+`nvngx_dlssg.dll` exports **0 named functions** — the host drives the snippet through an internal,
+undocumented NGX ABI, not exports. Two ways in: **(a)** load the Windows NGX host PEs too, or **(b)**
+reverse the host↔snippet entry ABI. We pursued **(a)**.
+
+### S5(a) — the Windows NGX host loads natively too (DONE — `s5_host.c`)
+
+`s5_host.c` generalises the S2 loader into a **multi-PE loader** (module registry + real
+`LoadLibrary`/`GetProcAddress` + export-table parsing) and loads the NGX core host. Result:
+
+```
+[loading] _nvngx.dll
+[_nvngx.dll DllMain -> 1, exports@rva=0x156950]
+== NGX Vulkan API exports resolved from the natively-loaded host ==
+   NVSDK_NGX_VULKAN_Init                     FOUND
+   NVSDK_NGX_VULKAN_Init_ProjectID           FOUND
+   NVSDK_NGX_VULKAN_Init_Ext2                FOUND
+   NVSDK_NGX_VULKAN_CreateFeature            FOUND
+   NVSDK_NGX_VULKAN_CreateFeature1           FOUND
+   NVSDK_NGX_VULKAN_EvaluateFeature          FOUND
+   NVSDK_NGX_VULKAN_GetFeatureRequirements   FOUND
+   NVSDK_NGX_VULKAN_GetCapabilityParameters  FOUND
+```
+
+So **both the FG snippet (S2) and the Windows NGX core host (`_nvngx.dll`) load + init natively
+(DllMain → 1), and the host's full `NVSDK_NGX_VULKAN_*` API — including `CreateFeature` — is
+reachable.** During the host's DllMain it probes Windows API-set DLLs (`api-ms-win-core-synch…`,
+`…-fibers…`) via `LoadLibrary`; we return not-found and it falls back to kernel32 (DllMain still
+returns 1). The host also exports the same API as the thin forwarder `nvngx.dll`.
+
+### S5/S6 — what remains to actually generate a frame
+
+1. **Call `NVSDK_NGX_VULKAN_Init_ProjectID` + `CreateFeature(FrameGeneration)`** with a *live*
+   `VkInstance`/`VkDevice`. This needs the **ms_abi→SysV thunks** for the 22 Vulkan + 26 CUDA imports
+   the host/snippet call (S1 found the symbols; they must be called MS-x64).
+2. **GPU-arch bridge:** `_nvngx.dll` strings show it needs **nvapi/nvml** to identify the GPU
+   ("GPUArchitecture == Unknown. Need … nvapi … nvml"). During `Init` (not DllMain) it will
+   `LoadLibrary("nvapi64.dll")`/`nvml` — we must bridge those to native `libnvidia-ml.so` / a minimal
+   nvapi shim (this is the dxvk-nvapi role). **This is the next real dependency and possible blocker.**
+3. **S6:** feed our render frame to the snippet via the CUDA-Vulkan external-memory/semaphore interop
+   it imports; **S4:** Reflex present-metering (`VK_NV_low_latency2`, native on Linux).
 
 ## Remaining stages (design.md §20.3, re-scoped by the recon)
 

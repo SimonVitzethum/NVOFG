@@ -1,8 +1,10 @@
 # ADR 0008 — Path B: native in-process loader for DLSS Frame Generation (`nvngx_dlssg.dll`)
 
 - **Status:** Accepted — **experiment underway.** S0 recon + S1 (map/relocate/native-import) +
-  **S2 (`DllMain` runs natively, returns TRUE, reproducibly)** done; crux now **S5** (host↔snippet
-  ABI). Own trained model (§21) kept as the parallel fallback.
+  **S2 (snippet `DllMain` runs natively)** + **S5(a) (Windows NGX host `_nvngx.dll` loads natively,
+  `DllMain`→1, full `NVSDK_NGX_VULKAN_*` API incl. `CreateFeature` reachable)** done. Next dependency:
+  the **nvapi/nvml GPU-arch bridge** + ms_abi→SysV Vulkan/CUDA thunks to actually call
+  `Init`/`CreateFeature(FrameGeneration)`. Own trained model (§21) kept as the parallel fallback.
 - **Date:** 2026-07-17
 - **Relates to:** design.md §20 (Path B plan), §21 (own model); ADR 0006 (NGX).
 
