@@ -5,9 +5,11 @@ T2 replaces `build_model` + `train_step` with the real SoftSplat+fusion net and 
 Everything else — atomic checkpointing, auto-resume, pause file, signal-graceful stop — is the
 provable-now plumbing. Run under tmux so SSH disconnect never kills it.
 """
-import argparse, glob, os, random, signal, time
+import argparse, os, random, signal, sys, time
 import torch
-import torch.nn as nn
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from model import build_model, train_step   # real SoftSplat + gated-conv fusion model (T2)
 
 
 def atomic_save(state, path):
@@ -16,27 +18,12 @@ def atomic_save(state, path):
     os.replace(tmp, path)  # atomic rename on the same filesystem
 
 
-# --- T2 replaces these two ---------------------------------------------------
-def build_model():
-    # placeholder ~ small conv net; the real ~1M SoftSplat+gated-conv fusion net lands in T2
-    return nn.Sequential(nn.Conv2d(3, 32, 3, padding=1), nn.ReLU(),
-                         nn.Conv2d(32, 32, 3, padding=1), nn.ReLU(),
-                         nn.Conv2d(32, 3, 3, padding=1))
-
-def train_step(model, device):
-    time.sleep(0.003)                                      # placeholder throttle (real step is ~ms); remove in T2
-    x = torch.randn(8, 3, 64, 64, device=device)          # placeholder batch (T2: real triplets)
-    y = model(x)
-    return (y - x).abs().mean()                            # placeholder loss (T2: §21.6 losses)
-# -----------------------------------------------------------------------------
-
-
 class Trainer:
     def __init__(self, a):
         self.a = a
         os.makedirs(a.run_dir, exist_ok=True)
         self.dev = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.model = build_model().to(self.dev)
+        self.model = build_model(a.mode).to(self.dev)
         self.opt = torch.optim.AdamW(self.model.parameters(), lr=a.lr)
         self.scaler = torch.amp.GradScaler(self.dev, enabled=(self.dev == 'cuda'))
         self.step = 0
@@ -121,6 +108,7 @@ def main():
     p.add_argument('--ckpt-every', type=int, default=500)
     p.add_argument('--log-every', type=int, default=50)
     p.add_argument('--lr', type=float, default=1e-3)
+    p.add_argument('--mode', default='interp', choices=['interp','extrap'])
     Trainer(p.parse_args()).train()
 
 
