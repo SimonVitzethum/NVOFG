@@ -7,3 +7,6 @@ pe_load
 pe_probe
 s5_host
 *.gdb
+
+# internal NVIDIA RE notes — §69e Abs.2: keep local, never publish
+INTERNALS_PRIVATE.md
