@@ -97,10 +97,19 @@ All plumbing is green *before* the expensive run (identity-first discipline). In
 - **A5 export** (`export.py`): model → versioned fp16 `.nvfgw` for the `recordCnnRefine` backend;
   round-trip bit-identical.
 
-**Proof of concept (2500 steps, synthetic disocc+shading):** the learned model beats the classical
-warp in every regime — `easy` PSNR +2.27 / LPIPS −0.090, `shading` PSNR +1.55 / LPIPS −0.113 (LPIPS
-~7× better). The whole approach is validated; the real training run is now blocked only on the RMC
-rendered captures in the A2 format (+ a matching flow source).
+**Validated on the 5080 — a trained reference model, held-out A4:** a full reference run (interp, 40
+synth clips, ~50k steps, GPU 95% / Tensor Cores) beats the classical warp on **held-out** clips
+(different seeds) by a wide margin — `easy` PSNR **21.6 → 29.8 (+8.2)** / LPIPS 0.112 → 0.008,
+`shading` PSNR **19.2 → 23.2 (+4.1)** / LPIPS 0.146 → 0.027. Exported to `.nvfgw` (1.023M).
+(The 2500-step PoC already showed +2.3 / +1.6; the trained model widens it.) The whole approach is
+validated end to end; the real *product* run is blocked only on the RMC rendered captures in the A2
+format (+ a matching flow source).
+
+**B4 inference backend proven:** the exported `.nvfgw` runs correctly in a standalone C++ **CPU
+reference** (max_err 0.006 vs PyTorch) and a **CUDA backend on Tensor Cores** (im2col + cuBLAS fp16
+GEMM / fp32 accum, nvcc sm_120, max_err 0.009, 1.6 ms/forward @32² after an async-pool fix from
+31 ms). Remaining B4: wire it into the nvofg `recordCnnRefine` seam via Vulkan-CUDA interop + the
+vendor-neutral coopmat port.
 
 ## Training plan on `ki-pc-fisch-101` (RTX 5080)
 
