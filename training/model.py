@@ -13,13 +13,23 @@ import torch.nn.functional as F
 
 
 # --- differentiable forward splatting (softmax splatting, Niklaus & Liu 2020) ----------------
+_grid_cache = {}
+def _base_grid(H, W, dev):
+    k = (H, W, str(dev))
+    if k not in _grid_cache:
+        yy, xx = torch.meshgrid(torch.arange(H, device=dev, dtype=torch.float32),
+                                torch.arange(W, device=dev, dtype=torch.float32), indexing='ij')
+        _grid_cache[k] = (xx, yy)
+    return _grid_cache[k]
+
+
 def forward_splat(feat, flow):
     """Scatter-add bilinear forward warp. feat [B,C,H,W], flow [B,2,H,W] (dx,dy px)."""
     B, C, H, W = feat.shape
     dev = feat.device
-    yy, xx = torch.meshgrid(torch.arange(H, device=dev), torch.arange(W, device=dev), indexing='ij')
-    px = xx.float()[None] + flow[:, 0]
-    py = yy.float()[None] + flow[:, 1]
+    xx, yy = _base_grid(H, W, dev)
+    px = xx[None] + flow[:, 0]
+    py = yy[None] + flow[:, 1]
     x0 = torch.floor(px); y0 = torch.floor(py)
     fx = px - x0; fy = py - y0
     out = torch.zeros(B, C, H * W, device=dev, dtype=feat.dtype)
@@ -131,10 +141,9 @@ def forward_batch(model, batch, device):
 # --- synthetic self-supervised batch (T1 replaces with rendered triplets) --------------------
 def _grid_warp(img, flow):
     B, C, H, W = img.shape
-    dev = img.device
-    yy, xx = torch.meshgrid(torch.arange(H, device=dev), torch.arange(W, device=dev), indexing='ij')
-    gx = (xx.float()[None] + flow[:, 0]) / (W - 1) * 2 - 1
-    gy = (yy.float()[None] + flow[:, 1]) / (H - 1) * 2 - 1
+    xx, yy = _base_grid(H, W, img.device)
+    gx = (xx[None] + flow[:, 0]) / (W - 1) * 2 - 1
+    gy = (yy[None] + flow[:, 1]) / (H - 1) * 2 - 1
     grid = torch.stack([gx, gy], -1)
     return F.grid_sample(img, grid, align_corners=True, padding_mode='border')
 

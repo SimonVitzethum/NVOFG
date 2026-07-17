@@ -26,7 +26,7 @@ class Trainer:
         self.a = a
         os.makedirs(a.run_dir, exist_ok=True)
         self.dev = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.model = build_model(a.mode).to(self.dev)
+        self.model = build_model(a.mode).to(self.dev, memory_format=torch.channels_last)
         self.opt = torch.optim.AdamW(self.model.parameters(), lr=a.lr)
         self.scaler = torch.amp.GradScaler(self.dev, enabled=(self.dev == 'cuda'))
         self.step = 0
@@ -114,15 +114,18 @@ class Trainer:
                     self._log("[resume] PAUSE cleared -> continue")
                 continue
             comps = None
-            if self.data_iter is not None:                    # real triplets + §21.6 losses
-                batch = next(self.data_iter)
-                out, _, target = forward_batch(self.model, batch, self.dev)
-                loss, comps = self.criterion(out, target, batch)
-                if self.a.temporal > 0:                       # §21.6 temporal-stability (flicker)
-                    tl = losses.temporal_pair_loss(self.model, batch, self.dev, forward_batch)
-                    loss = loss + self.a.temporal * tl; comps['temporal'] = tl.item()
-            else:
-                loss = train_step(self.model, self.dev)       # synthetic pipeline validation
+            # AMP fp16 autocast -> the conv fusion net runs on the Tensor Cores (the big lever);
+            # the SoftSplat scatter stays fp32 (autocast keeps it there). GradScaler handles fp16.
+            with torch.autocast('cuda', dtype=torch.float16, enabled=(self.dev == 'cuda')):
+                if self.data_iter is not None:                # real triplets + §21.6 losses
+                    batch = next(self.data_iter)
+                    out, _, target = forward_batch(self.model, batch, self.dev)
+                    loss, comps = self.criterion(out, target, batch)
+                    if self.a.temporal > 0:                   # §21.6 temporal-stability (flicker)
+                        tl = losses.temporal_pair_loss(self.model, batch, self.dev, forward_batch)
+                        loss = loss + self.a.temporal * tl; comps['temporal'] = tl.item()
+                else:
+                    loss = train_step(self.model, self.dev)   # synthetic pipeline validation
             self.opt.zero_grad(set_to_none=True)
             self.scaler.scale(loss).backward()
             self.scaler.step(self.opt); self.scaler.update()
@@ -146,8 +149,11 @@ def main():
     p.add_argument('--mode', default='interp', choices=['interp','extrap'])
     p.add_argument('--data-dir', default=None, help='rendered-triplet root (A2); omit -> synthetic')
     p.add_argument('--target-fps', type=int, default=60)
-    p.add_argument('--batch', type=int, default=4)
+    p.add_argument('--batch', type=int, default=16)
     p.add_argument('--temporal', type=float, default=0.0, help='temporal-stability weight (0=off)')
+    torch.backends.cuda.matmul.allow_tf32 = True               # TF32 Tensor Cores for fp32 matmuls
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True                      # pick fastest conv kernels
     Trainer(p.parse_args()).train()
 
 

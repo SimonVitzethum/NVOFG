@@ -41,14 +41,16 @@ class TripletDataset(Dataset):
                 for j in range(1, K):                 # GT in-betweens -> phases j/K
                     self.samples.append((frames[i], frames[i + K], frames[i + j], j / K))
         self.K_note = "phase-conditioned: t=j/K covers 2x..Kx from one net"
+        self._cache = {}
 
     def __len__(self):
         return len(self.samples)
 
-    @staticmethod
-    def _load(p):
-        d = np.load(p)
-        return d
+    def _load(self, p):
+        c = self._cache.get(p)
+        if c is None:                                          # cache frames in RAM (no per-sample disk I/O)
+            d = np.load(p); c = {k: d[k] for k in d.files}; self._cache[p] = c
+        return c
 
     def __getitem__(self, k):
         pa, pb, pg, t = self.samples[k]

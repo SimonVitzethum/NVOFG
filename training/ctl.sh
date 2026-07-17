@@ -16,8 +16,11 @@ case "${1:-status}" in
     if ! command -v tmux >/dev/null; then echo "tmux missing"; exit 1; fi
     if running; then echo "already running (tmux:$SESSION)"; exit 0; fi
     rm -f "$RUNDIR/PAUSE"
-    tmux new-session -d -s "$SESSION" "$PY -u $TRAIN --run-dir $RUNDIR >> $RUNDIR/console.log 2>&1"
-    echo "launched tmux:$SESSION -> $RUNDIR" ;;
+    EXTRA="${*:3}"                                  # extra train.py args after the run name
+    [ -n "$EXTRA" ] && echo "$EXTRA" > "$RUNDIR/args"      # remember them for relaunch/resume
+    EXTRA="$(cat "$RUNDIR/args" 2>/dev/null)"
+    tmux new-session -d -s "$SESSION" "$PY -u $TRAIN --run-dir $RUNDIR $EXTRA >> $RUNDIR/console.log 2>&1"
+    echo "launched tmux:$SESSION -> $RUNDIR  args:[$EXTRA]" ;;
   pause)   touch "$RUNDIR/PAUSE"; echo "PAUSE set (checkpoints, idles, frees GPU)" ;;
   resume)  rm -f "$RUNDIR/PAUSE"; echo "PAUSE cleared (continues)" ;;
   stop)    pkill -TERM -f "train.py --run-dir $RUNDIR" && echo "SIGTERM sent (checkpoints, exits; relaunch auto-resumes)" || echo "no process" ;;
