@@ -52,6 +52,8 @@ struct Stage {
 
 }  // namespace nvofg
 
+namespace nvofg { struct CnnModel; }   // learned-FG model (NVOFG_INTERP_CNN), src/cnn_model.hpp
+
 // The opaque context (C ABI forward-declares `struct NvofgContext`).
 struct NvofgContext {
     // --- caller-provided handles / config ---
@@ -66,6 +68,9 @@ struct NvofgContext {
     NvofgInterpolator interpolator = NVOFG_INTERP_WARP;
     NvofgMode         mode = NVOFG_MODE_AUTOMATIC;
     uint32_t          flags = 0;
+
+    // --- learned interpolator model (NVOFG_INTERP_CNN); null => identity (== classical warp) ---
+    nvofg::CnnModel*  cnn = nullptr;
 
     // --- optical-flow queue (dedicated family) ---
     VkQueue  ofQueue = VK_NULL_HANDLE;

@@ -56,7 +56,8 @@ add_custom_target(nvofg_shaders DEPENDS ${NVOFG_SHADER_HEADERS})
 add_library(nvofg
   src/context.cpp
   src/pipeline.cpp
-  src/pacer.cpp)
+  src/pacer.cpp
+  src/cnn_model.cpp)
 add_dependencies(nvofg nvofg_shaders)
 target_include_directories(nvofg
   PUBLIC  include

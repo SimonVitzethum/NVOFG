@@ -132,6 +132,12 @@ const char* const* nvofg_required_device_extensions(uint32_t* out_count);
 NvofgResult nvofg_create(const NvofgCreateInfo* info, NvofgContext** out);
 void        nvofg_destroy(NvofgContext* ctx);
 
+/* Load a trained learned-FG model (.nvfgw, from the Plan A trainer) for NVOFG_INTERP_CNN. The
+ * learned network refines the classical warp with a residual; with no model loaded, NVOFG_INTERP_CNN
+ * runs the identity (== classical warp). Safe to call after nvofg_create; replaces any prior model.
+ * Returns NVOFG_INVALID_ARGUMENT on a missing/corrupt file. */
+NvofgResult nvofg_load_cnn_model(NvofgContext* ctx, const char* path);
+
 /* -------------------------------------------------------------------------- */
 /* Resource registration (once, at swapchain create / resize)                 */
 /* -------------------------------------------------------------------------- */

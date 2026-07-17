@@ -1,5 +1,6 @@
 // nvofg — context lifecycle, capability query, diagnostics.
 #include "internal.hpp"
+#include "cnn_model.hpp"
 
 #include <cstring>
 #include <new>
@@ -198,7 +199,22 @@ void nvofg_destroy(NvofgContext* ctx) {
     if (ctx->device) vkDeviceWaitIdle(ctx->device);
     if (ctx->pipelineReady) nvofg::destroyPipeline(ctx);
     if (ctx->timeline) vkDestroySemaphore(ctx->device, ctx->timeline, nullptr);
+    delete ctx->cnn;
     delete ctx;
+}
+
+NvofgResult nvofg_load_cnn_model(NvofgContext* ctx, const char* path) {
+    if (!ctx || !path) return NVOFG_INVALID_ARGUMENT;
+    auto* m = new (std::nothrow) nvofg::CnnModel();
+    if (!m) return NVOFG_OUT_OF_MEMORY;
+    if (!nvofg::loadCnnModel(path, *m)) {
+        delete m;
+        ctx->setError("nvofg_load_cnn_model: missing or corrupt .nvfgw");
+        return NVOFG_INVALID_ARGUMENT;
+    }
+    delete ctx->cnn;
+    ctx->cnn = m;   // the recordCnnRefine backend picks this up; null => identity (== warp)
+    return NVOFG_OK;
 }
 
 NvofgResult nvofg_caps(NvofgContext* ctx, NvofgCaps* out) {
