@@ -403,7 +403,14 @@ MSABI static void* s_LoadLibraryExW(void* n,void* h,u32 f){ (void)h;(void)f; cha
     logn("[LoadLibrary] ",base); Module* m=load_module(base); return m?m->base:(void*)0x140000000ULL; }
 MSABI static void* s_LoadLibraryA(const char* n){ const char* s=strrchr(n,'\\'); s=s?s+1:n; logn("[LoadLibraryA] ",s);
     Module* m=load_module(s); return m?m->base:(void*)0x140000000ULL; }
-MSABI static int   s_GetModuleHandleExW(u32 f,void* n,void** out){ (void)f;(void)n; if(out)*out=g_mod[0].base; return 1; }
+MSABI static int   s_GetModuleHandleExW(u32 f,void* n,void** out){
+    // Init_ProjectID does the same FROM_ADDRESS(0x4) self-module lookup as the snippet; ignoring the
+    // flag returned the dummy module -> wrong path -> a code pointer got copied as a data struct and
+    // dereferenced (crash at _nvngx+0xceee). Honor FROM_ADDRESS like the A variant; a native (non-PE)
+    // caller address must FAIL (Init then skips its app-module path processing, as for an unknown mod).
+    if(f&4){ for(int i=0;i<g_nmod;i++) if(g_mod[i].base && (u8*)n>=g_mod[i].base && (u8*)n<g_mod[i].base+g_mod[i].size){ if(out)*out=g_mod[i].base; return 1; }
+        g_lasterr=126/*ERROR_MOD_NOT_FOUND*/; if(out)*out=0; return 0; }
+    if(out)*out=g_mod[0].base; return 1; }
 // GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS (0x4): resolve which loaded module CONTAINS the address.
 // The snippet uses this to find its own module (then its path). Returning the dummy module broke it.
 // The snippet checks the OS version (RtlGetVersion) against MinOS=10.0.0; an unfilled struct reads
@@ -412,7 +419,8 @@ MSABI static int   s_GetModuleHandleExW(u32 f,void* n,void** out){ (void)f;(void
 MSABI static int s_RtlGetVersion(u8* vi){ if(vi){ *(u32*)(vi+4)=10; *(u32*)(vi+8)=0; *(u32*)(vi+12)=19041; *(u32*)(vi+16)=2; *(u16*)(vi+20)=0; } return 0; }
 MSABI static int s_GetVersionExW(u8* vi){ if(vi){ *(u32*)(vi+4)=10; *(u32*)(vi+8)=0; *(u32*)(vi+12)=19041; *(u32*)(vi+16)=2; *(u16*)(vi+20)=0; } return 1; }
 MSABI static int   s_GetModuleHandleExA(u32 f,void* n,void** out){
-    if((f&4) && n){ for(int i=0;i<g_nmod;i++) if(g_mod[i].base && (u8*)n>=g_mod[i].base && (u8*)n<g_mod[i].base+g_mod[i].size){ if(out)*out=g_mod[i].base; return 1; } }
+    if(f&4){ for(int i=0;i<g_nmod;i++) if(g_mod[i].base && (u8*)n>=g_mod[i].base && (u8*)n<g_mod[i].base+g_mod[i].size){ if(out)*out=g_mod[i].base; return 1; }
+        g_lasterr=126; if(out)*out=0; return 0; }
     if(out)*out=g_mod[0].base; return 1; }
 
 struct { const char* name; void* fn; } g_stubs[]={
