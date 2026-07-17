@@ -91,12 +91,20 @@ int main() {
 
     void* params = nullptr;
     if (ngxOk(NVSDK_NGX_VULKAN_GetCapabilityParameters(&params)) && params) {
-        int sr = 0, rr = 0;
+        int sr = 0, rr = 0, fg = 0, fi = 0, fgNeedsUpdate = 0, fgResult = 0;
         NVSDK_NGX_Parameter_GetI(params, "SuperSampling.Available", &sr);         // DLSS SR / DLAA
         NVSDK_NGX_Parameter_GetI(params, "SuperSamplingDenoising.Available", &rr); // DLSS Ray Reconstruction
+        // DLSS Frame Generation (DLSS-G) — the trained NN used on Windows. Query whether
+        // the native Linux NGX runtime exposes it at all on this driver.
+        NVSDK_NGX_Parameter_GetI(params, "FrameGeneration.Available", &fg);
+        NVSDK_NGX_Parameter_GetI(params, "FrameInterpolation.Available", &fi);
+        NVSDK_NGX_Parameter_GetI(params, "FrameGeneration.NeedsUpdatedDriver", &fgNeedsUpdate);
+        NVSDK_NGX_Parameter_GetI(params, "FrameGeneration.FeatureInitResult", &fgResult);
         std::printf("  DLSS SR / DLAA available : %d\n", sr);
         std::printf("  DLSS Ray Reconstruction  : %d\n", rr);
-        std::printf("RESULT: NGX initialised (SR=%d RR=%d)\n", sr, rr);
+        std::printf("  DLSS Frame Generation    : %d  (FrameInterpolation=%d, needsDriver=%d, initResult=0x%08X)\n",
+                    fg, fi, fgNeedsUpdate, (unsigned)fgResult);
+        std::printf("RESULT: NGX initialised (SR=%d RR=%d FG=%d)\n", sr, rr, fg);
     }
 
     NVSDK_NGX_VULKAN_Shutdown1(dev);
