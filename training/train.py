@@ -118,6 +118,9 @@ class Trainer:
                 batch = next(self.data_iter)
                 out, _, target = forward_batch(self.model, batch, self.dev)
                 loss, comps = self.criterion(out, target, batch)
+                if self.a.temporal > 0:                       # §21.6 temporal-stability (flicker)
+                    tl = losses.temporal_pair_loss(self.model, batch, self.dev, forward_batch)
+                    loss = loss + self.a.temporal * tl; comps['temporal'] = tl.item()
             else:
                 loss = train_step(self.model, self.dev)       # synthetic pipeline validation
             self.opt.zero_grad(set_to_none=True)
@@ -144,6 +147,7 @@ def main():
     p.add_argument('--data-dir', default=None, help='rendered-triplet root (A2); omit -> synthetic')
     p.add_argument('--target-fps', type=int, default=60)
     p.add_argument('--batch', type=int, default=4)
+    p.add_argument('--temporal', type=float, default=0.0, help='temporal-stability weight (0=off)')
     Trainer(p.parse_args()).train()
 
 

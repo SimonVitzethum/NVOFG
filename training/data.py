@@ -99,6 +99,37 @@ def _write_fake_clip(root, name, H=64, W=64, capture_fps=360, target_fps=60, nfr
                  ui=np.zeros((H, W), np.uint8), reactive=np.zeros((H, W), np.uint8))
 
 
+def _write_synth_clip(root, name, H=96, W=96, capture_fps=360, target_fps=60, nframes=16, seed=0):
+    """Richer synthetic clip WITH disocclusion (2-layer motion) + shading (brightness) — so the hard
+    regimes exist and the learned model's per-regime gain over the warp is testable before real data.
+    A foreground patch slides over a background at a different velocity -> reveals background (holes
+    the warp can't fill); a per-frame brightness the warp can't predict -> shading regime."""
+    rng = np.random.default_rng(seed)
+    d = os.path.join(root, name); os.makedirs(d, exist_ok=True)
+    K = max(1, round(capture_fps / target_fps))
+    json.dump({'capture_fps': capture_fps, 'target_fps': target_fps, 'width': W, 'height': H,
+               'near': 0.1, 'far': 1000.0, 'mv_convention': 'prev_to_curr_interval_px'},
+              open(os.path.join(d, 'meta.json'), 'w'))
+    bg = rng.random((H, W, 3)).astype(np.float32)
+    fg = rng.random((H, W, 3)).astype(np.float32)
+    sz = H // 3; fy0, fx0 = H // 3, W // 4
+    m0 = np.zeros((H, W), np.float32); m0[fy0:fy0 + sz, fx0:fx0 + sz] = 1
+    vfg = np.array([int(rng.integers(1, 3)), int(rng.integers(-2, 3))])   # px/frame (integer)
+    for n in range(nframes):
+        fs = vfg * n
+        mn = np.roll(np.roll(m0, fs[1], axis=0), fs[0], axis=1)
+        fgn = np.roll(np.roll(fg, fs[1], axis=0), fs[0], axis=1)
+        color = bg * (1 - mn[..., None]) + fgn * mn[..., None]
+        bright = 1.0 + 0.15 * np.sin(0.5 * n + seed)                       # shading the warp can't predict
+        color = np.clip(color * bright, 0, 1)
+        mv = np.zeros((H, W, 2), np.float16)                               # bg static; fg = K*vfg
+        mv[mn > 0, 0] = K * vfg[0]; mv[mn > 0, 1] = K * vfg[1]
+        depth = np.where(mn > 0, 0.3, 0.8).astype(np.float16)
+        np.savez(os.path.join(d, f'frame_{n:06d}.npz'),
+                 color=color.astype(np.float16), mv=mv, depth=depth,
+                 ui=np.zeros((H, W), np.uint8), reactive=np.zeros((H, W), np.uint8))
+
+
 if __name__ == '__main__':
     import tempfile
     root = tempfile.mkdtemp()
