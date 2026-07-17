@@ -610,7 +610,7 @@ void submitTimeline(VkQueue queue, VkCommandBuffer cmd,
 }
 
 struct WarpPush   { uint32_t width, height; float phase; uint32_t flags; };
-enum { WARP_FLAG_UI = 1u, WARP_FLAG_REACTIVE = 2u, WARP_FLAG_BIDIR = 4u, WARP_FLAG_MATERIAL = 8u };
+enum { WARP_FLAG_UI = 1u, WARP_FLAG_REACTIVE = 2u, WARP_FLAG_BIDIR = 4u, WARP_FLAG_MATERIAL = 8u, WARP_FLAG_RESET = 16u };
 
 }  // namespace
 
@@ -755,7 +755,8 @@ NvofgResult nvofg_record_generate(NvofgContext* ctx, const NvofgGenerateInfo* in
         // warp -> output
         imgBarrier(cmd, ctx->output.image, VK_IMAGE_LAYOUT_UNDEFINED, G, 0, VK_ACCESS_SHADER_WRITE_BIT);
         uint32_t wflags = (ctx->hasUiMask ? WARP_FLAG_UI : 0u) | (ctx->hasReactive ? WARP_FLAG_REACTIVE : 0u)
-                        | (ctx->hasMaterialId ? WARP_FLAG_MATERIAL : 0u);   // no bidir in Tier B
+                        | (ctx->hasMaterialId ? WARP_FLAG_MATERIAL : 0u)     // no bidir in Tier B
+                        | (info->reset ? WARP_FLAG_RESET : 0u);
         WarpPush wp{W, H, info->phase, wflags};
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->warpStage.pipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->warpStage.pipeLayout, 0, 1, &ctx->warpSet, 0, nullptr);
@@ -882,6 +883,7 @@ NvofgResult nvofg_record_generate(NvofgContext* ctx, const NvofgGenerateInfo* in
         if (ctx->hasReactive)   wflags |= WARP_FLAG_REACTIVE;
         if (ctx->bidir)         wflags |= WARP_FLAG_BIDIR;
         if (ctx->hasMaterialId) wflags |= WARP_FLAG_MATERIAL;
+        if (info->reset)        wflags |= WARP_FLAG_RESET;
         WarpPush wp{W, H, info->phase, wflags};
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->warpStage.pipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->warpStage.pipeLayout, 0, 1, &ctx->warpSet, 0, nullptr);
@@ -905,6 +907,52 @@ NvofgResult nvofg_record_generate(NvofgContext* ctx, const NvofgGenerateInfo* in
     ctx->timelineValue = v3;
     out_sync->semaphore = ctx->timeline;
     out_sync->value = v3;
+    return NVOFG_OK;
+}
+
+// Warp-only pass (higher multipliers): reuse the flow from the last generate and
+// re-run just the warp at a new phase into the registered output image.
+NvofgResult nvofg_record_warp(NvofgContext* ctx, float phase,
+                              VkSemaphore wait_sem, uint64_t wait_val,
+                              NvofgFrameSync* out_sync) {
+    if (!ctx || !out_sync) return NVOFG_INVALID_ARGUMENT;
+    if (!ctx->pipelineReady || !ctx->haveColor || !ctx->haveOutput) return NVOFG_NOT_REGISTERED;
+
+    const uint32_t W = ctx->width, H = ctx->height;
+    const uint32_t gx = (W + 7) / 8, gy = (H + 7) / 8;
+    const VkImageLayout G = VK_IMAGE_LAYOUT_GENERAL;
+
+    const uint32_t slot = ctx->frameIndex % NvofgContext::kRing;
+    if (ctx->slotSignal[slot]) {
+        VkSemaphoreWaitInfo wi{};
+        wi.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+        wi.semaphoreCount = 1; wi.pSemaphores = &ctx->timeline; wi.pValues = &ctx->slotSignal[slot];
+        vkWaitSemaphores(ctx->device, &wi, UINT64_MAX);
+    }
+    vkResetCommandPool(ctx->device, ctx->computePools[slot], 0);
+
+    const uint64_t v1 = ctx->timelineValue + 1;
+    VkCommandBuffer cmd = beginCmd(ctx, ctx->computePools[slot]);
+    // prev/curr + refined flow/confidence/occlusion persist in GENERAL from the last
+    // generate; only the output needs (re)initialising for this phase.
+    imgBarrier(cmd, ctx->output.image, VK_IMAGE_LAYOUT_UNDEFINED, G, 0, VK_ACCESS_SHADER_WRITE_BIT);
+    uint32_t wflags = 0;
+    if (ctx->hasUiMask)     wflags |= WARP_FLAG_UI;
+    if (ctx->hasReactive)   wflags |= WARP_FLAG_REACTIVE;
+    if (ctx->bidir)         wflags |= WARP_FLAG_BIDIR;
+    if (ctx->hasMaterialId) wflags |= WARP_FLAG_MATERIAL;
+    WarpPush wp{W, H, phase, wflags};
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->warpStage.pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->warpStage.pipeLayout, 0, 1, &ctx->warpSet, 0, nullptr);
+    vkCmdPushConstants(cmd, ctx->warpStage.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(wp), &wp);
+    vkCmdDispatch(cmd, gx, gy, 1);
+    submitTimeline(ctx->queue, cmd, wait_sem, wait_val, ctx->timeline, v1);
+
+    ctx->slotSignal[slot] = v1;
+    ctx->frameIndex++;
+    ctx->timelineValue = v1;
+    out_sync->semaphore = ctx->timeline;
+    out_sync->value = v1;
     return NVOFG_OK;
 }
 

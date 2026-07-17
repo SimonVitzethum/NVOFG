@@ -69,8 +69,7 @@ cmake --build build
 
 ## License
 
-Licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT) at your
-option. Unless you explicitly state otherwise, any contribution you intentionally submit
+Licensed under  [Apache-2.0](LICENSE-APACHE) and [MIT](LICENSE-MIT). Unless you explicitly state otherwise, any contribution you intentionally submit
 for inclusion shall be dual-licensed as above, without additional terms.
 
 `nvofg` links only against the Vulkan loader and the user's installed NVIDIA driver at

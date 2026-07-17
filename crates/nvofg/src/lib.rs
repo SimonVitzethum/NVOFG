@@ -324,6 +324,18 @@ impl FrameGen {
         })
     }
 
+    /// Warp-only pass for higher multipliers (3×/4×): reuse the flow from the last
+    /// [`record_generate`](Self::record_generate) and re-run just the warp at a new
+    /// `phase`. `wait` gates the warp (e.g. the previous sub-frame's present) so the
+    /// shared output isn't overwritten while still read. Cheap: no OFA / no refine.
+    pub fn record_warp(&mut self, phase: f32, wait: Option<FrameSync>) -> Result<FrameSync, Error> {
+        let (wait_sem, wait_val) = wait.map_or((vk::Semaphore::null(), 0), |s| (s.semaphore, s.value));
+        let mut out = sys::NvofgFrameSync::default();
+        // SAFETY: `ctx` valid; `out` valid out-pointer.
+        check(unsafe { sys::nvofg_record_warp(self.ctx, phase, wait_sem, wait_val, &mut out) })?;
+        Ok(FrameSync { semaphore: out.semaphore, value: out.value })
+    }
+
     pub fn set_debug_view(&mut self, view: DebugView, target: Option<&ImageDesc>) -> Result<(), Error> {
         let t = target.map(|d| d.to_sys());
         let tp = t.as_ref().map_or(std::ptr::null(), |d| d as *const _);

@@ -200,6 +200,14 @@ extern "C" {
         out_sync: *mut NvofgFrameSync,
     ) -> NvofgResult;
 
+    pub fn nvofg_record_warp(
+        ctx: *mut NvofgContext,
+        phase: f32,
+        wait_sem: vk::Semaphore,
+        wait_val: u64,
+        out_sync: *mut NvofgFrameSync,
+    ) -> NvofgResult;
+
     pub fn nvofg_caps(ctx: *mut NvofgContext, out: *mut NvofgCaps) -> NvofgResult;
     pub fn nvofg_last_error(ctx: *mut NvofgContext) -> *const c_char;
 

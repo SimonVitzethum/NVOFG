@@ -201,6 +201,20 @@ typedef struct NvofgGenerateInfo {
 NvofgResult nvofg_record_generate(NvofgContext*, const NvofgGenerateInfo*,
                                   NvofgFrameSync* out_sync);
 
+/* Warp-only pass for higher multipliers (3x/4x): reuses the optical flow computed
+ * by the most recent nvofg_record_generate and only re-runs the warp at a new
+ * `phase`, writing the registered output image again. Call it once per extra
+ * interpolated frame after a full generate this frame (e.g. generate at phase 1/N,
+ * then warp at 2/N, 3/N, ...). Cheap — no OFA execute, no refine.
+ *
+ * `wait_sem`/`wait_val` gate the warp (e.g. the previous sub-frame's present/blit
+ * completion, so the shared output isn't overwritten while still being read); pass
+ * VK_NULL_HANDLE to skip. Returns the timeline point to wait on before presenting.
+ * Must follow a successful nvofg_record_generate with the same registrations. */
+NvofgResult nvofg_record_warp(NvofgContext* ctx, float phase,
+                              VkSemaphore wait_sem, uint64_t wait_val,
+                              NvofgFrameSync* out_sync);
+
 /* -------------------------------------------------------------------------- */
 /* Introspection & debug                                                      */
 /* -------------------------------------------------------------------------- */

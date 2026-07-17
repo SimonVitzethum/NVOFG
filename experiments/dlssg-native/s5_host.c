@@ -74,6 +74,7 @@ static u8* g_code; static size_t g_codeoff;
 static __thread void* g_tls[2048]; static __thread int g_lasterr; static int g_tlsnext=1; static u8 g_heap[1];
 static u64 g_hcount=0x2000;
 static u8 g_teb[0x2000],g_peb[0x800]; static void* g_tlsslots[512];   // fake Windows TEB + PE-TLS array
+static pthread_t g_wthreads[256]; static volatile int g_nwthreads;   // real worker-thread handle table
 static void* make_trap(const char* name);   // fwd (defined below)
 static void* make_ms2sysv(void* target);     // fwd (defined below)
 static u8 g_luid[8];                          // synthetic adapter LUID (deviceUUID-derived; filled in GPDP2)
@@ -113,8 +114,8 @@ MSABI static void  s_noop(void){}
 MSABI static u32   s_GetLastError(void){return(u32)g_lasterr;}
 MSABI static void  s_SetLastError(u32 e){g_lasterr=(int)e;}
 MSABI static void* s_CreateHandle(void){return(void*)__sync_fetch_and_add(&g_hcount,1);}
-MSABI static int   s_CloseHandle(void* h){(void)h;return 1;}
-MSABI static u32   s_WaitForSingleObject(void* h,u32 m){(void)h;(void)m;return 0;}
+MSABI static int   s_CloseHandle(void* h){ if(((uintptr_t)h & 0xFF000000u)==0x50000000u && h!=(void*)-1) close((int)((uintptr_t)h & 0x00FFFFFFu)); return 1;}
+MSABI static u32   s_WaitForSingleObject(void* h,u32 m){(void)m; if(((uintptr_t)h&0xFF000000u)==0x70000000u){ int idx=(int)((uintptr_t)h&0xFFFFFF); if(idx<256&&g_wthreads[idx]) pthread_join(g_wthreads[idx],0); } return 0;}
 MSABI static u64   s_GetTickCount64(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return(u64)t.tv_sec*1000+t.tv_nsec/1000000;}
 MSABI static void  s_GetStartupInfoW(void* si){if(si)memset(si,0,104);}
 MSABI static void* s_GetCommandLineW(void){static const u16 w[]={'a',0};return(void*)w;}
@@ -137,9 +138,69 @@ MSABI static u32 s_GetFullPathNameW(const u16* n,u32 sz,u16* buf,void** fp){ (vo
 // --- S5e file-API trace: log the exact paths NGX asks for during NGXGetPath, so we can tell
 // whether it wants a WRITABLE DIRECTORY (scenario A) or concrete MODEL FILES (scenario B). ---
 static void wlog(const char* tag,const void* w){ char b[320]; const u16* p=w; int i=0; if(p) for(;p[i]&&i<319;i++) b[i]=(char)(p[i]&0xFF); b[i]=0; logn(tag,b); }
-MSABI static void* s_CreateFileW(void* name,u32 a,u32 s,void* sa,u32 cd,u32 fa,void* t){ (void)a;(void)s;(void)sa;(void)cd;(void)fa;(void)t; wlog("[CreateFileW] ",name); g_lasterr=2/*ERROR_FILE_NOT_FOUND*/; return (void*)-1; } // INVALID_HANDLE_VALUE
-MSABI static u32   s_GetFileAttributesW(void* name){ wlog("[GetFileAttributesW] ",name); g_lasterr=2/*ERROR_FILE_NOT_FOUND*/; return 0xFFFFFFFF; } // INVALID_FILE_ATTRIBUTES
-MSABI static int   s_GetFileAttributesExW(void* name,u32 lvl,void* info){ (void)lvl;(void)info; wlog("[GetFileAttributesExW] ",name); return 0; } // FALSE
+// A DLL/file the host asks about is REAL iff it exists in the driver's wine dir (nvngx_dlssg.dll,
+// etc.). NGX verifies the snippet exists (GetFileAttributes/PathFileExists) before LoadLibrary; if
+// we say "absent" it never loads it -> GetFeatureRequirements(FG) returns NotImplemented.
+static int wine_basename(const void* w,char* out){ const u16* p=w; int i=0; char tmp[320]; if(!p){out[0]=0;return 0;}
+    for(;p[i]&&i<319;i++) tmp[i]=(char)(p[i]&0xFF); tmp[i]=0;
+    char* s=strrchr(tmp,'\\'); s=s?s+1:tmp; char* s2=strrchr(s,'/'); s=s2?s2+1:s; strcpy(out,s); return (int)strlen(out); }
+static int wine_has(const void* w){ char b[320]; wine_basename(w,b); if(!b[0]) return 0; char path[400]; snprintf(path,sizeof path,WINE"%s",b); return access(path,R_OK)==0; }
+// File-backed handles for real wine-dir files (the snippet): NGX opens+reads/maps nvngx_dlssg.dll
+// itself (hash/version check + its own PE map) before it LoadLibrary's it. Serve real bytes from
+// /usr/lib/nvidia/wine/. Tag high bit so these don't collide with the event/counter handles.
+#define FILETAG 0x50000000u
+static int is_fileh(void* h){ return ((uintptr_t)h & 0xFF000000u)==FILETAG && h!=(void*)-1; }
+static int fileh_fd(void* h){ return (int)((uintptr_t)h & 0x00FFFFFFu); }
+MSABI static void* s_CreateFileW(void* name,u32 a,u32 s,void* sa,u32 cd,u32 fa,void* t){ (void)a;(void)s;(void)sa;(void)cd;(void)fa;(void)t;
+    if(wine_has(name)){ char b[320]; wine_basename(name,b); char path[400]; snprintf(path,sizeof path,WINE"%s",b);
+        int fd=open(path,O_RDONLY); if(fd>=0){ wlog("[CreateFileW OK] ",name); return (void*)(uintptr_t)(FILETAG|(u32)fd); } }
+    wlog("[CreateFileW] ",name); g_lasterr=2/*ERROR_FILE_NOT_FOUND*/; return (void*)-1; } // INVALID_HANDLE_VALUE
+MSABI static int s_ReadFile(void* h,void* buf,u32 n,u32* pread,void* ov){ (void)ov;
+    if(is_fileh(h)){ ssize_t r=read(fileh_fd(h),buf,n); if(r<0){ if(pread)*pread=0; return 0;} if(pread)*pread=(u32)r; return 1; }
+    if(pread)*pread=0; return 0; }
+MSABI static u32 s_SetFilePointer(void* h,int lo,int* phi,u32 method){ if(is_fileh(h)){ off_t off=(unsigned)lo; if(phi)off|=((off_t)*phi)<<32; off_t r=lseek(fileh_fd(h),off,method); if(r<0)return 0xFFFFFFFF; if(phi)*phi=(int)(r>>32); return (u32)r; } return 0xFFFFFFFF; }
+MSABI static int s_SetFilePointerEx(void* h,long long dist,long long* pnew,u32 method){ if(is_fileh(h)){ off_t r=lseek(fileh_fd(h),dist,method); if(r<0)return 0; if(pnew)*pnew=r; return 1; } return 0; }
+MSABI static u32 s_GetFileSize(void* h,u32* phi){ if(is_fileh(h)){ struct stat st; if(fstat(fileh_fd(h),&st)==0){ if(phi)*phi=(u32)((u64)st.st_size>>32); return (u32)st.st_size; } } return 0xFFFFFFFF; }
+MSABI static int s_GetFileSizeEx(void* h,long long* psz){ if(is_fileh(h)){ struct stat st; if(fstat(fileh_fd(h),&st)==0){ if(psz)*psz=st.st_size; return 1; } } return 0; }
+MSABI static void* s_CreateFileMappingW(void* h,void* sa,u32 prot,u32 hi,u32 lo,void* nm){ (void)sa;(void)prot;(void)hi;(void)lo;(void)nm; return h; /* pass file handle through as mapping handle */ }
+MSABI static void* s_MapViewOfFile(void* h,u32 acc,u32 ohi,u32 olo,u64 sz){ (void)acc; if(is_fileh(h)){ off_t off=((off_t)ohi<<32)|olo; struct stat st; if(fstat(fileh_fd(h),&st)) return 0; size_t len=sz?(size_t)sz:(size_t)st.st_size; void* p=mmap(NULL,len,PROT_READ,MAP_PRIVATE,fileh_fd(h),off); return p==MAP_FAILED?0:p; } return 0; }
+MSABI static int s_UnmapViewOfFile(void* p){ (void)p; return 1; }
+// Real CreateThread: NGX spawns worker threads (snippet load/init runs on one); a null handle
+// stalls everything downstream. Run the MS-x64 ThreadProc on a pthread, giving it its own Windows
+// TEB on gs (sharing the process-wide PE-TLS array) so gs:[0x58]/gs:[0x30] accesses don't fault.
+typedef u32 MSABI (*win_thread_t)(void*);
+struct thctx { win_thread_t fn; void* param; };
+static void* win_thread_entry(void* a){ struct thctx* c=a;
+    u8* teb=calloc(1,0x2000); *(void**)(teb+0x30)=teb; *(void**)(teb+0x58)=g_tlsslots; *(void**)(teb+0x60)=g_peb;
+    u8* sp; __asm__("mov %%rsp,%0":"=r"(sp)); *(void**)(teb+0x08)=sp+0x100000; *(void**)(teb+0x10)=sp-0x400000;
+    syscall(SYS_arch_prctl,0x1001,(unsigned long)teb);
+    win_thread_t fn=c->fn; void* p=c->param; free(c); if(fn) fn(p); return 0; }
+MSABI static void* s_CreateThread(void* attr,u64 stack,void* start,void* param,u32 flags,u32* tid){ (void)attr;(void)stack;(void)flags;
+    struct thctx* c=malloc(sizeof*c); c->fn=(win_thread_t)start; c->param=param;
+    pthread_t th; if(pthread_create(&th,0,win_thread_entry,c)!=0){ free(c); return 0; }
+    int idx=__sync_fetch_and_add(&g_nwthreads,1); if(idx<256) g_wthreads[idx]=th;
+    if(tid)*tid=(u32)(uintptr_t)th; logn("[CreateThread] ","spawned"); return (void*)(uintptr_t)(0x70000000u|(u32)(idx&0xFFFFFF)); }
+// VS_FIXEDFILEINFO with a version far above any NGX minimum (the snippet-version gate).
+static u32 g_vfi[13]={0xFEEF04BD,0x00010000,(999u<<16)|99u,(9999u<<16)|9999u,(999u<<16)|99u,(9999u<<16)|9999u,0x3F,0,4/*VOS_NT*/,2/*VFT_DLL*/,0,0,0};
+MSABI static u32 s_GetFileVersionInfoSizeExW(u32 fl,const u16* n,u32* h){ (void)fl;(void)n; if(h)*h=0; return sizeof(g_vfi)+64; }
+MSABI static u32 s_GetFileVersionInfoSizeW(const u16* n,u32* h){ (void)n; if(h)*h=0; return sizeof(g_vfi)+64; }
+MSABI static int s_GetFileVersionInfoExW(u32 fl,const u16* n,u32 h,u32 len,void* data){ (void)fl;(void)n;(void)h; if(data&&len>=sizeof g_vfi) memcpy(data,g_vfi,sizeof g_vfi); return 1; }
+MSABI static int s_GetFileVersionInfoW(const u16* n,u32 h,u32 len,void* data){ (void)n;(void)h; if(data&&len>=sizeof g_vfi) memcpy(data,g_vfi,sizeof g_vfi); return 1; }
+MSABI static int s_VerQueryValueW(void* blk,const u16* sub,void** out,u32* len){ (void)blk;(void)sub; if(out)*out=g_vfi; if(len)*len=sizeof g_vfi; return 1; }
+// benign CRT/locale/env fillers the snippet-requirements path touches
+MSABI static u32 s_GetACP(void){ return 1252; }
+MSABI static void* s_GetStdHandle(u32 n){ (void)n; return (void*)(uintptr_t)0x30000001u; }
+MSABI static int s_AreFileApisANSI(void){ return 1; }
+MSABI static u32 s_GetEnvironmentVariableW(const u16* n,u16* b,u32 s){ (void)n;(void)b;(void)s; g_lasterr=203; return 0; }
+MSABI static u32 s_FormatMessageA(u32 fl,void* src,u32 id,u32 lang,char* buf,u32 sz,void* args){ (void)fl;(void)src;(void)id;(void)lang;(void)args; if(buf&&sz)buf[0]=0; return 0; }
+MSABI static int s_FreeLibrary(void* h){ (void)h; return 1; }
+MSABI static u32 s_GetFileType(void* h){ (void)h; return 1; /*FILE_TYPE_DISK*/ }
+MSABI static int s_GetStringTypeW(u32 t,const u16* s,int c,u16* out){ (void)t;(void)s; if(out) for(int i=0;i<c;i++) out[i]=0; return 1; }
+MSABI static int s_IsValidCodePage(u32 c){ (void)c; return 1; }
+MSABI static void* s_OpenFileMappingA(u32 a,int inh,const char* n){ (void)a;(void)inh;(void)n; g_lasterr=2; return 0; }
+MSABI static int s_WriteFile(void* h,const void* buf,u32 n,u32* wr,void* ov){ (void)ov; if(((uintptr_t)h&0xFF000000u)==0x30000000u){ ssize_t r=write(2,buf,n); if(wr)*wr=r>0?(u32)r:0; return 1; } if(wr)*wr=n; return 1; }
+MSABI static u32   s_GetFileAttributesW(void* name){ if(wine_has(name)){ wlog("[GetFileAttributesW OK] ",name); return 0x80; /*FILE_ATTRIBUTE_NORMAL*/ } wlog("[GetFileAttributesW] ",name); g_lasterr=2/*ERROR_FILE_NOT_FOUND*/; return 0xFFFFFFFF; } // INVALID_FILE_ATTRIBUTES
+MSABI static int   s_GetFileAttributesExW(void* name,u32 lvl,void* info){ (void)lvl; if(wine_has(name)){ if(info) memset(info,0,36); if(info)*(u32*)info=0x80; wlog("[GetFileAttributesExW OK] ",name); return 1; } wlog("[GetFileAttributesExW] ",name); return 0; } // FALSE
 MSABI static void* s_FindFirstFileExW(void* name,u32 a,void* d,u32 b,void* c,u32 e){ (void)a;(void)d;(void)b;(void)c;(void)e; wlog("[FindFirstFileExW] ",name); return (void*)-1; }
 // NGX's NGXGetPath calls SHGetKnownFolderPath(rfid, flags, token, &out) to locate its
 // model/config dir (ProgramData/LocalAppData). Return a real writable path (the §19 pattern
@@ -159,16 +220,62 @@ MSABI static int s_D3DKMTEnumAdapters2(void* pe){ if(!pe) return (int)0xC000000D
     if(!*pa){ *n=1; return 0; }                       // query: report count only
     u8* a=(u8*)*pa; memset(a,0,20); *(u32*)(a+0)=0x21; memcpy(a+4,g_luid,8); *(u32*)(a+12)=1; *n=1;
     logn("[D3DKMTEnumAdapters2] ","1 adapter, LUID=deviceUUID-derived"); return 0; }
-MSABI static int s_PathFileExistsW(void* p){ (void)p; return 0; } // FALSE (deny_list etc. absent = fine)
+MSABI static int s_PathFileExistsW(void* p){ if(wine_has(p)){ wlog("[PathFileExistsW OK] ",p); return 1; } return 0; } // TRUE for real wine-dir snippets
+// NGX locates its snippets via HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore -> "FullPath" (REG_SZ).
+// MEASURED under Proton (WINEDEBUG=+reg): NGX opens NGXCore, reads FullPath ("C:\\Windows\\System32"),
+// then LoadLibrary("nvngx_dlssg.dll"). Natively our old trap made the read fail -> NGX aborted the
+// snippet path -> NotImplemented. Serve the key so NGX proceeds to LoadLibrary (our loader then maps
+// the real /usr/lib/nvidia/wine/nvngx_dlssg.dll). Only NGXCore exists; other keys honestly not-found.
+#define FAKE_NGXKEY ((void*)0x4E475801)
+MSABI static int s_RegOpenKeyExW(void* hk,const u16* sub,u32 o,u32 sam,void** phk){ (void)hk;(void)o;(void)sam;
+    char b[260]; int i=0; if(sub) for(;sub[i]&&i<259;i++) b[i]=(char)(sub[i]&0xFF); b[i]=0; wlog("[RegOpenKeyExW] ",sub);
+    if(sub&&strstr(b,"NGXCore")){ if(phk)*phk=FAKE_NGXKEY; return 0; }
+    return 2; /*ERROR_FILE_NOT_FOUND — key doesn't exist, NGX uses defaults*/ }
+MSABI static int s_RegQueryValueExW(void* hk,const u16* val,void* res,u32* type,u8* data,u32* cb){ (void)res;
+    char b[128]; int i=0; if(val) for(;val[i]&&i<127;i++) b[i]=(char)(val[i]&0xFF); b[i]=0;
+    if(hk==FAKE_NGXKEY && val && !strcasecmp(b,"FullPath")){
+        const char* p="C:\\Windows\\System32"; u32 need=(u32)(strlen(p)+1)*2;
+        if(type)*type=1; /*REG_SZ*/
+        if(!data){ if(cb)*cb=need; return 0; }
+        if(cb&&*cb<need){ *cb=need; return 234; /*ERROR_MORE_DATA*/ }
+        u16* w=(u16*)data; for(i=0;p[i];i++) w[i]=(u8)p[i]; w[i]=0; if(cb)*cb=need; logn("[RegQueryValueExW] FullPath -> ",p); return 0; }
+    return 2; /*ERROR_FILE_NOT_FOUND*/ }
+MSABI static int s_RegCloseKey(void* hk){ (void)hk; return 0; }
+// After opening the snippet, NGX Authenticode-verifies it via WinVerifyTrust (wintrust.dll) before
+// LoadLibrary — the file IS the genuine NVIDIA-signed /usr/lib/nvidia/wine/nvngx_dlssg.dll, so assert
+// trust (S_OK). WTHelper* accessors let NGX walk the signer chain (checks CN=NVIDIA); return benign.
+MSABI static int s_WinVerifyTrust(void* hwnd,void* act,void* data){ (void)hwnd;(void)act;(void)data; return 0; /*S_OK = trusted*/ }
+static u8 g_fakecert[64];  // stand-in CERT_CONTEXT (pCertInfo@24 -> g_certinfo); NGX reads name via CertGetNameString
+static u8 g_certinfo[256],g_provdata[64],g_provsgnr[64],g_provcert[64];  // fake WinTrust provider chain
+MSABI static void* s_WTHelperProvDataFromStateData(void* h){ (void)h; return g_provdata; }
+MSABI static void* s_WTHelperGetProvSignerFromChain(void* p,u32 i,int c,u32 s){ (void)p;(void)i;(void)c;(void)s; return g_provsgnr; }
+MSABI static void* s_WTHelperGetProvCertFromChain(void* sgnr,u32 idx){ (void)sgnr;(void)idx;
+    *(void**)(g_fakecert+24)=g_certinfo; /*CERT_CONTEXT.pCertInfo*/ *(void**)(g_provcert+8)=g_fakecert; return g_provcert; }
+// Coherent fake Authenticode chain: the snippet IS the genuine NVIDIA-signed file, so report a valid
+// PKCS7-embedded signature whose signer subject is "NVIDIA Corporation". CryptQueryObject yields fake
+// store/msg handles; the cert lookup returns a fake CERT_CONTEXT; the name string is NVIDIA.
+MSABI static int s_CryptQueryObject(u32 ot,const void* o,u32 ec,u32 ef,u32 fl,u32* pEnc,u32* pCont,u32* pFmt,void** phS,void** phM,const void** ppv){
+    (void)ot;(void)o;(void)ec;(void)ef;(void)fl; if(pEnc)*pEnc=0x00010001; if(pCont)*pCont=10/*PKCS7_SIGNED_EMBED*/; if(pFmt)*pFmt=1;
+    if(phS)*phS=(void*)0x5700; if(phM)*phM=(void*)0x5701; if(ppv)*ppv=0; logn("[CryptQueryObject] ","OK (assert NVIDIA sig)"); return 1; }
+MSABI static int s_CryptMsgGetParam(void* h,u32 type,u32 idx,void* data,u32* cb){ (void)h;(void)idx;
+    if(type==5/*CMSG_SIGNER_COUNT_PARAM*/){ if(data&&cb&&*cb>=4)*(u32*)data=1; if(cb)*cb=4; return 1; }
+    u32 need=256; if(!data){ if(cb)*cb=need; return 1; } if(cb){ u32 w=*cb<need?*cb:need; memset(data,0,w); } return 1; }
+MSABI static int s_CryptMsgClose(void* h){ (void)h; return 1; }
+MSABI static void* s_CertFindCertificateInStore(void* store,u32 enc,u32 fl,u32 ft,const void* fp,const void* prev){ (void)store;(void)enc;(void)fl;(void)ft;(void)fp;(void)prev; return prev?0:g_fakecert; }
+MSABI static u32 s_CertGetNameStringW(void* c,u32 t,u32 f,void* p,u16* name,u32 cch){ (void)c;(void)t;(void)f;(void)p; const char* s="NVIDIA Corporation"; u32 n=(u32)strlen(s)+1; if(!name||!cch) return n; u32 i=0; for(;i<n-1&&i<cch-1;i++) name[i]=(u8)s[i]; name[i]=0; return i+1; }
+MSABI static u32 s_CertGetNameStringA(void* c,u32 t,u32 f,void* p,char* name,u32 cch){ (void)c;(void)t;(void)f;(void)p; const char* s="NVIDIA Corporation"; u32 n=(u32)strlen(s)+1; if(!name||!cch) return n; u32 i=0; for(;i<n-1&&i<cch-1;i++) name[i]=s[i]; name[i]=0; return i+1; }
+MSABI static int s_CertFreeCertificateContext(void* c){ (void)c; return 1; }
+MSABI static int s_CertCloseStore(void* s,u32 f){ (void)s;(void)f; return 1; }
 // D3DKMT_QUERYADAPTERINFO{ UINT hAdapter@0; KMTQAITYPE Type@4; void* pData@8; UINT Size@16 }
 MSABI static int s_D3DKMTQueryAdapterInfo(void* p){ if(!p) return (int)0xC000000D;
     u32 type=*(u32*)((u8*)p+4); void* pd=*(void**)((u8*)p+8); u32 sz=*(u32*)((u8*)p+16);
     char b[80]; snprintf(b,sizeof b,"[D3DKMTQueryAdapterInfo] Type=%u size=%u\n",type,sz); logs(b);
+    // MEASURED against Proton (WINEDEBUG=+d3dkmt): even Wine returns "type 48 not handled" and
+    // NGX tolerates it (FG still Success). So DON'T fake success with zeroed data (that sends NGX
+    // down a wrong path) — match Wine and return an error for unhandled types.
+    if(type==48) return (int)0xC0000002; // STATUS_NOT_IMPLEMENTED (like Wine's fixme path)
     if(pd&&sz) memset(pd,0,sz);
-    // Type 48 = KMTQAITYPE_KMD_DRIVER_VERSION: NGX checks the WDDM version >= a minimum for FG.
-    // Report a modern WDDM (KMT_DRIVERVERSION_WDDM_3_0 = 3000). Zeroed = version 0 = too old.
-    if(type==48 && pd && sz>=4) *(u32*)pd = 3000;
-    return 0; } // STATUS_SUCCESS
+    return 0; } // STATUS_SUCCESS for handled types
 MSABI static int s_D3DKMTCloseAdapter(void* p){ (void)p; return 0; }
 MSABI static int s_D3DKMTOpenAdapterFromLuid(void* p){ if(p) *(u32*)p=0x21; return 0; } // fill hAdapter
 // --- nvapi shim (S5c): the host resolves NvAPI_* via nvapi_QueryInterface(id). First pass:
@@ -246,11 +353,15 @@ static void* resolve(const char* dll,const char* fn);
 static void* make_trap(const char* name);
 static Module* load_module(const char* name);
 static void* module_export(Module* m,const char* fn);
+static void* g_stubs_lookup(const char* fn);
 
 // dynamic loader entry points (real)
 MSABI static void* s_GetModuleHandleW(void* n){ (void)n; return g_mod[0].base; }
 MSABI static void* s_GetProcAddress(void* m,const char* n){ if(!n)return 0;
     for(int i=0;i<g_nmod;i++) if(g_mod[i].base==(u8*)m){ void* e=module_export(&g_mod[i],n); if(e)return e; break; }
+    // host<->snippet services: the snippet resolves NVSDK_NGX_*/NGX_SNIPPETS_* callbacks via
+    // GetProcAddress on whatever handle it has -> search EVERY loaded module's exports by name.
+    if(!strncmp(n,"NVSDK_NGX",9)||!strncmp(n,"NGX_",4)){ for(int i=0;i<g_nmod;i++){ void* e=module_export(&g_mod[i],n); if(e){ logn("[host-svc] ",n); return e; } } }
     // Vulkan loader: the host's GPU-arch path LoadLibrary's vulkan-1.dll + resolves entry
     // points. gipa/gdpa must be our ms_abi wrappers (they ms2sysv-wrap what they return);
     // other vk* funcs bridge straight to native libvulkan via ms2sysv.
@@ -259,7 +370,12 @@ MSABI static void* s_GetProcAddress(void* m,const char* n){ if(!n)return 0;
     if(!strncmp(n,"vk",2)&&g_hvk){ void* f=dlsym(g_hvk,n); if(f){ logn("[vk->native] ",n); return make_ms2sysv(f); } }
     // NVML is public + native: bridge nvml.dll's functions to libnvidia-ml.so.1 via ms2sysv.
     if(!strncmp(n,"nvml",4)&&g_hnvml){ void* f=dlsym(g_hnvml,n); if(f){ logn("[nvml->native] ",n); return make_ms2sysv(f); } }
-    // fall back to our CRT stub table by name, else a logging trap
+    // The host probes the snippet for OPTIONAL NGX callbacks (NGX_SNIPPETS_GetRequiredDriverSupport,
+    // NVSDK_NGX_SetTelemetryCallback, SetOverrideStatusCallback, ...) that this snippet doesn't export.
+    // The all-module export search above already failed for them -> return NULL (not a trap) so the
+    // host's `if(pfn)` guard skips them, exactly as under Proton. A trap made the host call garbage.
+    if(!strncmp(n,"NVSDK_NGX",9)||!strncmp(n,"NGX_",4)){ logn("[GetProcAddress->NULL] ",n); return 0; }
+    // Everything else (Win32/CRT/crypt the code calls unconditionally) -> stub or logging trap as before.
     void* r=resolve("dyn",n); return r; }
 static void wide_basename(const void* w,char* out){ const u16* p=w; int n=0; char tmp[260];
     for(;p[n]&&n<259;n++) tmp[n]=(char)(p[n]&0xFF); tmp[n]=0; char* s=strrchr(tmp,'\\'); s=s?s+1:tmp; char* s2=strrchr(s,'/'); s=s2?s2+1:s; strcpy(out,s); }
@@ -308,6 +424,19 @@ struct { const char* name; void* fn; } g_stubs[]={
  {"SHGetKnownFolderPath",s_SHGetKnownFolderPath},{"CoTaskMemFree",s_CoTaskMemFree},
  {"D3DKMTEnumAdapters2",s_D3DKMTEnumAdapters2},{"PathFileExistsW",s_PathFileExistsW},
  {"D3DKMTQueryAdapterInfo",s_D3DKMTQueryAdapterInfo},{"D3DKMTCloseAdapter",s_D3DKMTCloseAdapter},{"D3DKMTOpenAdapterFromLuid",s_D3DKMTOpenAdapterFromLuid},
+ {"RegOpenKeyExW",s_RegOpenKeyExW},{"RegQueryValueExW",s_RegQueryValueExW},{"RegCloseKey",s_RegCloseKey},
+ {"ReadFile",s_ReadFile},{"SetFilePointer",s_SetFilePointer},{"SetFilePointerEx",s_SetFilePointerEx},
+ {"GetFileSize",s_GetFileSize},{"GetFileSizeEx",s_GetFileSizeEx},
+ {"CreateFileMappingW",s_CreateFileMappingW},{"CreateFileMappingA",s_CreateFileMappingW},{"MapViewOfFile",s_MapViewOfFile},{"UnmapViewOfFile",s_UnmapViewOfFile},
+ {"WinVerifyTrust",s_WinVerifyTrust},{"WTHelperProvDataFromStateData",s_WTHelperProvDataFromStateData},{"WTHelperGetProvSignerFromChain",s_WTHelperGetProvSignerFromChain},{"WTHelperGetProvCertFromChain",s_WTHelperGetProvCertFromChain},
+ {"CreateThread",s_CreateThread},{"WriteFile",s_WriteFile},
+ {"GetFileVersionInfoSizeExW",s_GetFileVersionInfoSizeExW},{"GetFileVersionInfoSizeW",s_GetFileVersionInfoSizeW},{"GetFileVersionInfoExW",s_GetFileVersionInfoExW},{"GetFileVersionInfoW",s_GetFileVersionInfoW},{"VerQueryValueW",s_VerQueryValueW},
+ {"GetACP",s_GetACP},{"GetStdHandle",s_GetStdHandle},{"AreFileApisANSI",s_AreFileApisANSI},{"GetEnvironmentVariableW",s_GetEnvironmentVariableW},
+ {"FormatMessageA",s_FormatMessageA},{"FreeLibrary",s_FreeLibrary},{"OpenFileMappingA",s_OpenFileMappingA},
+ {"CreateMutexA",s_CreateHandle},{"GetFileType",s_GetFileType},{"GetStringTypeW",s_GetStringTypeW},{"IsValidCodePage",s_IsValidCodePage},
+ {"CryptQueryObject",s_CryptQueryObject},{"CryptMsgGetParam",s_CryptMsgGetParam},{"CryptMsgClose",s_CryptMsgClose},
+ {"CertFindCertificateInStore",s_CertFindCertificateInStore},{"CertGetNameStringW",s_CertGetNameStringW},{"CertGetNameStringA",s_CertGetNameStringA},
+ {"CertFreeCertificateContext",s_CertFreeCertificateContext},{"CertCloseStore",s_CertCloseStore},
  {0,0}};
 static void* g_stubs_lookup(const char* fn){ for(int i=0;g_stubs[i].name;i++) if(!strcmp(g_stubs[i].name,fn)) return g_stubs[i].fn; return 0; }
 

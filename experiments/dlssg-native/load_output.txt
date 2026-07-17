@@ -1,0 +1,4 @@
+
+
+== child exited code 0
+== S2 verdict: DllMain RETURNED 1 (DLL loaded + attached natively).

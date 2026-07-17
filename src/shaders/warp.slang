@@ -23,7 +23,7 @@ struct Push {
 };
 [[vk::push_constant]] Push pc;
 
-static const uint FLAG_UI = 1u, FLAG_REACTIVE = 2u, FLAG_BIDIR = 4u, FLAG_MATERIAL = 8u;
+static const uint FLAG_UI = 1u, FLAG_REACTIVE = 2u, FLAG_BIDIR = 4u, FLAG_MATERIAL = 8u, FLAG_RESET = 16u;
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
@@ -76,6 +76,11 @@ void main(uint3 tid : SV_DispatchThreadID) {
     // UI mask is mandatory: HUD/crosshair/text must come straight from a real
     // frame, never interpolated. Take the most recent (curr).
     if ((pc.flags & FLAG_UI) && gUiMask[p] > 0.5)
+        outC = gCurr.SampleLevel(gLinear, uvP, 0);
+
+    // Reset (camera cut / first frame): the previous frame is unrelated, so don't
+    // interpolate — output the current real frame straight through.
+    if (pc.flags & FLAG_RESET)
         outC = gCurr.SampleLevel(gLinear, uvP, 0);
 
     gOut[p] = outC;
