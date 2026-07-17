@@ -359,9 +359,10 @@ static void* g_stubs_lookup(const char* fn);
 MSABI static void* s_GetModuleHandleW(void* n){ (void)n; return g_mod[0].base; }
 MSABI static void* s_GetProcAddress(void* m,const char* n){ if(!n)return 0;
     for(int i=0;i<g_nmod;i++) if(g_mod[i].base==(u8*)m){ void* e=module_export(&g_mod[i],n); if(e)return e; break; }
-    // host<->snippet services: the snippet resolves NVSDK_NGX_*/NGX_SNIPPETS_* callbacks via
-    // GetProcAddress on whatever handle it has -> search EVERY loaded module's exports by name.
-    if(!strncmp(n,"NVSDK_NGX",9)||!strncmp(n,"NGX_",4)){ for(int i=0;i<g_nmod;i++){ void* e=module_export(&g_mod[i],n); if(e){ logn("[host-svc] ",n); return e; } } }
+    // GetProcAddress is PER-HANDLE: only the addressed module's exports (base-match loop above).
+    // Do NOT greedily search other modules for NVSDK_NGX_*/NGX_* — the host probes the SNIPPET for
+    // functions it may not export and expects NULL (e.g. GetFeatureDeviceExtensionRequirements);
+    // returning _nvngx's copy diverges from Proton and yields FeatureNotSupported.
     // Vulkan loader: the host's GPU-arch path LoadLibrary's vulkan-1.dll + resolves entry
     // points. gipa/gdpa must be our ms_abi wrappers (they ms2sysv-wrap what they return);
     // other vk* funcs bridge straight to native libvulkan via ms2sysv.
@@ -532,7 +533,11 @@ MSABI static void s_vkGPDP2(void* pd,void* pprops){
             // The native NVIDIA Linux driver reports deviceLUIDValid=0. Synthesize a valid LUID
             // DERIVED from the fixed deviceUUID (first 8 bytes) — stable + collision-free — and use
             // the SAME bytes as the nvapi OS-AdapterId (g_luid) so NGX's adapter correlation matches.
-            if(!idp->deviceLUIDValid){ memcpy(g_luid,idp->deviceUUID,8); idp->deviceLUIDValid=1; memcpy(idp->deviceLUID,g_luid,8); idp->deviceNodeMask=1; }
+            { int uuidnz=0; for(int k=0;k<8;k++) if(idp->deviceUUID[k]) uuidnz=1;
+              if(uuidnz) memcpy(g_luid,idp->deviceUUID,8); // else keep the non-zero fallback g_luid
+              idp->deviceLUIDValid=1; memcpy(idp->deviceLUID,g_luid,8); idp->deviceNodeMask=1;
+              char q[128]; snprintf(q,sizeof q,"   ID_PROPS FIXED: valid=%u LUID=%02x%02x%02x%02x%02x%02x%02x%02x @idp=%p\n",
+                idp->deviceLUIDValid,g_luid[0],g_luid[1],g_luid[2],g_luid[3],g_luid[4],g_luid[5],g_luid[6],g_luid[7],(void*)idp); logs(q); }
         } else { char c[48]; snprintf(c,sizeof c,"   pNext sType=%u\n",(unsigned)s->sType); logs(c);} } }
 MSABI static void* my_gipa(void* inst,const char* n){ if(n)logn("[gipa] ",n);
     if(n&&!strcmp(n,"vkGetPhysicalDeviceProperties2")) return (void*)s_vkGPDP2;

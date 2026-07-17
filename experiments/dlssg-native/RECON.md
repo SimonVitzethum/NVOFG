@@ -425,6 +425,83 @@ make            # builds pe_probe (S1) and, with: cc -O2 -o pe_load pe_load.c -l
 ./pe_load  /usr/lib/nvidia/wine/nvngx_dlssg.dll   # S2: run DllMain natively -> returns 1
 ```
 
+## S5f — measurement infra + the snippet LOADS + inits natively (2026-07-17)
+
+**Measurement infra is built into Wine.** `WINEDEBUG=+d3dkmt/+loaddll/+reg` and
+`DXVK_NVAPI_LOG_LEVEL=trace` under Proton give the exact reference sequence for every host call —
+no custom detour hook needed. This turned per-struct *guessing* into byte-for-byte *diffing*.
+
+**Two findings inverted the earlier plan:**
+- **Type-48 D3DKMT is a RED HERRING.** Wine logs `fixme:d3dkmt:...QueryAdapterInfo type 48 not
+  handled` — even Wine returns an error, and NGX still reports FG=Success under Proton. Faking
+  success-with-zeroed-data sent NGX down a *worse* path. The whole "multi-week WDDM/D3DKMT rebuild"
+  wall was thus never the real blocker.
+- **The real gate to loading `nvngx_dlssg.dll` is a chain the native traps silently broke:**
+  `HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore` → value `FullPath` (REG_SZ) → file-existence in
+  the wine dir → file-backed `CreateFile`/`ReadFile`/`GetFileSize`/`MapViewOfFile` → **Authenticode
+  verification** (`CryptQueryObject` + `WinVerifyTrust` + `WTHelper` signer/cert chain, subject must
+  read `NVIDIA Corporation`).
+
+**Implemented all of it → the snippet now maps, its `DllMain(PROCESS_ATTACH)` returns TRUE, and the
+host consults it natively.** Also required: real `CreateThread` (pthread + per-thread Windows TEB on
+gs), version-info (`VS_FIXEDFILEINFO`), benign CRT fillers, and — crucially — **correct
+`GetProcAddress` NULL semantics**: the snippet exports 45 named functions (the earlier "0 exports"
+recon was wrong — it exports `NVSDK_NGX_VULKAN_GetFeatureRequirements/CreateFeature/EvaluateFeature/
+Init/...`), and the host probes it for a handful it does *not* export (`NGX_SNIPPETS_GetRequired
+DriverSupport`, `..._Init_Ext1`, `..._GetFeatureDeviceExtensionRequirements`, `SetTelemetryCallback`).
+Those must return **NULL** (Windows semantics) so the host's `if(pfn)` guards skip them — a trap made
+the host call garbage. Confirmed those NULLs match Proton (same snippet, same missing exports).
+
+**Result:** FG `GetFeatureRequirements` advanced **`0xBAD00012` (NotImplemented) → `0xBAD00002`
+(FeatureNotSupported)** — no longer a loader failure but a *snippet-informed* verdict (vs Proton's
+`0x1` Success).
+
+**Current wall (the real one now).** Under Proton, `GetFeatureRequirements(FG)` makes a rich nvapi
+burst on the calling thread — `GPU_GetArchInfo`, `GPU_GetLogicalGpuInfo`,
+`GetLogicalGPUFromPhysicalGPU`, `EnumPhysicalGPUs`, `SYS_GetDriverAndBranchVersion`, and
+`DRS_CreateSession/LoadSettings/FindApplicationByName/GetBaseProfile/GetProfileInfo/GetSetting×12` —
+then returns Success. **Natively the host makes ZERO nvapi calls** in the snippet path: after loading
+the snippet + probing its API surface (+ spawning a background thread) it returns FeatureNotSupported
+*before reaching nvapi*, cleanly (child exit 0, no fault). So an internal `_nvngx` branch bails
+between snippet-load and the nvapi burst. Black-box tracing can't reveal the decision variable — the
+next step is disassembling `_nvngx.dll`'s `NVSDK_NGX_VULKAN_GetFeatureRequirements` to find the
+branch that constructs `0xBAD00002`, or a scoped Proton relay diff of that function. This is the
+genuine deep-RE tail (engineering, bounded, but multi-hour+).
+
+## S5g — the LUID gate broken; native flow now matches Proton's FG-support path (2026-07-17)
+
+Disassembling `_nvngx.dll!NVSDK_NGX_VULKAN_GetFeatureRequirements` (RVA 0xDF80) revealed the exact
+gate chain and the ONE data value that natively diverged from Proton:
+
+1. It `LoadLibraryW`s the snippet, `GetProcAddress`es `vkGetInstanceProcAddr` from it (→ our
+   `my_gipa`), then calls a `GetLUIDFromVkPhysicalDevice` worker (`0x18000c4a0`): it resolves
+   `vkGetPhysicalDeviceProperties2` and reads `VkPhysicalDeviceIDProperties.deviceLUIDValid`
+   (struct+60) / `deviceLUID` (struct+48). **The native NVIDIA Linux driver reports
+   `deviceLUIDValid=0`** (no WDDM/DXGI adapter identity); DXVK under Proton synthesizes a valid LUID.
+   With `deviceLUIDValid=0` the worker returns false → `0xBAD00002`. **Our `s_vkGPDP2` interpose now
+   forces `deviceLUIDValid=1` + a deterministic non-zero LUID (deviceUUID-derived, == the nvapi
+   OS-adapter id).** This was the real gate.
+2. **Breaking it advanced the flow to exactly Proton's nvapi burst** — `EnumPhysicalGPUs`,
+   `GetLogicalGPUFromPhysicalGPU`, `GPU_GetLogicalGpuInfo`, `GPU_GetArchInfo(Blackwell=0x1B0)`,
+   `SYS_GetDriverAndBranchVersion(610.43)`, `DRS_CreateSession/LoadSettings/FindApplicationByName/
+   GetBaseProfile/GetProfileInfo/GetSetting×N/DestroySession`. **Verified our nvapi surface matches
+   dxvk-nvapi bit-for-bit**: the 4 "unknown" QueryInterface IDs (0x33c7358c, 0x593e8644, 0xa782ea46,
+   0xad298d3f) are "Unknown function ID" in dxvk-nvapi too, and the probed DRS settings
+   (0x10e41df2, 0x10afb764/6b) return "Setting not found" under Proton exactly like our stub.
+3. `NVSDK_NGX_VULKAN_GetFeatureRequirements` → the LUID worker (now passes) → `FreeLibrary` →
+   `0x18000c450` (build ctx/table → r13) → **`0x18000c1e0`** (the FG-support evaluator). Its result
+   `!= 1` is returned verbatim. Inside it: `0x180061730` (nvapi init + `SYS_GetDriverAndBranchVersion`
+   status/version — **passes**, driver 610.43), then `[r14+0x2460]`, `call 0x18003b370` with a
+   `cmp eax,0xbad00000; je` error-shortcut, then a per-feature dispatch
+   `r13[0x24e0 + FeatureID*144]` (null → `0xBAD00012`; else call the feature fn).
+
+**Status:** the remaining `0xBAD00002` now originates *deep* inside `0x18000c1e0`, AFTER the
+driver-version check passes — in `0x18003b370` / the per-feature FG evaluator, NOT in the loader,
+LUID, or nvapi surface (all of which now match Proton). Next step: disassemble `0x18000c1e0` +
+`0x18003b370` fully to find the post-driver-version branch that yields `0xBAD00002`, and instrument
+which nvapi/DRS *data field* (not status) it reads differently. The loader + adapter-identity layers
+are done; this is a contained per-feature-evaluator diff.
+
 ## Legal
 
 `nvngx_dlssg.dll` is NVIDIA-licensed and shipped for the driver's Wine/Proton runtime. This
