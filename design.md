@@ -1056,12 +1056,24 @@ real init logic and returns a clean `0xBAD00002` (`FAIL_PlatformError`) — no c
 retires the "internal host↔snippet ABI" fear: the app drives the host via the **documented
 `NVSDK_NGX_VULKAN_*` API**, and the host loads the snippet itself.
 
-**The single remaining dependency to a successful `Init` is an nvapi shim** (the dxvk-nvapi role):
-implement `nvapi_QueryInterface` + the `NvAPI_*` GPU-architecture queries, bridged to the native
-driver, so the host classifies the RTX 5070 as Blackwell. Then `CreateFeature(FrameGeneration)`
-loads the snippet; S6 (feed our frame via the snippet's CUDA-Vulkan external-memory/semaphore
-interop) + S4 (Reflex `VK_NV_low_latency2` pacing) follow. The own model (§21) stays the parallel
-fallback if the nvapi bridge proves intractable.
+**S5(c) — Gate 2 characterised (the wall).** Instrumenting `nvapi_QueryInterface` shows NGX resolves,
+after `NvAPI_Initialize`, a set of **private/undocumented** nvapi interface IDs (0xAD298D3F,
+0x33C7358C, 0x593E8644, 0x0694D52E, 0x375DBD6B, 0xDA8466A0) — *not* the documented `EnumPhysicalGPUs`/
+`GPU_GetArchInfo`/`GetPCIIdentifiers`. Two shortcuts were tested and don't apply: **(i) no NVML
+fallback** — we bridged `nvml.dll` → native `libnvidia-ml.so.1` and forced nvapi to return NULL, but
+NGX never loads `nvml.dll` (it relies on nvapi alone for arch); **(ii) dxvk-nvapi pulls the DXVK
+stack** — its `nvapi64.dll` implements these private interfaces but imports `d3d11/d3d12/dxgi`
+(queries the GPU through DXVK/vkd3d), so hosting it re-introduces the Proton d3d stack. So Gate 2
+needs either **RE of the ~6 private nvapi interfaces** (disassemble nvngx, implement against native
+NVML/Vulkan) or **hosting DXVK**. Until then **Gate 3 — the FG-available go/no-go — is unreachable**
+(the capability query needs a successful Init).
+
+**Honest status:** Path B went from "infeasible in practice" to *both NVIDIA PEs load natively,
+DllMain→1, the documented `NVSDK_NGX_VULKAN_*` API drives the host, 48 foreign-ABI Vulkan/CUDA
+imports run through real Init logic via one register-shuffle thunk with zero errors, and Init returns
+a clean, precisely-localised `PlatformError`* — blocked at exactly one gate (private-nvapi arch
+detection). Crossing it to even test the go/no-go is RE-heavy or DXVK-heavy. The own model (§21,
+native, single-GPU-trainable) stays the pragmatic parallel path and depends on none of this.
 
 *(Working log + probes in `experiments/dlssg-native/RECON.md`; `pe_probe.c` S1, `pe_load.c` S2,
 `s5_host.c` S5.)*

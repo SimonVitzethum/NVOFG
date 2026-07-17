@@ -4,8 +4,11 @@
   native) + S5(a) (host loads, API reachable) + **S5(b): `NVSDK_NGX_VULKAN_Init_ProjectID` runs
   natively end-to-end via ms_abi↔SysV Vulkan/CUDA thunks + a live VkDevice, returning a clean
   `0xBAD00002` FAIL_PlatformError — failing ONLY because nvapi64.dll isn't bridged**. The single
-  remaining dependency to a successful Init is an **nvapi shim** (dxvk-nvapi role). Own trained model
-  (§21) kept as the parallel fallback.
+  remaining dependency to a successful Init is an **nvapi shim** (dxvk-nvapi role). **S5(c): Gate 2
+  characterised** — NGX resolves *private/undocumented* nvapi interface IDs for arch detection (no
+  NVML fallback in this build; dxvk-nvapi pulls the DXVK d3d stack), so crossing it needs RE of the
+  ~6 private interfaces or hosting DXVK; until then Gate 3 (FG-available go/no-go) is unreachable.
+  Own trained model (§21) kept as the parallel — and now pragmatically favoured — fallback.
 - **Date:** 2026-07-17
 - **Relates to:** design.md §20 (Path B plan), §21 (own model); ADR 0006 (NGX).
 

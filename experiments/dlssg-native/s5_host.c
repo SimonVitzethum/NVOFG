@@ -31,8 +31,15 @@
 
 // Generic Microsoft-x64 -> System-V ABI thunk: the PE calls its Vulkan/CUDA imports
 // MS-x64 (rcx,rdx,r8,r9 + shadow); native libvulkan/libcuda are SysV (rdi,rsi,rdx,rcx,
-// r8,r9). All imported entry points take <=6 integer/pointer args (no float args), so a
-// register+2-stack shuffle suffices. Target native fn is passed in r10 by the trampoline.
+// r8,r9). Target native fn is passed in r10 by the trampoline.
+//
+// SCOPE / TODO (S6): this handles ONLY the INTEGER class (RCX/RDX/R8/R9 -> RDI/RSI/RDX/RCX)
+// + 2 stack-overflow args + shadow space. It is CORRECT for pointer/handle signatures
+// (all of Vulkan, and the CUDA driver calls NGX-Init uses) but NOT for float/double args
+// or by-value structs: MS-x64 uses positional slots (a float at position 3 -> XMM2) while
+// SysV has a separate SSE file (XMM0..7) and classifies structs (INTEGER/SSE/MEMORY)
+// independently. When the CUDA-interop path (S6) goes live, any import taking a float/
+// double or a small struct by value needs XMM handling + struct classification added here.
 __asm__(
 ".text\n.globl ms2sysv_common\nms2sysv_common:\n"
 "  push %rdi\n  push %rsi\n"
@@ -65,6 +72,8 @@ static u8* g_code; static size_t g_codeoff;
 static __thread void* g_tls[2048]; static __thread int g_lasterr; static int g_tlsnext=1; static u8 g_heap[1];
 static u64 g_hcount=0x2000;
 static u8 g_teb[0x2000],g_peb[0x800]; static void* g_tlsslots[512];   // fake Windows TEB + PE-TLS array
+static void* make_trap(const char* name);   // fwd (defined below)
+static void* make_ms2sysv(void* target);     // fwd (defined below)
 
 // ---- ms_abi CRT shim (subset proven in pe_load.c) ----
 MSABI static void* s_GetProcessHeap(void){return g_heap;}
@@ -119,6 +128,15 @@ MSABI static u32 s_GetModuleFileNameA(void* m,char* b,u32 sz){ (void)m; const ch
 MSABI static int s_VerifyVersionInfoW(void* a,u32 b,u64 c){ (void)a;(void)b;(void)c; return 1; }
 MSABI static u64 s_VerSetConditionMask(u64 m,u32 t,u8 c){ (void)t;(void)c; return m?m:1; }
 MSABI static u32 s_GetFullPathNameW(const u16* n,u32 sz,u16* buf,void** fp){ (void)fp; u32 i=0; if(buf)for(;n[i]&&i<sz-1;i++)buf[i]=n[i]; if(buf)buf[i]=0; return i; }
+// --- nvapi shim (S5c): the host resolves NvAPI_* via nvapi_QueryInterface(id). First pass:
+// log every requested interface id and hand back a 0-returning stub (NVAPI_OK) so the host
+// keeps querying and we can enumerate the full set it needs for GPU-arch detection. ---
+MSABI static int s_nv_ok(void){ return 0; }   // NVAPI_OK
+// nvapi uses PRIVATE/undocumented interface IDs for arch detection -> return NULL so NGX
+// treats nvapi as unavailable and (hopefully) falls back to its nvml path, which is the
+// PUBLIC NVML API and bridges cleanly to native libnvidia-ml.so.1.
+MSABI static void* s_nvapi_QueryInterface(u32 id){ char b[48]; snprintf(b,sizeof b,"[nvapi_QI 0x%08X -> null]\n",id); logs(b); return 0; }
+static void* g_hnvml;   // native libnvidia-ml.so.1
 
 // forward decls
 static void* resolve(const char* dll,const char* fn);
@@ -130,6 +148,8 @@ static void* module_export(Module* m,const char* fn);
 MSABI static void* s_GetModuleHandleW(void* n){ (void)n; return g_mod[0].base; }
 MSABI static void* s_GetProcAddress(void* m,const char* n){ if(!n)return 0;
     for(int i=0;i<g_nmod;i++) if(g_mod[i].base==(u8*)m){ void* e=module_export(&g_mod[i],n); if(e)return e; break; }
+    // NVML is public + native: bridge nvml.dll's functions to libnvidia-ml.so.1 via ms2sysv.
+    if(!strncmp(n,"nvml",4)&&g_hnvml){ void* f=dlsym(g_hnvml,n); if(f){ logn("[nvml->native] ",n); return make_ms2sysv(f); } }
     // fall back to our CRT stub table by name, else a logging trap
     void* r=resolve("dyn",n); return r; }
 static void wide_basename(const void* w,char* out){ const u16* p=w; int n=0; char tmp[260];
@@ -174,6 +194,7 @@ struct { const char* name; void* fn; } g_stubs[]={
  {"GetModuleFileNameW",s_GetModuleFileNameW},{"GetModuleFileNameA",s_GetModuleFileNameA},
  {"GetSystemDirectoryW",s_GetSystemDirectoryW},{"GetWindowsDirectoryW",s_GetWindowsDirectoryW},
  {"VerifyVersionInfoW",s_VerifyVersionInfoW},{"VerSetConditionMask",s_VerSetConditionMask},{"GetFullPathNameW",s_GetFullPathNameW},
+ {"nvapi_QueryInterface",s_nvapi_QueryInterface},
  {0,0}};
 static void* g_stubs_lookup(const char* fn){ for(int i=0;g_stubs[i].name;i++) if(!strcmp(g_stubs[i].name,fn)) return g_stubs[i].fn; return 0; }
 
@@ -269,6 +290,7 @@ int main(void){
         sigaction(SIGSEGV,&sa,0);sigaction(SIGILL,&sa,0);sigaction(SIGBUS,&sa,0);sigaction(SIGFPE,&sa,0);
         // native drivers for the ms_abi->SysV import thunks
         g_hvk=dlopen("libvulkan.so.1",RTLD_NOW|RTLD_GLOBAL); g_hcu=dlopen("libcuda.so.1",RTLD_NOW|RTLD_GLOBAL);
+        g_hnvml=dlopen("libnvidia-ml.so.1",RTLD_NOW|RTLD_GLOBAL);
         int vr=setup_vulkan();
         { char b[96]; snprintf(b,sizeof b,"[vulkan setup rc=%d inst=%p pd=%p dev=%p]\n",vr,(void*)g_inst,(void*)g_pd,(void*)g_dev); logs(b);}
         if(vr){ logs("[no vulkan device -> cannot call NGX Init]\n"); _exit(5); }

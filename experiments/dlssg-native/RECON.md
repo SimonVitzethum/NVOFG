@@ -142,6 +142,49 @@ native driver (`libnvidia-ml.so` / `libcuda`), that the host classifies the RTX 
 Then `CreateFeature(FrameGeneration)` loads the snippet, and S6 (feed our frame via the snippet's
 CUDA-Vulkan external-memory/semaphore interop) + S4 (Reflex `VK_NV_low_latency2` pacing) follow.
 
+### S5(c) — Gate 2 characterised: NGX arch-detection uses PRIVATE nvapi interfaces (the wall)
+
+Instrumented `nvapi_QueryInterface` to log the interface IDs NGX resolves during Init. It queries,
+after `NvAPI_Initialize` (0x0150E828), a set of **private/undocumented** interface IDs:
+
+```
+0xAD298D3F  0x0150E828(Initialize)  0x33C7358C  0x593E8644  0x0694D52E  0x375DBD6B  0xDA8466A0
+```
+
+These are **not** the documented public IDs (`EnumPhysicalGPUs` 0xE5AC921F, `GPU_GetArchInfo`
+0xD8265D24, `GPU_GetPCIIdentifiers` 0x2DDFB66E) — so NGX uses internal nvapi entry points whose
+function semantics + out-struct layouts are undocumented. Two hoped-for shortcuts were tested and
+**do not apply to this build**:
+
+- **NVML fallback — absent.** NGX's strings mention `nvngx_common_nvml`, so we bridged `nvml.dll` →
+  native `libnvidia-ml.so.1` (public API, easy) and returned NULL from `nvapi_QueryInterface` to
+  force the fallback. NGX **never loads `nvml.dll`** — it relies on nvapi alone for arch detection.
+  (The nvml bridge is left in `s_GetProcAddress`, ready if a future NGX build uses it.)
+- **dxvk-nvapi — pulls the DXVK stack.** jp7677/dxvk-nvapi's `nvapi64.dll` implements these private
+  interfaces, but it imports **`d3d11.dll` / `d3d12.dll` / `dxgi.dll`** (it queries the GPU through
+  DXVK/vkd3d, not Vulkan directly). Loading it natively would drag in the whole DXVK d3d stack —
+  the "re-host Proton" wall relocated into the nvapi layer. Not a clean unlock.
+
+**So Gate 2 requires one of:** (a) **reverse-engineer** the ~6 private nvapi interfaces NGX calls
+(disassemble `nvngx`/`_nvngx` to learn each function's out-struct, implement against native
+NVML/Vulkan) — deep, multi-session, uncertain; or (b) host the **DXVK d3d11/dxgi/d3d12 stack** to run
+dxvk-nvapi — deeper. Until one is done, **Gate 3 (the FG-available go/no-go) cannot be reached**,
+because the capability query needs a *successful* Init.
+
+*(Note: with the CRT time/thread stubs returning live values, ~40% of runs crash intermittently at a
+fixed 0xa8ec8148cb inside NGX — a data-dependent path off a time/seed stub; clean runs deterministically
+reach `0xBAD00002`. Not worth determinising until Gate 2 is crossed.)*
+
+### Honest status & decision point
+
+Path B went from "infeasible in practice" to: **both NVIDIA PEs load natively, DllMain→1, the
+documented `NVSDK_NGX_VULKAN_*` API drives the host, 48 foreign-ABI Vulkan/CUDA imports run through
+real Init logic via one register-shuffle thunk with zero errors, and Init returns a clean, precisely
+localised `PlatformError`** — blocked at exactly one gate: GPU-arch detection through private nvapi
+interfaces. Crossing that gate to even *test* whether Linux NGX reports FG-available is an
+RE-heavy (or DXVK-heavy) effort. The own model (§21, native, single-GPU-trainable) remains the
+pragmatic parallel path and does not depend on any of this.
+
 ## Remaining stages (design.md §20.3, re-scoped by the recon)
 
 - **S2 — MSVC-CRT shim (M, was L).** Provide the 150 KERNEL32/ADVAPI32/USER32/VERSION symbols +
