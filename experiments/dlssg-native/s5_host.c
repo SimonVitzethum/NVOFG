@@ -164,7 +164,11 @@ MSABI static int s_PathFileExistsW(void* p){ (void)p; return 0; } // FALSE (deny
 MSABI static int s_D3DKMTQueryAdapterInfo(void* p){ if(!p) return (int)0xC000000D;
     u32 type=*(u32*)((u8*)p+4); void* pd=*(void**)((u8*)p+8); u32 sz=*(u32*)((u8*)p+16);
     char b[80]; snprintf(b,sizeof b,"[D3DKMTQueryAdapterInfo] Type=%u size=%u\n",type,sz); logs(b);
-    if(pd&&sz) memset(pd,0,sz); return 0; } // STATUS_SUCCESS, zeroed (refine per Type from trace)
+    if(pd&&sz) memset(pd,0,sz);
+    // Type 48 = KMTQAITYPE_KMD_DRIVER_VERSION: NGX checks the WDDM version >= a minimum for FG.
+    // Report a modern WDDM (KMT_DRIVERVERSION_WDDM_3_0 = 3000). Zeroed = version 0 = too old.
+    if(type==48 && pd && sz>=4) *(u32*)pd = 3000;
+    return 0; } // STATUS_SUCCESS
 MSABI static int s_D3DKMTCloseAdapter(void* p){ (void)p; return 0; }
 MSABI static int s_D3DKMTOpenAdapterFromLuid(void* p){ if(p) *(u32*)p=0x21; return 0; } // fill hAdapter
 // --- nvapi shim (S5c): the host resolves NvAPI_* via nvapi_QueryInterface(id). First pass:
