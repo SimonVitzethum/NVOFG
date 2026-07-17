@@ -824,3 +824,348 @@ lets §16's hybrid (NGX + open + native) sit behind one clean API.
 As before: **no implementation change now.** These are guardrails so that when the RenderFX
 project is eventually built, its capability/dispatch layer is right the first time and
 nvofg slots in as a backend unchanged.
+
+---
+
+## 19. NGX (DLSS SR/DLAA/RR) init on Linux — the `/usr/share/nvidia/ngx` write trap
+
+**Relevant to RenderFX's NGX backend (§16), not to nvofg's OFA core** (nvofg uses only
+`VK_NV_optical_flow` and needs none of this). Documented here because it blocks any NGX
+feature init on a stock Linux install and the fix is non-obvious.
+
+### Symptom
+`NVSDK_NGX_VULKAN_Init*` fails with **`0xBAD00005`** (`NVSDK_NGX_Result_FAIL_InvalidParameter`).
+The real cause is that NGX tries to create/write its model + CUBIN cache under the
+**root-owned** `/usr/share/nvidia/ngx/` and gets *permission denied* (it needs root to
+create that directory). Observed on driver **610**.
+
+### What does NOT work (driver 610)
+None of the commonly-cited redirects steer NGX off `/usr/share/nvidia/ngx` on this driver:
+- `nvidia-ngx-conf.json` with `ngx_models_path`
+- `__NGX_DISABLE_UPDATER`
+- `NGX_CUBIN_DISABLE_RESOURCE_CACHE`
+
+Don't rely on them; they silently no-op and init still fails.
+
+### The fix — pass a WRITABLE application-data path to NGX init
+`NVSDK_NGX_VULKAN_Init_with_ProjectID(...)` takes an **`InApplicationDataPath`**
+(`wchar_t*`, UTF-32/4-byte on Linux). Point it at a directory the process **can write**
+(a per-user cache dir, or a writable dir next to the DLSS feature snippets). NGX then
+writes its logs **and its cubin/model cache into that directory**, so it never touches
+`/usr/share/nvidia/ngx` and init succeeds — no root, no system-dir writes.
+
+Do it in **both** places NGX reads a path from (belt and braces):
+1. the legacy `InApplicationDataPath` argument, and
+2. the modern `NVSDK_NGX_FeatureCommonInfo.PathListInfo` (the snippet/search path list).
+
+Reference implementation (RustMineClient, `crates/renderer/src/ngx.rs::init`) — the exact
+call that made DLSS SR/DLAA/RR init succeed on driver 610 despite the root-owned system
+dir:
+
+```c
+// app_data_path = a WRITABLE dir (RMC uses its vendored vendor/dlss/... dir; a
+// per-user ~/.cache/<app>/ngx works equally). UTF-32, null-terminated on Linux.
+const wchar_t* app_data_path = L"/writable/dir";           // must be writable!
+NVSDK_NGX_FeatureCommonInfo fci = {0};
+const wchar_t* paths[1] = { app_data_path };
+fci.PathListInfo.Path   = paths;                            // (2) modern path list
+fci.PathListInfo.Length = 1;
+fci.LoggingInfo = /* your callback */;
+
+NVSDK_NGX_VULKAN_Init_with_ProjectID(
+    project_id, NVSDK_NGX_ENGINE_TYPE_CUSTOM, engine_ver,
+    app_data_path,                                          // (1) legacy data path
+    instance, physicalDevice, device, gipa, gdpa,
+    &fci, NVSDK_NGX_Version_API);
+```
+
+Key points:
+- The directory must **exist and be writable** before `Init` (create it, e.g.
+  `~/.cache/<app>/ngx`, `mkdir -p`).
+- Pass real `vkGetInstanceProcAddr` / `vkGetDeviceProcAddr` (a null `gipa`/`gdpa` is a
+  *separate* `0xBAD00005` cause — don't conflate the two).
+- On Linux `wchar_t` is **4 bytes**: encode the path as UTF-32, null-terminated
+  (`chars().map(|c| c as u32)` + trailing `0`), not UTF-16.
+- Unrelated but adjacent: the DLSS **feature snippets** (`libnvidia-ngx-dlss.so`,
+  `libnvidia-ngx-dlssd.so`) must be findable on the path list, else `SuperSampling.Available`
+  probes false even though `Init` succeeded.
+
+### For RenderFX
+When RenderFX wires up its NGX backend (§16), it must create a writable per-user NGX cache
+dir and feed it as above. Treat "writable ApplicationDataPath" as a hard precondition of
+NGX init on Linux, surfaced through the same graceful-degradation path as a missing OFA
+(§G6): if the dir can't be made writable, report the NGX/DLSS backend unavailable and fall
+back (nvofg FG / native rendering) rather than failing the whole pipeline.
+
+## 20. Path B — running the real Windows DLSS Frame Generation (`nvngx_dlssg.dll`) natively
+
+**Motivation.** DLSS Frame Generation (DLSS-G) — the trained NN NVIDIA ships on Windows — has
+**no native Linux runtime**. The driver (610.x) ships native ELF snippets for DLSS Super
+Resolution (`libnvidia-ngx-dlss.so`) and Ray Reconstruction (`libnvidia-ngx-dlssd.so`) but
+**not** for FG; DLSS-G exists only as a **Windows PE** at `/usr/lib/nvidia/wine/nvngx_dlssg.dll`.
+Probed on an RTX 5070 / driver 610, the native Linux NGX host returns
+`FrameGeneration.Available = 0`, `FeatureInitResult = 0xBAD00004` (`FAIL_FeatureNotSupported`),
+`needsDriver = 0` — the native NGX host **deliberately does not expose FG**. "Path B" asks:
+can a *native* Linux Vulkan process load and drive that Windows PE in-process, **without**
+running the whole app under Proton/Wine?
+
+### 20.1 Verdict — infeasible in practice (documented, not pursued)
+
+Not strictly impossible, but effort is **XL** and the endpoint is *re-hosting most of Proton's
+graphics stack in-process*, unsupported and legally exposed. The PE loader is the easy part and
+misleads on total cost. **Single biggest blocker:** `nvngx_dlssg.dll` is not a self-contained
+compute kernel — it is a Streamline/NGX component that expects to sit behind a **D3D12 device +
+DXGI/Vulkan swapchain whose `vkQueuePresentKHR`/`vkAcquireNextImageKHR` it intercepts**, and it
+**hard-requires NVIDIA Reflex** (`VK_NV_low_latency2`) present-metering to pace generated frames.
+Satisfying that natively means standing up, in-process, exactly the Windows-PE shims Proton
+provides — a Win32 surface, a D3D12 impl (= vkd3d-proton), NVIDIA's Windows NGX host
+(`nvngx.dll`/`_nvngx.dll`), and dxvk-nvapi's Reflex plumbing. That is "build a single-DLL Wine",
+which defeats the no-Wine mandate in spirit.
+
+### 20.2 How DLSS-G runs on Linux today (the Proton chain)
+
+PE = Windows PE running in Wine's address space; native = ELF `.so` in the NVIDIA Linux driver:
+
+1. **Game `.exe` (PE)** — Wine's PE loader. FG integrated via **NVIDIA Streamline** (`sl.dlss_g`)
+   or directly via NvAPI + NGX SDK.
+2. **dxvk-nvapi (`nvapi64.dll`, PE)** — does *not* implement FG; forwards D3D12 DLSS/FG calls
+   into vkd3d-proton and provides Reflex entry points (D3D12 via vkd3d-proton ≥ 2.12, or the
+   native Vulkan layer `libdxvk_nvapi_vkreflex_layer.so` over `VK_NV_low_latency2`, R550+).
+3. **NVIDIA NGX host (`nvngx.dll` + `_nvngx.dll`, PE)** — NVIDIA's Windows NGX runtime at
+   `/usr/lib/nvidia/wine/`; performs the feature handshake and loads the FG snippet.
+4. **`nvngx_dlssg.dll` (PE)** — the actual FG implementation; drives the OFA via
+   `VK_NV_optical_flow` + compute, and manages generated-frame present via the hooked swapchain.
+5. **vkd3d-proton** — provides the D3D12 device/queue/resources the FG code binds to → Vulkan.
+6. **Native driver core** — `libnvidia-ngx.so`, the Vulkan driver implementing
+   `VK_NV_optical_flow` and `VK_NV_low_latency2`, and kernel present-metering for Reflex.
+
+**Structural fact:** the only native-ELF pieces are the driver, `libnvidia-ngx.so`, the Reflex
+Vulkan layer, and vkd3d-proton's translation. **DLSS-G proper — the NGX host and the FG snippet —
+is Windows PE.** (For DLSS *SR* the driver ships a native ELF snippet, which is why SR/RR work
+natively and FG does not.)
+
+### 20.3 What Path B would require (staged; difficulty S/M/L/XL)
+
+| Stage | Work | Reuse | Diff | Risk |
+|---|---|---|---|---|
+| **S1** In-process PE loader (no Wine process) | map PE, relocations, TLS/`DllMain`, resolve imports vs shims; load 2 PEs (host + snippet) | taviso/`loadlibrary` proves the mechanism (x86-64→x86-64, no FEX/box64) | **M** | low–mod |
+| **S2** Win32 shim surface | stub/emulate kernel32/UCRT/ntdll imports (heap, TLS, threads, events, module discovery); correct pthread/futex mapping (FG is multithreaded, syncs via binary semaphores); NGX host↔snippet version/signature checks | none clean (else link Wine) | **L** | moderate |
+| **S3** D3D12/DXGI surface | give the DLL an `ID3D12Device`/`ID3D12CommandQueue`/`IDXGISwapChain` it can bind + hook; even the Vulkan FG path routes device/resources through the Streamline swapchain wrapper | vkd3d-proton — but it's authored as Win32 PE DLLs, not a native lib with a stable COM surface | **XL** | **very high** |
+| **S4** Reflex / present-metering | implement the full Reflex marker protocol (`eReflexMarkerPresentStart/End`) over `VK_NV_low_latency2` so FG can meter real vs. generated frames | native `VK_NV_low_latency2`; dxvk-nvapi shows the pattern | **L** | high |
+| **S5** NGX host + FG snippet handshake | make the **Windows** `nvngx.dll` host init and return success for `FrameGeneration` (the native host returns `0xBAD00004`); undocumented, versioned host↔snippet interface | the NVIDIA Windows PEs (PE only) | **XL** | **very high** |
+| **S6** Feed it our Vulkan frame + backbuffer | hand FG color/depth/MV + a backbuffer it can present; cede present control to a DLL that wants to own the swapchain | our nvofg inputs | **L** | high |
+
+**Cumulative:** S1 is small; the project is dominated by S3 + S5 (both XL — essentially "re-host
+Proton's D3D12/NGX stack in-process"). You would ship vkd3d-proton + a Win32 shim + NVIDIA's
+Windows NGX PEs inside a "native" process — a bespoke mini-Wine.
+
+### 20.4 Blockers, ranked
+
+1. **D3D12 device + swapchain-interception contract (S3)** — reproducing it without Wine ≈
+   reproducing vkd3d-proton + Wine COM. *Biggest blocker.*
+2. **NGX host exposes FG only via the Windows PE (S5)** — native host returns `0xBAD00004`; the
+   only host that loads the snippet is the Windows `nvngx.dll`, which itself needs S2/S3.
+3. **Mandatory Reflex present-metering (S4)** — FG won't pace without correct markers; timing is
+   fragile even inside the fully-supported Proton path.
+4. **Win32 shim volume (S2)** — individually easy, collectively converges on "be Wine".
+5. **Legal exposure (§20.6).**
+
+### 20.5 Sanctioned / native alternatives & roadmap signals
+
+- **No native Linux DLSS-G today.** Streamline `sl.dlss_g` is Windows-only, shipped as prebuilt
+  signed DLLs (not buildable from source); the DLSS-G guide lists Windows-only requirements.
+- `nvpro-samples/vk_streamline` shows Reflex + DLSS SR + DLSS-G in Vulkan, but is Windows-oriented
+  and inherits Streamline's Windows-only FG plugin; the sole Linux question on its tracker got no
+  NVIDIA answer.
+- **Native primitives DO exist on Linux:** `VK_NV_optical_flow` (OFA, Ampere+) and
+  `VK_NV_low_latency2`/Reflex (R550+). So a *future native ELF FG snippet* is technically
+  plausible — but there is **no public signal** NVIDIA plans one.
+- **NVK/Mesa** gained experimental DLSS **SR** by importing CuBIN kernels via
+  `VK_NVX_binary_import` — evidence that native snippet execution (not PE loading) is the
+  sanctioned direction; it does **not** provide an FG route.
+
+**Roadmap read:** the credible native path is "NVIDIA ships a native ELF DLSS-G snippet exposed by
+the native NGX host", not "we load the Windows PE". Track driver release notes for a
+`libnvidia-ngx-dlssg.so` and for `FrameGeneration` no longer returning `0xBAD00004`; file a
+native-Linux DLSS-G request with NVIDIA.
+
+### 20.6 Legal note
+
+`nvngx_dlssg.dll` is governed by NVIDIA's RTX/DLSS SDK EULA + driver license: licensed for use on
+NVIDIA GPUs, **may not be distributed stand-alone / without substantial value-add**, with
+pre-release notification obligations. The file at `/usr/lib/nvidia/wine/` is distributed **for the
+driver's Wine/Proton runtime**; loading it from a bespoke non-Proton in-process loader is a use
+NVIDIA does not contemplate or document, and redistributing it with the app is very likely outside
+the grant (cf. NVIDIA's strictness over NGX DLL redistribution, e.g. the Blender DLSS friction).
+**Gray-to-red area — any shipping Path-B product needs explicit written clearance from NVIDIA.**
+*Not legal advice.*
+
+### 20.7 Decision
+
+**Path B is documented and rejected for production.** It is XL, unsupported, undocumented, and
+legally exposed, and it contradicts the native-no-Wine mandate in spirit even if the app's own
+frame loop stays ELF. Frame generation on Linux stays **native** — nvofg (OFA + warp today),
+with the quality gap to DLSS-G closed by a **native learned interpolator we train ourselves**
+(§21, the `NVOFG_INTERP_CNN` path over `VK_KHR_cooperative_matrix`), not by hosting NVIDIA's
+Windows DLL. Revisit only if NVIDIA ships a native ELF FG snippet.
+
+*If empirical certainty on S1/S2 is ever wanted:* `objdump -p /usr/lib/nvidia/wine/nvngx_dlssg.dll`
+(or `winedump`) to enumerate the real import table, and test whether the Windows `nvngx.dll` host
+enforces a signature/driver check that rejects a non-Wine environment. Neither changes the S3/S5
+verdict.
+
+## 21. Training our own frame-generation model — what it would take
+
+Path B (§20) is a dead end; the native way to close the quality gap to DLSS-G is to **train
+our own learned interpolator** and run it on-device (`NVOFG_INTERP_CNN` over
+`VK_KHR_cooperative_matrix`). The decisive insight: **we already have the expensive inputs**
+(OFA optical flow via `VK_NV_optical_flow`, engine motion vectors, depth, reactive/UI masks),
+so our model does **not** have to *estimate* motion — which is exactly what makes pure-RGB
+video-frame-interpolation (VFI) nets big and slow. That collapses the model into the tiny,
+real-time "rendering-aware" regime.
+
+### 21.1 Honest verdict
+
+An independent team can realistically reach **"very good — visibly better than classical warp,
+close to DLSS-G on most scenes"**, *not* a guaranteed pixel-match of DLSS-G. The hard part
+(dense motion) is done by the OFA in hardware; our network only does **synthesis + disocclusion
+inpainting + ghosting/shading correction**, which is a small, well-understood net (0.4–1.1M
+params in the literature). Matching DLSS-G's last-10% polish (proprietary training at scale, and
+DLSS 4's transformer) is the genuinely hard part — but 80–95% of the perceived quality is
+reachable natively and legally.
+
+### 21.2 Interpolation vs extrapolation — the latency decision
+
+| | Interpolation (DLSS 3 FG, FSR 3 FG) | Extrapolation (ExtraNet, GFFE, Intel ExtraSS) |
+|---|---|---|
+| Uses | prev **and** curr frame → in-between | only **past** frames → predict future |
+| Latency | **+~1 source-frame (~10 ms @60fps)**; must hold the newest frame back; needs Reflex/Anti-Lag to claw back | **no added latency** (nothing held back) |
+| Disocclusion | easier — the future frame usually *reveals* what was hidden | harder — must hallucinate newly-revealed regions |
+| Quality | cleaner | artifact-prone in disoccluded/shadow/reflection regions |
+
+DLSS-G itself is **interpolation** — but it only survives the latency hit because NVIDIA pairs it
+with **hardware flip-metering + Reflex** pacing, which we do **not** have on Linux. Tellingly, the
+entire *game* frame-generation research lineage — **ExtraNet** (NVIDIA/UCSB), **ExtraSS** (Intel),
+**GFFE** (Intel) — is **extrapolation**, chosen specifically to avoid the hold-back latency. So the
+recommendation is a **shared backbone with both modes**, shipping **extrapolation as the primary
+game path**:
+- **v1 = extrapolation** (predict next frame from past frames + MV/OFA): **no added latency**, no
+  dependence on flip-metering, and it is exactly the ExtraNet/ExtraSS/GFFE design point that hits
+  the real-time budget. The cost is harder disocclusion (no future frame) — mitigated by our depth +
+  occlusion masks + G-buffer-guided hole-filling.
+- **interpolation mode (quality/offline fallback)** reuses nvofg's *existing* bidirectional OFA flow
+  (prev↔curr) and gives cleaner disocclusion; pair with `VK_NV_low_latency2` (Reflex, native on
+  Linux R550+) for pacing. Good for cutscenes / latency-insensitive use.
+
+### 21.3 Why engine inputs make the model 10–50× smaller (the key lever)
+
+Pure-RGB VFI must learn optical flow, which dominates its size and cost. Rendering-aware nets get
+motion **analytically** from MVs/OFA and shrink dramatically. Measured references:
+
+| Model | Class | Params | Inference | Notes |
+|---|---|---|---|---|
+| RIFE | RGB VFI (efficient end) | 9.8M | ~31 ms @720p | IFNet flow estimator is the bulk |
+| FILM | RGB VFI, large motion | ~tens of M | 0.39 s @720p | feature pyramid + flow + fusion U-Net |
+| DAIN / CAIN | RGB VFI | 24–43M | 40–436 ms | |
+| (standalone flow) RAFT / PWC-Net | flow only | 5.3M / 8.8M | — | this is the cost we *avoid* |
+| **ExtraNet** | game extrapolation | **~1.1M** | 30.7 ms → **17.2 ms (TensorRT)** @1080p | G-buffer + reliable MVs, gated convs |
+| **STSSNet / STSS** | game SS+extrapolation | **0.4M (417K)** | **4.4 ms** @1080p (1.8 ms TensorRT) | MV+depth, no learned flow |
+| GFFE | G-buffer-free extrapolation | (n/r) | 6.6 ms @1080p (RTX 4070Ti S) | heuristic motion, not a heavy flow net |
+| PatchEX | patch extrapolation | (n/r) | ~2.14 ms @1080p | |
+
+*Sources:* RIFE ([arXiv 2011.06294](https://arxiv.org/abs/2011.06294)), FILM ([arXiv 2202.04901](https://arxiv.org/abs/2202.04901)),
+STSS ([arXiv 2312.10890](https://arxiv.org/html/2312.10890v1)), ExtraNet
+([SIGGRAPH Asia 2021](https://dl.acm.org/doi/10.1145/3478513.3480531), [code](https://github.com/fuxihao66/ExtraNet)),
+GFFE ([arXiv 2406.18551](https://arxiv.org/abs/2406.18551)), ExtraSS
+([SIGGRAPH Asia 2023](https://dl.acm.org/doi/fullHtml/10.1145/3610548.3618224)), PatchEX ([arXiv 2407.17501](https://arxiv.org/pdf/2407.17501)).
+
+**We supply MV + depth + OFA flow + masks → we live in the 0.4–1.1M-param, 2–20 ms regime, not the
+10–40M-param VFI regime.** That is the whole reason this is tractable natively.
+
+### 21.4 Recommended architecture
+
+A small **rendering-aware forward-warp + fusion network** (SoftSplat / ExtraNet / ExtraSS lineage) —
+**~0.26–1.0M params** (ExtraNet is **~262K params** computed from its released weights):
+- **Warp stage (no learned flow):** forward-warp prev frame(s) to the target phase via **softmax
+  splatting** (Niklaus & Liu, CVPR 2020, [arXiv 2003.05534](https://arxiv.org/abs/2003.05534)) using
+  our *given* OFA flow / MVs, resolving many-to-one collisions with **depth** as the splat weight.
+  This is the key departure from RIFE/IFRNet, which spend most parameters *estimating* flow.
+- **Inputs to the fusion net:** the warped color(s), forward+backward flow, occlusion/confidence
+  (already produced by nvofg's REFINE stage), depth, engine motion vectors, the **OFA-vs-MV
+  disagreement** map, a **disocclusion mask** (from fwd/bwd MV consistency), and the **reactive + UI
+  masks** (never synthesize HUD/particles from geometry motion).
+- **Backbone:** lightweight encoder–decoder with **gated convolutions** (ExtraNet: 11 lightweight
+  gated-conv encoder layers + 7 conv decoder layers, plus a weight-shared **history encoder** for
+  moving shadows/reflections MVs miss); skip connections; a **residual add** of the warped RGB
+  stabilises training; output = the generated color that corrects ghosting and fills disocclusion
+  holes the classical warp leaves.
+- **Why both OFA flow and engine MVs (like DLSS-G):** MVs describe only *geometry* motion; the OFA
+  captures *pixel* motion MVs miss — particles, reflections, shadows, lighting. DLSS-G's autoencoder
+  fuses exactly these four (prev, curr, OFA flow, MV+depth); we mirror that fusion.
+  ([NVIDIA DLSS 3](https://www.nvidia.com/en-us/geforce/news/dlss3-ai-powered-neural-graphics-innovations/))
+- This is a **drop-in for `NVOFG_INTERP_CNN`**: it replaces the WARP stage's hand-tuned blend with a
+  learned one; everything upstream (OFA execute, refine, masks) is unchanged.
+
+### 21.5 Training data plan
+
+- **Rendering-aware GT (primary):** render engine sequences at **2× the target frame rate** so every
+  other frame is the ground-truth "in-between"; capture the **aux buffers per frame** (color, MV,
+  depth, HUD/UI mask, reactive mask). For this project's consumer (RMC/Minecraft, handled by the
+  other agent) that means an offline capture harness dumping color+MV+depth+mask sequences. Aim for
+  tens of thousands of frame-triplets across varied motion (camera pans, fast entities, transparency).
+- **Public VFI pretraining (bootstrap):** **Vimeo-90K** (~73k septuplets), **X4K1000FPS** (4K, extreme
+  motion), **ATD-12K** (animation) — pretrain the synthesis net, then fine-tune on rendered data with
+  real MV/depth. Public data lacks aux buffers, so it only warm-starts the RGB synthesis.
+- Resolution: train at 540p–1080p crops; the net is resolution-independent (fully convolutional).
+
+### 21.6 Losses
+
+Charbonnier/L1 reconstruction **+ LPIPS/VGG perceptual** (sharpness) **+ census/warping loss**
+(flow consistency) **+ light adversarial (GAN)** for micro-detail **+ temporal-stability loss**
+(penalize flicker across consecutive generated frames). UI/reactive regions are **masked out** of
+all losses — the model must not learn to interpolate HUD. Disocclusion regions get up-weighted
+(that is where classical warp fails and where the perceived quality lives).
+
+### 21.7 Training compute & real-time inference budget
+
+- **Training:** models this small (0.4–1.1M params) train on a **single RTX 5070** in **days, not
+  weeks** — order **10²–10³ GPU-hours** for a competitive v1 (RIFE-class nets were trained at
+  single-GPU/small-cluster scale). No large cluster required for v1.
+- **Inference target: <2–3 ms @1080p.** STSSNet already hits 4.4 ms naïve / **1.8 ms with TensorRT**
+  at 1080p on an RTX 3090; on Blackwell (RTX 5070) with fp16 and **`VK_KHR_cooperative_matrix`**
+  (Tensor Cores — our `src/spike/cuda_tensor.cu` / `cuda_vk_interop.cu` WMMA spikes prove the path),
+  <2 ms is realistic. **Quantization headroom is large:** QW-Net (NVIDIA, SIGGRAPH Asia 2020) runs
+  **~95% of a reconstruction net's compute in INT4** with quality above TAA — so INT8/INT4 coopmat
+  paths are on the table for v2. ([QW-Net](https://dl.acm.org/doi/10.1145/3414685.3417786))
+
+### 21.8 Staged roadmap
+
+- **v0 — data + harness** (~2–4 weeks): a UE5/Unity capture pipeline rendering at 2× fps for GT
+  intermediate frames + aux buffers (color pre/post-UI, MV, depth, UI/reactive masks); the offline
+  PyTorch training harness; softmax-splat + disocclusion-mask reference ops. Deliverable: ~20k+ GT
+  tuples across 5–10 scenes.
+- **v1 — "beat the classical warp"** (~2–3 person-months, 1–2 eng): ~0.26–1M-param splat+fusion net,
+  **extrapolation-first** (no latency). Pretrain on Vimeo-90K; fine-tune on rendered MV/depth/mask
+  data. Losses: Charbonnier + census + VGG. Export fp16, run on `VK_KHR_cooperative_matrix`; target
+  **<2–3 ms @1080p** (anchor: ExtraNet ~262K params, 8 ms@720p / 15.8 ms@1080p naïve TensorRT-fp16 on
+  an RTX 3090; ExtraSS "Ours-ESS" **4.1 ms** at 540p→1080p; Blackwell + coopmat is faster).
+  **Success bar:** visibly fewer disocclusion holes + less ghosting than the current warp, stable UI.
+  High-confidence outcome (low bar, strong inputs). Effort: **L–XL** (data harness + training +
+  coopmat inference kernel — the real work item).
+- **v2 — "DLSS-G-adjacent"** (~9–18 person-months, 2–3 eng): add temporal-stability loss over
+  sequences, FILM Gram + light GAN for sharpness, OFA-vs-MV handling for transparencies/shadows,
+  **INT8/INT4 quantization** (QW-Net runs **~95% of a reconstruction net in INT4** above TAA quality —
+  [SIGGRAPH Asia 2020](https://dl.acm.org/doi/10.1145/3414685.3417786)), per-title fine-tuning, and an
+  **interpolation mode** with `VK_NV_low_latency2` pacing. **Goal: FSR3-competitive, DLSS-G-adjacent
+  on most scenes** — honest residual gaps in fast disocclusion, transparencies/particles, and
+  end-to-end latency (no flip-metering hardware). Effort: **XL**.
+
+### 21.9 Bottom line
+
+Because the OFA already provides the motion the big VFI nets spend their parameters estimating, a
+**native, legal, on-device learned interpolator in the 0.4–1M-param / <3 ms class is the right way
+to approach DLSS-G quality on Linux** — not hosting NVIDIA's Windows DLL. v1 is a concrete,
+single-GPU-trainable milestone that slots into the reserved `NVOFG_INTERP_CNN` interpolator with no
+public API change. Uncertainties to keep honest: DLSS-G's and QW-Net's exact params/ms are
+unpublished (figures above are from comparable open academic nets), and matching DLSS 4's
+transformer-grade polish is a stretch goal, not a v1 promise.
