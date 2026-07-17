@@ -565,6 +565,29 @@ one-value changes (module path; OS version), the same shape as the LUID and DRS 
 **Next phase (separate, multi-stage):** `Init_ProjectID` → `CreateFeature(FG)` (wants model weights +
 the CUDA/Vulkan-interop `EvaluateFeature` float-ABI path) → present/pacing (`VK_NV_low_latency2`).
 
+## S6 — entering the functional phase: Init crash localized (2026-07-17)
+
+With the capability phase byte-identical to Proton, ran the full
+`NVSDK_NGX_VULKAN_Init_ProjectID` (`RUN_INIT=1`). Signature verified against the SDK header (11 args,
+correctly mapped — no ABI misalignment). It **SIGSEGVs at `_nvngx+0xceee`** (`movzbl (%rcx),%eax`).
+
+Traced (gdb, following the child): the fault is inside helper `0x18000ce40`, called by
+`Init_ProjectID` at `0x18000d75b`. `0xce40` sets `rbp = rsp-7` (deliberately unaligned) and does a
+**versioned struct copy** — it reads a count/length into `esi` and a struct pointer into `r10` from
+its stack args, then copies fields `r10[0], r10[8], r10[0x10]…` gated on `esi >= 0x13/0x14`, and
+dereferences `rcx = r10[0x10]` at `0xceee`. At the fault: `r10 = 0x55555555d740` (valid heap),
+`rcx = 0x7c290f2434290f00` (garbage/ASCII), `esi = 0x5555d5d0` (looks like a pointer low-32, not a
+small version). So `0xce40` is interpreting one of its inputs as a length when it is actually
+pointer-ish data. `0xce40` is a **multi-call helper** (hit many times before the crashing
+invocation), so isolating the exact bad call + back-tracing the garbage value's origin is real work.
+
+**This is the boundary of the functional phase.** Init/CreateFeature/EvaluateFeature is a distinct,
+larger undertaking than the capability query: NGX-internal param/struct setup (this crash), model
+weight loading, the CUDA↔Vulkan interop path, the `EvaluateFeature` float/SSE-ABI thunk (our
+`ms2sysv` handles INTEGER-class only), and present/pacing (`VK_NV_low_latency2`). Each is likely the
+same one-value-fix shape, but there will be many, and the Init struct internals need per-invocation
+gdb isolation rather than a single boundary diff. Checkpointed here for a scope decision.
+
 ## Legal
 
 `nvngx_dlssg.dll` is NVIDIA-licensed and shipped for the driver's Wine/Proton runtime. This

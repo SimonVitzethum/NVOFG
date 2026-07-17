@@ -6,3 +6,4 @@ ngxfg_result.txt
 pe_load
 pe_probe
 s5_host
+*.gdb
