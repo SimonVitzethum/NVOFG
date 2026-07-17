@@ -1000,19 +1000,40 @@ the grant (cf. NVIDIA's strictness over NGX DLL redistribution, e.g. the Blender
 **Gray-to-red area — any shipping Path-B product needs explicit written clearance from NVIDIA.**
 *Not legal advice.*
 
-### 20.7 Decision
+### 20.7 Decision — pursue B as a staged, empirically-gated experiment
 
-**Path B is documented and rejected for production.** It is XL, unsupported, undocumented, and
-legally exposed, and it contradicts the native-no-Wine mandate in spirit even if the app's own
-frame loop stays ELF. Frame generation on Linux stays **native** — nvofg (OFA + warp today),
-with the quality gap to DLSS-G closed by a **native learned interpolator we train ourselves**
-(§21, the `NVOFG_INTERP_CNN` path over `VK_KHR_cooperative_matrix`), not by hosting NVIDIA's
-Windows DLL. Revisit only if NVIDIA ships a native ELF FG snippet.
+**Revised (2026-07-17).** The original recommendation was to reject Path B. Reconsidered for one
+strong reason: **Path B scales to future DLSS FG versions for free** — a newer `nvngx_dlssg.dll`
+drops in with no retraining — whereas an own model (§21) must be re-trained to keep pace. Decision:
+**pursue B as a staged experiment** under `experiments/dlssg-native/`, each stage gated by an
+empirical result, stopping the moment a stage proves a hard blocker; keep the **own model (§21) as
+the parallel fallback** (a 5080 server for ~100–200 h makes it practical). See ADR 0008. The
+empirical S0/S1 results below **materially improve** the outlook and are the reason to continue.
 
-*If empirical certainty on S1/S2 is ever wanted:* `objdump -p /usr/lib/nvidia/wine/nvngx_dlssg.dll`
-(or `winedump`) to enumerate the real import table, and test whether the Windows `nvngx.dll` host
-enforces a signature/driver check that rejects a non-Wine environment. Neither changes the S3/S5
-verdict.
+### 20.8 Empirical findings (S0 recon + S1 native map/relocate)
+
+The original §20.3 assumed the snippet dragged in D3D12/DXGI/COM (→ XL "re-host Proton"). Dumping
+the real driver DLLs **disproves that for the snippet**:
+
+- **`nvngx_dlssg.dll` (9.29 MB) imports only Vulkan (22) + CUDA (26) + MSVC-CRT (KERNEL32 143) + 7
+  trivial Win32** (VERSION 3 / ADVAPI32 3 registry-reads / USER32 1). **No D3D12, no DXGI, no COM.**
+  It is a **CUDA + Vulkan compute module wrapped in the MSVC C runtime** — the NN runs on CUDA,
+  sharing memory/semaphores with Vulkan via external-memory/semaphore interop
+  (`cuImportExternalMemory`, `cuImportExternalSemaphore`, `cuSignal/WaitExternalSemaphoresAsync`).
+- The nasty surface (CRYPT32/bcrypt crypto, WS2_32 winsock, ole32 COM, SHELL32) lives **only in the
+  host `_nvngx.dll`**, not the snippet.
+- **`experiments/dlssg-native/pe_probe.c`** maps + relocates the PE natively (3770 relocations) and
+  **resolves all 48 Vulkan+CUDA imports against native `libvulkan.so.1` / `libcuda.so.1`** (22/22 +
+  26/26). The only remainder to *load* the snippet is **150 standard MSVC-CRT symbols + a PE-aware
+  CRT/SEH init** — a bounded, reusable shim (Wine `ucrtbase`/`kernel32`, or taviso/loadlibrary).
+
+**Re-scoped stages:** S1 (map/relocate/native-import) **done**. S2 (CRT shim + `DllMain`) is now
+**M, not L**. S3 (D3D12/DXGI) is **likely not needed for the snippet** (it's Vulkan-native). The
+**crux moves to S5** — the host↔snippet handshake: either load the Windows host PEs (`_nvngx.dll`
+crypto/COM/winsock) or drive the snippet from a **minimal custom host** (undocumented interface).
+S5 + S4 (Reflex pacing) are where Path B still may die; the experiment stops there if it blocks.
+
+*(Working log + probe in `experiments/dlssg-native/RECON.md`.)*
 
 ## 21. Training our own frame-generation model — what it would take
 
