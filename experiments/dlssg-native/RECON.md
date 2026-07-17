@@ -112,17 +112,35 @@ reachable.** During the host's DllMain it probes Windows API-set DLLs (`api-ms-w
 `…-fibers…`) via `LoadLibrary`; we return not-found and it falls back to kernel32 (DllMain still
 returns 1). The host also exports the same API as the thin forwarder `nvngx.dll`.
 
-### S5/S6 — what remains to actually generate a frame
+### S5(b) — `NVSDK_NGX_VULKAN_Init_ProjectID` RUNS natively; only the nvapi bridge is missing (DONE)
 
-1. **Call `NVSDK_NGX_VULKAN_Init_ProjectID` + `CreateFeature(FrameGeneration)`** with a *live*
-   `VkInstance`/`VkDevice`. This needs the **ms_abi→SysV thunks** for the 22 Vulkan + 26 CUDA imports
-   the host/snippet call (S1 found the symbols; they must be called MS-x64).
-2. **GPU-arch bridge:** `_nvngx.dll` strings show it needs **nvapi/nvml** to identify the GPU
-   ("GPUArchitecture == Unknown. Need … nvapi … nvml"). During `Init` (not DllMain) it will
-   `LoadLibrary("nvapi64.dll")`/`nvml` — we must bridge those to native `libnvidia-ml.so` / a minimal
-   nvapi shim (this is the dxvk-nvapi role). **This is the next real dependency and possible blocker.**
-3. **S6:** feed our render frame to the snippet via the CUDA-Vulkan external-memory/semaphore interop
-   it imports; **S4:** Reflex present-metering (`VK_NV_low_latency2`, native on Linux).
+`s5_host.c` now creates a live `VkInstance`/`VkDevice`, wires the **generic MS-x64→SysV ABI thunk**
+(`ms2sysv_common`) for the 22 Vulkan + 26 CUDA imports (all ≤6 int/ptr args → register+2-stack
+shuffle), passes **ms_abi `gipa`/`gdpa` wrappers**, and calls `NVSDK_NGX_VULKAN_Init_ProjectID` on
+the natively-loaded host. Result:
+
+```
+[calling NVSDK_NGX_VULKAN_Init_ProjectID ...]
+  ... registry reads, VerifyVersionInfo, GetSystemDirectoryW ...
+  [LoadLibrary] msasn1/cryptnet/cryptbase/wldp/drvstore/devobj.dll  (tolerated, not found)
+  [LoadLibrary] nvapi64.dll        -> not found
+  [STUB] dyn:nvapi_QueryInterface  -> 0
+  [LoadLibrary] vulkan-1.dll ; [STUB] dyn:vkGetInstanceProcAddr
+  [NGX Init returned 0xBAD00002]           # FAIL_PlatformError
+```
+
+**Init runs to completion through NGX's real init logic and returns a clean, well-defined NGX error
+— no crash, no ABI mismatch.** It fails at `0xBAD00002` (`FAIL_PlatformError`) purely because
+**`nvapi64.dll` is not bridged**, so the host can't identify the GPU architecture. Everything else —
+the PE loader, the MS-x64 CRT shim, the TEB/gs, the ms_abi↔SysV Vulkan/CUDA thunks, the ms_abi
+gipa/gdpa — works end-to-end. This retires the "internal host↔snippet ABI" fear: the app talks to
+the host via the **documented `NVSDK_NGX_VULKAN_*` API**, and the host loads the snippet itself.
+
+**The single remaining dependency to a successful `Init` is an nvapi shim** (the dxvk-nvapi role):
+implement enough of `nvapi_QueryInterface` + the `NvAPI_*` GPU-architecture queries, bridged to the
+native driver (`libnvidia-ml.so` / `libcuda`), that the host classifies the RTX 5070 as Blackwell.
+Then `CreateFeature(FrameGeneration)` loads the snippet, and S6 (feed our frame via the snippet's
+CUDA-Vulkan external-memory/semaphore interop) + S4 (Reflex `VK_NV_low_latency2` pacing) follow.
 
 ## Remaining stages (design.md §20.3, re-scoped by the recon)
 

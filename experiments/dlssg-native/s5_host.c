@@ -3,13 +3,15 @@
 // loader (pe_load.c) into a multi-PE loader with a module registry + real
 // LoadLibrary/GetProcAddress + export-table parsing, so the host can pull its siblings.
 //
-// Goal this stage: prove the Windows NGX host loads + inits natively (DllMain), expose
-// its NVSDK_NGX exports, and observe what it dynamically requests during init (expected:
-// nvapi/nvml for GPU-arch detection — the next S5 dependency). We do NOT yet call NGX
-// Init (that needs a live VkDevice + a driver bridge). Runs in a forked child under a
-// SIGSEGV guard; loads the on-disk driver DLLs in place (never vendored).
+// Result: the Windows NGX host loads + inits natively (DllMain->1), its NVSDK_NGX_VULKAN
+// API resolves, and NVSDK_NGX_VULKAN_Init_ProjectID — called here with a live VkInstance/
+// VkDevice + ms_abi->SysV Vulkan/CUDA thunks + ms_abi gipa/gdpa — RUNS to completion and
+// returns a clean NGX code 0xBAD00002 (FAIL_PlatformError): it reached GPU-arch detection
+// and failed only because nvapi64.dll is not yet bridged. No crash, no ABI issue. The sole
+// remaining dependency for a successful Init is an nvapi shim (the dxvk-nvapi role).
+// Runs in a forked child under a SIGSEGV guard; loads the on-disk driver DLLs in place.
 //
-// Build: gcc -O2 -o s5_host s5_host.c -ldl   Run: ./s5_host
+// Build: gcc -O2 -o s5_host s5_host.c -ldl -lvulkan   Run: ./s5_host
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -25,6 +27,27 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <vulkan/vulkan.h>
+
+// Generic Microsoft-x64 -> System-V ABI thunk: the PE calls its Vulkan/CUDA imports
+// MS-x64 (rcx,rdx,r8,r9 + shadow); native libvulkan/libcuda are SysV (rdi,rsi,rdx,rcx,
+// r8,r9). All imported entry points take <=6 integer/pointer args (no float args), so a
+// register+2-stack shuffle suffices. Target native fn is passed in r10 by the trampoline.
+__asm__(
+".text\n.globl ms2sysv_common\nms2sysv_common:\n"
+"  push %rdi\n  push %rsi\n"
+"  mov %rcx, %rdi\n"          // sysv arg1 = ms arg1
+"  mov %rdx, %rsi\n"          // sysv arg2 = ms arg2
+"  mov %r9,  %rax\n"          // save ms arg4 before clobbering rcx
+"  mov %r8,  %rdx\n"          // sysv arg3 = ms arg3
+"  mov %rax, %rcx\n"          // sysv arg4 = ms arg4
+"  mov 0x38(%rsp), %r8\n"     // sysv arg5 = ms stack arg5
+"  mov 0x40(%rsp), %r9\n"     // sysv arg6 = ms stack arg6
+"  sub $8, %rsp\n"
+"  call *%r10\n"
+"  add $8, %rsp\n"
+"  pop %rsi\n  pop %rdi\n  ret\n");
+extern void ms2sysv_common(void);
 
 typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t u64;
 #define MSABI __attribute__((ms_abi))
@@ -88,6 +111,14 @@ MSABI static u32   s_GetEnvironmentVariableA(const char* n,void* b,u32 s){(void)
 MSABI static int s_WideCharToMultiByte(u32 cp,u32 fl,const u16* w,int wl,char* mb,int mbl,void* d,void* u){(void)cp;(void)fl;(void)d;(void)u;int i=0;if(wl<0){int n=0;while(w[n])n++;wl=n+1;}if(mbl==0)return wl;for(;i<wl&&i<mbl;i++)mb[i]=(char)(w[i]&0xFF);return i;}
 MSABI static int s_MultiByteToWideChar(u32 cp,u32 fl,const char* mb,int mbl,u16* w,int wl){(void)cp;(void)fl;int i=0;if(mbl<0){int n=0;while(mb[n])n++;mbl=n+1;}if(wl==0)return mbl;for(;i<mbl&&i<wl;i++)w[i]=(u8)mb[i];return i;}
 MSABI static int s_InitOnceExecuteOnce(void* o,void* f,void* p,void** c){(void)p;(void)c;typedef int MSABI(*t)(void*,void*,void**);if(f)((t)f)(o,p,c);return 1;}
+static u32 putw16(u16* b,u32 sz,const char* s){ u32 n=strlen(s); if(!b||sz==0) return n; u32 i=0; for(;i<n&&i<sz-1;i++) b[i]=(u8)s[i]; b[i]=0; return i; }
+MSABI static u32 s_GetSystemDirectoryW(u16* b,u32 sz){ return putw16(b,sz,"C:\\Windows\\System32"); }
+MSABI static u32 s_GetWindowsDirectoryW(u16* b,u32 sz){ return putw16(b,sz,"C:\\Windows"); }
+MSABI static u32 s_GetModuleFileNameW(void* m,u16* b,u32 sz){ (void)m; return putw16(b,sz,"C:\\game\\game.exe"); }
+MSABI static u32 s_GetModuleFileNameA(void* m,char* b,u32 sz){ (void)m; const char* s="C:\\game\\game.exe"; u32 n=strlen(s); if(!b||!sz)return n; u32 i=0; for(;i<n&&i<sz-1;i++)b[i]=s[i]; b[i]=0; return i; }
+MSABI static int s_VerifyVersionInfoW(void* a,u32 b,u64 c){ (void)a;(void)b;(void)c; return 1; }
+MSABI static u64 s_VerSetConditionMask(u64 m,u32 t,u8 c){ (void)t;(void)c; return m?m:1; }
+MSABI static u32 s_GetFullPathNameW(const u16* n,u32 sz,u16* buf,void** fp){ (void)fp; u32 i=0; if(buf)for(;n[i]&&i<sz-1;i++)buf[i]=n[i]; if(buf)buf[i]=0; return i; }
 
 // forward decls
 static void* resolve(const char* dll,const char* fn);
@@ -140,7 +171,9 @@ struct { const char* name; void* fn; } g_stubs[]={
  {"CloseHandle",s_CloseHandle},{"WaitForSingleObject",s_WaitForSingleObject},{"WaitForSingleObjectEx",s_WaitForSingleObject},
  {"SetEvent",s_ret1},{"ResetEvent",s_ret1},{"GetTickCount64",s_GetTickCount64},
  {"SetUnhandledExceptionFilter",s_ret0p},{"UnhandledExceptionFilter",s_ret1},{"RtlLookupFunctionEntry",s_ret0p},{"RtlPcToFileHeader",s_ret0p},
- {"GetModuleFileNameW",(void*)s_ret0p},
+ {"GetModuleFileNameW",s_GetModuleFileNameW},{"GetModuleFileNameA",s_GetModuleFileNameA},
+ {"GetSystemDirectoryW",s_GetSystemDirectoryW},{"GetWindowsDirectoryW",s_GetWindowsDirectoryW},
+ {"VerifyVersionInfoW",s_VerifyVersionInfoW},{"VerSetConditionMask",s_VerSetConditionMask},{"GetFullPathNameW",s_GetFullPathNameW},
  {0,0}};
 static void* g_stubs_lookup(const char* fn){ for(int i=0;g_stubs[i].name;i++) if(!strcmp(g_stubs[i].name,fn)) return g_stubs[i].fn; return 0; }
 
@@ -149,7 +182,17 @@ static void* make_trap(const char* name){ u8* p=g_code+g_codeoff,*st=p;
     *p++=0x48;*p++=0x83;*p++=0xEC;*p++=0x28; *p++=0x48;*p++=0xB9;memcpy(p,&name,8);p+=8;
     void* lg=(void*)trap_log; *p++=0x48;*p++=0xB8;memcpy(p,&lg,8);p+=8; *p++=0xFF;*p++=0xD0;
     *p++=0x48;*p++=0x83;*p++=0xC4;*p++=0x28; *p++=0xC3; g_codeoff+=(size_t)(p-st); return st; }
-static void* resolve(const char* dll,const char* fn){ void* s=g_stubs_lookup(fn); if(s)return s;
+static void* g_hvk,*g_hcu;   // native libvulkan / libcuda handles
+static void* make_ms2sysv(void* target){ if(!target) return 0; u8* p=g_code+g_codeoff,*st=p;
+    *p++=0x49;*p++=0xBA;memcpy(p,&target,8);p+=8;             // movabs r10, target
+    void* c=(void*)ms2sysv_common; *p++=0x48;*p++=0xB8;memcpy(p,&c,8);p+=8;  // movabs rax, common
+    *p++=0xFF;*p++=0xE0;                                      // jmp rax
+    g_codeoff+=(size_t)(p-st); return st; }
+static void* resolve(const char* dll,const char* fn){
+    // Vulkan/CUDA imports -> native driver via an ms_abi->SysV thunk (the PE calls MS-x64).
+    if(!strcasecmp(dll,"vulkan-1.dll")){ void* n=g_hvk?dlsym(g_hvk,fn):0; if(n) return make_ms2sysv(n); }
+    if(!strcasecmp(dll,"nvcuda.dll")){   void* n=g_hcu?dlsym(g_hcu,fn):0; if(n) return make_ms2sysv(n); }
+    void* s=g_stubs_lookup(fn); if(s)return s;
     char* nm=malloc(strlen(dll)+strlen(fn)+2); sprintf(nm,"%s:%s",dll,fn); return make_trap(nm); }
 
 static void* module_export(Module* m,const char* fn){ if(!m->exp_rva) return 0; const u8* e=m->base+m->exp_rva;
@@ -190,6 +233,29 @@ static Module* load_module(const char* name){
     return m;
 }
 
+// --- live Vulkan device (native SysV; created before gs is switched) ---
+static VkInstance g_inst; static VkPhysicalDevice g_pd; static VkDevice g_dev; static uint32_t g_qfam; static VkQueue g_queue;
+static int try_device(const char** de,uint32_t nde){ float pr=1;
+    VkDeviceQueueCreateInfo qci={.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,.queueFamilyIndex=g_qfam,.queueCount=1,.pQueuePriorities=&pr};
+    VkDeviceCreateInfo dci={.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,.queueCreateInfoCount=1,.pQueueCreateInfos=&qci,.enabledExtensionCount=nde,.ppEnabledExtensionNames=de};
+    return vkCreateDevice(g_pd,&dci,0,&g_dev)==VK_SUCCESS?0:1; }
+static int setup_vulkan(void){
+    VkApplicationInfo app={.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,.apiVersion=VK_API_VERSION_1_3};
+    const char* ie[]={"VK_KHR_get_physical_device_properties2","VK_KHR_external_memory_capabilities","VK_KHR_external_semaphore_capabilities"};
+    VkInstanceCreateInfo ici={.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,.pApplicationInfo=&app,.enabledExtensionCount=3,.ppEnabledExtensionNames=ie};
+    if(vkCreateInstance(&ici,0,&g_inst)!=VK_SUCCESS) return 1;
+    uint32_t n=0; vkEnumeratePhysicalDevices(g_inst,&n,0); VkPhysicalDevice pds[8]; if(n>8)n=8; vkEnumeratePhysicalDevices(g_inst,&n,pds);
+    for(uint32_t i=0;i<n;i++){VkPhysicalDeviceProperties p;vkGetPhysicalDeviceProperties(pds[i],&p);if(p.vendorID==0x10DE){g_pd=pds[i];break;}}
+    if(!g_pd) return 2;
+    uint32_t qn=0; vkGetPhysicalDeviceQueueFamilyProperties(g_pd,&qn,0); VkQueueFamilyProperties q[16]; if(qn>16)qn=16; vkGetPhysicalDeviceQueueFamilyProperties(g_pd,&qn,q);
+    for(uint32_t i=0;i<qn;i++) if(q[i].queueFlags&VK_QUEUE_GRAPHICS_BIT){g_qfam=i;break;}
+    const char* de[]={"VK_KHR_external_memory","VK_KHR_external_memory_fd","VK_KHR_external_semaphore","VK_KHR_external_semaphore_fd","VK_KHR_push_descriptor"};
+    if(try_device(de,5) && try_device(de,3) && try_device(0,0)) return 3;   // degrade until a device is created
+    vkGetDeviceQueue(g_dev,g_qfam,0,&g_queue); return 0; }
+// ms_abi gipa/gdpa: the host calls these MS-x64; return ms2sysv-wrapped native entry points.
+MSABI static void* my_gipa(void* inst,const char* n){ void* f=(void*)vkGetInstanceProcAddr((VkInstance)inst,n); return f?make_ms2sysv(f):0; }
+MSABI static void* my_gdpa(void* dev,const char* n){ PFN_vkGetDeviceProcAddr g=(PFN_vkGetDeviceProcAddr)vkGetInstanceProcAddr(g_inst,"vkGetDeviceProcAddr"); void* f=g?(void*)g((VkDevice)dev,n):0; return f?make_ms2sysv(f):0; }
+
 static void segv(int s,siginfo_t* si,void* u){(void)s;(void)u;char b[19]="0x0000000000000000";u64 a=(u64)si->si_addr;for(int i=0;i<16;i++){int d=(a>>((15-i)*4))&0xF;b[2+i]=d<10?'0'+d:'a'+d-10;}logs("[SIGSEGV @ ");(void)write(2,b,18);logs("]\n");_exit(42);}
 
 int main(void){
@@ -201,21 +267,27 @@ int main(void){
     if(pid==0){
         struct sigaction sa;memset(&sa,0,sizeof sa);sa.sa_sigaction=segv;sa.sa_flags=SA_SIGINFO;
         sigaction(SIGSEGV,&sa,0);sigaction(SIGILL,&sa,0);sigaction(SIGBUS,&sa,0);sigaction(SIGFPE,&sa,0);
+        // native drivers for the ms_abi->SysV import thunks
+        g_hvk=dlopen("libvulkan.so.1",RTLD_NOW|RTLD_GLOBAL); g_hcu=dlopen("libcuda.so.1",RTLD_NOW|RTLD_GLOBAL);
+        int vr=setup_vulkan();
+        { char b[96]; snprintf(b,sizeof b,"[vulkan setup rc=%d inst=%p pd=%p dev=%p]\n",vr,(void*)g_inst,(void*)g_pd,(void*)g_dev); logs(b);}
+        if(vr){ logs("[no vulkan device -> cannot call NGX Init]\n"); _exit(5); }
+        // Windows TEB on gs (see S2). Created AFTER the native Vulkan device.
         memset(g_teb,0,sizeof g_teb);memset(g_peb,0,sizeof g_peb);memset(g_tlsslots,0,sizeof g_tlsslots);
         *(void**)(g_teb+0x30)=g_teb;*(void**)(g_teb+0x58)=g_tlsslots;*(void**)(g_teb+0x60)=g_peb;
         u8* sp;__asm__("mov %%rsp,%0":"=r"(sp));*(void**)(g_teb+0x08)=sp+0x100000;*(void**)(g_teb+0x10)=sp-0x400000;
         syscall(SYS_arch_prctl,0x1001,(unsigned long)g_teb);
-        // load the NGX core host; it will LoadLibrary its siblings (logged)
+        // load the NGX core host; it LoadLibrary's its siblings (logged)
         Module* h=load_module("_nvngx.dll");
         if(!h){ logs("host load failed\n"); _exit(3); }
-        // resolve the FG-capable Vulkan API entry points to prove reachability
-        const char* apis[]={"NVSDK_NGX_VULKAN_Init","NVSDK_NGX_VULKAN_Init_ProjectID",
-            "NVSDK_NGX_VULKAN_Init_Ext2","NVSDK_NGX_VULKAN_CreateFeature","NVSDK_NGX_VULKAN_CreateFeature1",
-            "NVSDK_NGX_VULKAN_EvaluateFeature","NVSDK_NGX_VULKAN_GetFeatureRequirements",
-            "NVSDK_NGX_VULKAN_GetCapabilityParameters",0};
-        logs("\n== NGX Vulkan API exports resolved from the natively-loaded host ==\n");
-        for(int i=0;apis[i];i++){ void* f=module_export(h,apis[i]); char b[128]; snprintf(b,sizeof b,"   %-46s %s\n",apis[i],f?"FOUND":"missing"); logs(b);}
-        logs("\n== next: call Init (needs a live VkDevice + nvapi/nvml bridge) ==\n");
+        typedef int MSABI(*init_t)(const char*,int,const char*,const u16*,void*,void*,void*,void*,void*,const void*,unsigned);
+        init_t Init=(init_t)module_export(h,"NVSDK_NGX_VULKAN_Init_ProjectID");
+        if(!Init){ logs("Init_ProjectID export missing\n"); _exit(4); }
+        static u16 wpath[80]; const char* dp=WINE; int i=0; for(;dp[i]&&i<79;i++) wpath[i]=(u8)dp[i]; wpath[i]=0;  // UTF-16 (2-byte) path
+        logs("\n[calling NVSDK_NGX_VULKAN_Init_ProjectID on the natively-loaded host ...]\n");
+        int r=Init("a0b1c2d3-1234-5678-9abc-def012345678",0,"1.0",wpath,
+                   (void*)g_inst,(void*)g_pd,(void*)g_dev,(void*)my_gipa,(void*)my_gdpa,0,0x15);
+        { char b[80]; snprintf(b,sizeof b,"\n[NGX Init returned 0x%08X]\n",(unsigned)r); logs(b);}
         _exit(0);
     }
     int stx; waitpid(pid,&stx,0);

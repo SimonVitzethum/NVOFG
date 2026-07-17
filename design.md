@@ -1047,16 +1047,24 @@ generalises the loader into a **multi-PE loader** (module registry + real `LoadL
 snippet and the Windows NGX core host load + init natively on Linux, and the FG-capable API surface
 is reachable.**
 
-**What remains (S5/S6):** (1) call `Init_ProjectID` + `CreateFeature(FrameGeneration)` with a live
-`VkInstance`/`VkDevice`, which needs the **ms_abi→SysV thunks** for the 22 Vulkan + 26 CUDA imports;
-(2) the **nvapi/nvml GPU-arch bridge** the host needs during `Init` (its strings: "GPUArchitecture ==
-Unknown. Need … nvapi … nvml") — bridge to native `libnvidia-ml.so` / a minimal nvapi shim (the
-dxvk-nvapi role) — **this is the next real dependency and possible blocker**; (3) S6 feed our frame
-via the snippet's CUDA-Vulkan interop; (4) S4 Reflex pacing. The own model (§21) stays the parallel
-fallback if the nvapi/nvml bridge proves intractable.
+**S5(b) — `Init` RUNS natively; only the nvapi bridge remains (DONE).** `s5_host.c` now creates a
+live `VkInstance`/`VkDevice`, wires a **generic MS-x64→SysV ABI thunk** for the 22 Vulkan + 26 CUDA
+imports (all ≤6 int/ptr args), passes **ms_abi `gipa`/`gdpa`** wrappers, and calls
+`NVSDK_NGX_VULKAN_Init_ProjectID` on the natively-loaded host. It **runs to completion through NGX's
+real init logic and returns a clean `0xBAD00002` (`FAIL_PlatformError`) — no crash, no ABI mismatch**
+— failing only because **`nvapi64.dll` is not bridged**, so the host can't identify the GPU. This
+retires the "internal host↔snippet ABI" fear: the app drives the host via the **documented
+`NVSDK_NGX_VULKAN_*` API**, and the host loads the snippet itself.
+
+**The single remaining dependency to a successful `Init` is an nvapi shim** (the dxvk-nvapi role):
+implement `nvapi_QueryInterface` + the `NvAPI_*` GPU-architecture queries, bridged to the native
+driver, so the host classifies the RTX 5070 as Blackwell. Then `CreateFeature(FrameGeneration)`
+loads the snippet; S6 (feed our frame via the snippet's CUDA-Vulkan external-memory/semaphore
+interop) + S4 (Reflex `VK_NV_low_latency2` pacing) follow. The own model (§21) stays the parallel
+fallback if the nvapi bridge proves intractable.
 
 *(Working log + probes in `experiments/dlssg-native/RECON.md`; `pe_probe.c` S1, `pe_load.c` S2,
-`s5_host.c` S5(a).)*
+`s5_host.c` S5.)*
 
 ## 21. Training our own frame-generation model — what it would take
 

@@ -11,7 +11,7 @@ pe_load: pe_load.c
 	$(CC) $(CFLAGS) -o $@ $< -ldl
 
 s5_host: s5_host.c
-	$(CC) $(CFLAGS) -o $@ $< -ldl
+	$(CC) $(CFLAGS) -o $@ $< -ldl -lvulkan
 
 .PHONY: run recon clean
 all: pe_probe pe_load s5_host
