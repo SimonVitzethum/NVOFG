@@ -375,6 +375,36 @@ and wants a more complete D3DKMT adapter model (likely `D3DKMTOpenAdapterFromLui
 correlation tail — grind each against the Proton reference (WINEDEBUG / dxvk trace). Multi-session,
 but with a known-green endpoint (Gate 3). The own model (§21) stays the parallel path.
 
+## S5e — the wall: NGX wants undocumented WDDM driver-private adapter info (D3DKMT)
+
+Traced the adapter path past `D3DKMTEnumAdapters2`: NGX then calls **`D3DKMTQueryAdapterInfo`** with
+**`Type = 48` (`KMTQAITYPE_KMD_DRIVER_VERSION` / registry family), buffer size 1072 bytes**, then
+`D3DKMTCloseAdapter`. My stub zeroes the buffer + returns STATUS_SUCCESS, but NGX still returns
+NotImplemented — it needs **real WDDM driver-private adapter data** (an undocumented 1072-byte
+structure the Windows kernel display driver fills). Under Proton this is Wine's `win32u`
+`D3DKMTQueryAdapterInfo`, which bridges to the native NVIDIA driver; there is no native-Linux D3DKMT.
+
+This is the honest bottom of the Path-B rabbit hole: past the loader + MS-x64 ABI + CRT/TEB + nvapi
+surface + path shim + adapter enumeration, NGX's Windows host reaches into the **WDDM kernel
+display-driver model** (D3DKMT driver-private structures), which has no native-Linux equivalent and
+whose formats are undocumented. Reproducing them faithfully (Type 48 and the further D3DKMT calls
+CreateFeature will make) is genuine multi-week reverse-engineering — each struct measurable against
+the Proton/Wine reference, but each a deep dive.
+
+**Status of Path B (honest):**
+- **Gate 3 = GREEN**: the native driver *does* report FG available (proven via the Proton oracle).
+  The feasibility question is answered — no more machbarkeit risk.
+- The native loader is extensive and correct as far as it goes: both NVIDIA PEs load + init, the NGX
+  Vulkan API is driven natively, 48 foreign-ABI Vulkan/CUDA imports run through one register-shuffle
+  thunk, the nvapi surface matches dxvk-nvapi, and **native `GetFeatureRequirements(FG)` runs to
+  completion**.
+- The remaining path (full `Init` crash tail → `CreateFeature` → `EvaluateFeature` float-ABI thunk →
+  present/pacing) is gated on faithfully synthesizing the **WDDM D3DKMT driver-private adapter model**
+  — a multi-week effort. Every piece has a Proton reference, so it is engineering, not research; but
+  it is a long tail.
+- The own model (§21) — native, legal, single-GPU-trainable, no Windows-adapter dependency — remains
+  the pragmatic path to shippable native FG, and the 5080 server (≈24 h) makes it actionable.
+
 ## Next step (now justified)
 
 **S5** (the crux): load the NGX host PEs (`nvngx.dll` + `_nvngx.dll`) under the same loader (they

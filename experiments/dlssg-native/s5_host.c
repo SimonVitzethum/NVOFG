@@ -160,6 +160,13 @@ MSABI static int s_D3DKMTEnumAdapters2(void* pe){ if(!pe) return (int)0xC000000D
     u8* a=(u8*)*pa; memset(a,0,20); *(u32*)(a+0)=0x21; memcpy(a+4,g_luid,8); *(u32*)(a+12)=1; *n=1;
     logn("[D3DKMTEnumAdapters2] ","1 adapter, LUID=deviceUUID-derived"); return 0; }
 MSABI static int s_PathFileExistsW(void* p){ (void)p; return 0; } // FALSE (deny_list etc. absent = fine)
+// D3DKMT_QUERYADAPTERINFO{ UINT hAdapter@0; KMTQAITYPE Type@4; void* pData@8; UINT Size@16 }
+MSABI static int s_D3DKMTQueryAdapterInfo(void* p){ if(!p) return (int)0xC000000D;
+    u32 type=*(u32*)((u8*)p+4); void* pd=*(void**)((u8*)p+8); u32 sz=*(u32*)((u8*)p+16);
+    char b[80]; snprintf(b,sizeof b,"[D3DKMTQueryAdapterInfo] Type=%u size=%u\n",type,sz); logs(b);
+    if(pd&&sz) memset(pd,0,sz); return 0; } // STATUS_SUCCESS, zeroed (refine per Type from trace)
+MSABI static int s_D3DKMTCloseAdapter(void* p){ (void)p; return 0; }
+MSABI static int s_D3DKMTOpenAdapterFromLuid(void* p){ if(p) *(u32*)p=0x21; return 0; } // fill hAdapter
 // --- nvapi shim (S5c): the host resolves NvAPI_* via nvapi_QueryInterface(id). First pass:
 // log every requested interface id and hand back a 0-returning stub (NVAPI_OK) so the host
 // keeps querying and we can enumerate the full set it needs for GPU-arch detection. ---
@@ -296,6 +303,7 @@ struct { const char* name; void* fn; } g_stubs[]={
  {"CreateFileW",s_CreateFileW},{"GetFileAttributesW",s_GetFileAttributesW},{"GetFileAttributesExW",s_GetFileAttributesExW},{"FindFirstFileExW",s_FindFirstFileExW},
  {"SHGetKnownFolderPath",s_SHGetKnownFolderPath},{"CoTaskMemFree",s_CoTaskMemFree},
  {"D3DKMTEnumAdapters2",s_D3DKMTEnumAdapters2},{"PathFileExistsW",s_PathFileExistsW},
+ {"D3DKMTQueryAdapterInfo",s_D3DKMTQueryAdapterInfo},{"D3DKMTCloseAdapter",s_D3DKMTCloseAdapter},{"D3DKMTOpenAdapterFromLuid",s_D3DKMTOpenAdapterFromLuid},
  {0,0}};
 static void* g_stubs_lookup(const char* fn){ for(int i=0;g_stubs[i].name;i++) if(!strcmp(g_stubs[i].name,fn)) return g_stubs[i].fn; return 0; }
 
