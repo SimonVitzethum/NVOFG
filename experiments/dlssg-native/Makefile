@@ -7,11 +7,16 @@ CFLAGS ?= -O2 -Wall
 pe_probe: pe_probe.c
 	$(CC) $(CFLAGS) -o $@ $< -ldl
 
+pe_load: pe_load.c
+	$(CC) $(CFLAGS) -o $@ $< -ldl
+
 .PHONY: run recon clean
-run: pe_probe
+all: pe_probe pe_load
+run: pe_probe pe_load
 	./pe_probe $(DLLSG)
+	./pe_load $(DLLSG)
 # regenerate the import recon with winedump (needs wine tools)
 recon:
 	winedump -j import $(DLLSG) || true
 clean:
-	rm -f pe_probe probe_output.txt
+	rm -f pe_probe pe_load probe_output.txt load_output.txt

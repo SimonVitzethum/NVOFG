@@ -2,3 +2,4 @@ pe_probe
 *.o
 # never commit NVIDIA's DLLs
 *.dll
+pe_load

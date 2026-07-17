@@ -56,6 +56,41 @@ surface is **150 standard MSVC-CRT symbols** (no exotic APIs, no ordinals) plus 
 init to run `DllMain`. The probe does **not** execute the DLL (safety) — it stops at "mapped +
 imports wired".
 
+## S2 — run DllMain natively (DONE — `pe_load.c`)
+
+`pe_load.c` extends S1 with everything needed to *execute* the DLL and reached a decisive result:
+**`nvngx_dlssg.dll`'s `DllMain(DLL_PROCESS_ATTACH)` runs and returns `TRUE` — natively on Linux,
+no Wine/Proton — reproducibly (3/3 runs, exit 0).** What it took:
+
+1. **Executable section protections** (`mprotect` per section `Characteristics`).
+2. **The Microsoft-x64 ABI boundary** — a PE calls its imports MS-x64 (rcx/rdx/r8/r9 + 32B shadow),
+   not SysV. Every shim is `__attribute__((ms_abi))`; unknown imports get a generated ms_abi
+   trampoline that self-identifies and returns 0. (This also means the native libvulkan/libcuda
+   pointers from S1 will each need an ms_abi→SysV thunk when actually *called* in S6.)
+3. **A minimal MSVC-CRT shim** (~40 real stubs: heap→malloc, TLS/FLS→arrays, sync→no-op,
+   time→clock_gettime, module/handle, `WideCharToMultiByte`/`MultiByteToWideChar`, env). The CRT
+   probes kernel32 via `GetProcAddress` for optional APIs — the shim returns callable stubs so the
+   probes succeed.
+4. **The Windows TEB on the `gs` segment** — the last blocker. The CRT reads `gs:[0x58]`
+   (ThreadLocalStoragePointer), `gs:[0x30]` (TEB self), `gs:[0x60]` (PEB); Linux uses `fs` for glibc
+   and leaves `gs` empty, so it faulted at `0x58`. Fix: allocate a fake TEB + PEB, set up **PE-TLS**
+   (copy the image TLS template, store the slot index, hang it off the TLS array), and point `gs` at
+   the TEB via `arch_prctl(ARCH_SET_GS)` — exactly the Wine TEB mechanism, ~40 lines. After that,
+   DllMain returns 1.
+
+**Conclusion:** loading + initialising the real DLSS-G snippet natively is **not the blocker** — it
+works. No D3D12/DXGI/COM, no exotic dependency; just the bounded CRT surface + the TEB/gs setup.
+
+## S5 — the real crux: host ↔ snippet interface
+
+`nvngx_dlssg.dll` exports **0 named functions** (`winedump -j export` → empty). So the NGX host does
+**not** drive the snippet via named exports — the interface is an **internal, undocumented NGX ABI**
+(the host likely hands the snippet a function/context table at a fixed entry, or calls a hardcoded
+RVA). This is now the make-or-break stage: either (a) load the Windows NGX host PEs too (`_nvngx.dll`
+brings crypto/COM/winsock, but they're all CRT-shimmable like S2), or (b) reverse the host↔snippet
+entry ABI and drive the snippet from a minimal custom host. S4 (Reflex pacing) and S6 (feed our
+Vulkan images via the CUDA-interop path the snippet imports) follow.
+
 ## Remaining stages (design.md §20.3, re-scoped by the recon)
 
 - **S2 — MSVC-CRT shim (M, was L).** Provide the 150 KERNEL32/ADVAPI32/USER32/VERSION symbols +
@@ -77,9 +112,23 @@ imports wired".
 
 ## Next step
 
-S2: stand up the CRT shim (evaluate Wine `ucrtbase`/`kernel32`-as-library vs taviso/loadlibrary),
-get `DllMain` to return, and log the first NGX/host entry points the snippet looks for — which
-directly probes the S5 handshake. Own-model (§21) stays the parallel fallback (5080 server, 100–200 h).
+**S5** (the crux): load the NGX host PEs (`nvngx.dll` + `_nvngx.dll`) under the same loader (they
+need the same CRT shim + a few more Win32 DLLs: CRYPT32/bcrypt/ole32/WS2_32 — all shimmable), get
+`NVSDK_NGX_VULKAN_Init` + `NVSDK_NGX_VULKAN_CreateFeature(FrameGeneration)` to succeed through the
+Windows host talking to the natively-loaded snippet; **or** trace the host↔snippet entry ABI and
+drive the snippet directly. Then S6: implement the ms_abi→SysV thunks for the 22 Vulkan + 26 CUDA
+imports and feed our frame via CUDA-Vulkan external-memory/semaphore interop; S4: Reflex pacing.
+
+Own-model (§21) stays the parallel fallback (5080 server, 100–200 h) in case S5's internal ABI
+proves intractable.
+
+## Build & run
+
+```
+make            # builds pe_probe (S1) and, with: cc -O2 -o pe_load pe_load.c -ldl (S2)
+./pe_probe /usr/lib/nvidia/wine/nvngx_dlssg.dll   # S1: map/relocate/resolve + gap report
+./pe_load  /usr/lib/nvidia/wine/nvngx_dlssg.dll   # S2: run DllMain natively -> returns 1
+```
 
 ## Legal
 

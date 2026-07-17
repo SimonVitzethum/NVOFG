@@ -1,7 +1,8 @@
 # ADR 0008 — Path B: native in-process loader for DLSS Frame Generation (`nvngx_dlssg.dll`)
 
-- **Status:** Accepted — **experiment underway** (S0 recon + S1 map/relocate done; S2 next).
-  Own trained model (§21) kept as the parallel fallback.
+- **Status:** Accepted — **experiment underway.** S0 recon + S1 (map/relocate/native-import) +
+  **S2 (`DllMain` runs natively, returns TRUE, reproducibly)** done; crux now **S5** (host↔snippet
+  ABI). Own trained model (§21) kept as the parallel fallback.
 - **Date:** 2026-07-17
 - **Relates to:** design.md §20 (Path B plan), §21 (own model); ADR 0006 (NGX).
 
@@ -35,9 +36,19 @@ S0/S1 recon **disproved that for the snippet**:
 - The only remainder to *load* the snippet is **150 standard MSVC-CRT symbols + a PE-aware CRT/SEH
   init** — a bounded, reusable shim (Wine `ucrtbase`/`kernel32` or taviso/loadlibrary).
 
-So the **snippet-loading** half is now demonstrably tractable. The **crux moves to S5**: the
-host↔snippet handshake — either load the Windows host PEs (`_nvngx.dll` brings crypto/COM/winsock)
-or reverse the interface and drive the snippet from a **minimal custom host**. That, plus S4 Reflex
+So the **snippet-loading** half is now demonstrably tractable.
+
+**S2 update — it loads and runs.** `pe_load.c` executes the snippet's `DllMain(DLL_PROCESS_ATTACH)`
+natively and it **returns TRUE** (3/3 runs). Required, beyond S1: executable section protections;
+the **MS-x64 ABI boundary** (`ms_abi` shims); a **~40-stub MSVC-CRT shim** with `GetProcAddress`
+returning callable stubs for the CRT's optional-API probes; and a **fake Windows TEB on `gs`** +
+**PE-TLS** via `arch_prctl(ARCH_SET_GS)` (the Wine TEB mechanism — the `gs:[0x58]` fault was the last
+blocker). No D3D12/DXGI/COM, no exotic dependency.
+
+**The crux is now S5**: the snippet exports **0 named functions**, so the host↔snippet interface is
+an **internal, undocumented NGX ABI** — either load the Windows host PEs (`_nvngx.dll` adds
+crypto/COM/winsock, all CRT-shimmable) so `CreateFeature(FrameGeneration)` reaches the native
+snippet, or reverse the entry ABI and drive it from a minimal custom host. That, plus S4 Reflex
 present-metering, is where Path B still may die.
 
 ## Consequences

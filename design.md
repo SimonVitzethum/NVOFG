@@ -1027,13 +1027,26 @@ the real driver DLLs **disproves that for the snippet**:
   26/26). The only remainder to *load* the snippet is **150 standard MSVC-CRT symbols + a PE-aware
   CRT/SEH init** — a bounded, reusable shim (Wine `ucrtbase`/`kernel32`, or taviso/loadlibrary).
 
-**Re-scoped stages:** S1 (map/relocate/native-import) **done**. S2 (CRT shim + `DllMain`) is now
-**M, not L**. S3 (D3D12/DXGI) is **likely not needed for the snippet** (it's Vulkan-native). The
-**crux moves to S5** — the host↔snippet handshake: either load the Windows host PEs (`_nvngx.dll`
-crypto/COM/winsock) or drive the snippet from a **minimal custom host** (undocumented interface).
-S5 + S4 (Reflex pacing) are where Path B still may die; the experiment stops there if it blocks.
+**S1 (map/relocate/native-import) done.** **S2 (run `DllMain`) DONE** — `experiments/dlssg-native/
+pe_load.c` loads the 9 MB snippet and its **`DllMain(DLL_PROCESS_ATTACH)` returns `TRUE`, natively
+on Linux, no Wine/Proton, reproducibly.** It took: executable section protections; the **MS-x64 ABI
+boundary** (`ms_abi` shims — a PE calls imports rcx/rdx/r8/r9 + shadow, not SysV; native
+libvulkan/libcuda will each need an ms_abi→SysV thunk when *called* in S6); a **minimal MSVC-CRT
+shim** (~40 real stubs + `GetProcAddress`-returns-callable-stubs for the CRT's optional-API probes);
+and — the last blocker — a **fake Windows TEB on the `gs` segment** (`gs:[0x58]` =
+ThreadLocalStoragePointer etc.) with **PE-TLS** setup, installed via `arch_prctl(ARCH_SET_GS)`, i.e.
+the Wine TEB mechanism (~40 lines). So **loading + initialising the real DLSS-G snippet natively is
+not the blocker — it works**; no D3D12/DXGI/COM, no exotic dependency.
 
-*(Working log + probe in `experiments/dlssg-native/RECON.md`.)*
+**Crux now = S5 (host↔snippet ABI).** The snippet exports **0 named functions** — the NGX host does
+not call it by export; the interface is an **internal, undocumented NGX ABI**. Next: load the NGX
+host PEs (`nvngx.dll`/`_nvngx.dll`) under the same loader (they add CRYPT32/bcrypt/ole32/WS2_32 —
+all CRT-shimmable) so `NVSDK_NGX_VULKAN_CreateFeature(FrameGeneration)` reaches the native snippet,
+**or** reverse the host↔snippet entry ABI and drive it from a minimal custom host. Then S6 (ms_abi
+thunks + feed our frame via the snippet's CUDA-Vulkan interop imports) and S4 (Reflex pacing). S5 is
+where Path B still may die; the own model (§21) stays the parallel fallback.
+
+*(Working log + probes in `experiments/dlssg-native/RECON.md`, `pe_probe.c` (S1), `pe_load.c` (S2).)*
 
 ## 21. Training our own frame-generation model — what it would take
 
