@@ -308,7 +308,10 @@ static u8 g_gpubuf[8192];
 MSABI static int s_EnumPhysicalGPUs(void** h,u32* c){ if(h)h[0]=FAKE_GPU; if(c)*c=1; return 0; }
 // NV_GPU_ARCH_INFO = {version@0 (set by caller), architecture@4, implementation@8, revision@12}.
 // We know the device is a Blackwell RTX 5070 -> report GB200 (0x1B0), which is >= Ada, so FG-eligible.
-MSABI static int s_GPU_GetArchInfo(void* gpu,u32* ai){ (void)gpu; if(ai){ ai[1]=0x000001B0; /*GB200/Blackwell*/ ai[2]=0x00000005; /*GB20x impl*/ ai[3]=0x000000A1; /*rev*/ } return 0; }
+// MEASURED against dxvk-nvapi (nvapi_dump.exe under Proton): arch=0x1B0, impl=0x2, rev=0xFFFFFFFF
+// (CHIP_REVISION_UNKNOWN). Our earlier impl=5/rev=0xA1 were guesses that diverged from the oracle;
+// the FG evaluator reads impl/rev and rejected the mismatched values.
+MSABI static int s_GPU_GetArchInfo(void* gpu,u32* ai){ (void)gpu; if(ai){ ai[1]=0x000001B0; /*GB2xx/Blackwell*/ ai[2]=0x00000002; /*impl*/ ai[3]=0xFFFFFFFF; /*rev=UNKNOWN*/ } return 0; }
 MSABI static int s_GetLogicalGPU(void* p,void** l){ (void)p; if(l)*l=FAKE_LGPU; return 0; }
 MSABI static int s_GPU_GetPCIIdentifiers(void* g,u32* dev,u32* sub,u32* rev,u32* ext){ (void)g; u32 id=(0x2D18u<<16)|0x10DE; if(dev)*dev=id; if(sub)*sub=0; if(rev)*rev=0xA1; if(ext)*ext=id; return 0; }
 MSABI static int s_GPU_GetFullName(void* g,char* name){ (void)g; const char* s="NVIDIA GeForce RTX 5070 Laptop GPU"; if(name){int i=0;for(;s[i]&&i<63;i++)name[i]=s[i];name[i]=0;} return 0; }

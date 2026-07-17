@@ -502,6 +502,35 @@ LUID, or nvapi surface (all of which now match Proton). Next step: disassemble `
 which nvapi/DRS *data field* (not status) it reads differently. The loader + adapter-identity layers
 are done; this is a contained per-feature-evaluator diff.
 
+## S5h — differential boundary diff at the nvapi surface (2026-07-17)
+
+Switched method (per guidance): instead of reverse-disassembling the value's origin, **diff the
+evaluator's inputs against the Proton oracle at the boundary**. Built `nvapi_dump.exe` — a mingw exe
+that, under Proton, calls the SAME nvapi functions dxvk-nvapi implements that the FG evaluator reads,
+and dumps the exact returned bytes. Diff vs our native stubs:
+
+- **`GPU_GetArchInfo` DIVERGED** (the diff's first hit): oracle returns `arch=0x1B0, impl=0x2,
+  rev=0xFFFFFFFF(UNKNOWN)`; our stub returned `impl=0x5, rev=0xA1` (guesses). **Fixed to match.**
+  arch (0x1B0) already matched. — *But fixing impl/rev did NOT change the result (still 0xBAD00002),
+  so the evaluator does not gate on impl/rev.*
+- nvapi **status** surface: every call the evaluator makes returns the same status as dxvk-nvapi
+  (all OK; DRS settings 0x10e41df2/0x10afb764/6b all "Setting not found"; 4 QI IDs "unknown").
+- `FeatureDiscoveryInfo` we pass matches the successful probe: `SDKVersion=0x15`
+  (== `NVSDK_NGX_VERSION_API_MACRO`), `FeatureID=11`, `AppId=0x1337`, valid `ApplicationDataPath`.
+- The evaluator makes **NO** Vulkan/CUDA/OFA calls in the requirements path (only the LUID
+  `vkGetPhysicalDeviceProperties2`), so candidates "Vulkan extension set" and "OFA probe" are ruled
+  out for GetFeatureRequirements.
+- `GPU_GetLogicalGpuInfo` DATA remained **unmeasurable** via the probe (dxvk-nvapi rejects every
+  guessed `NV_LOGICAL_GPU_DATA` struct-version with -9), but its **status** matches (OK) and our
+  stub fills a self-consistent LUID (== vk deviceLUID == D3DKMTEnumAdapters2 LUID).
+
+**Checkpoint.** One real input divergence found+fixed (arch impl/rev), but it was not the gate.
+Every other measurable evaluator input matches Proton. `0xBAD00002` now comes from either (a) an
+unmeasured `GPU_GetLogicalGpuInfo` DATA field, or (b) the per-feature dispatch
+`r13[0x24e0+FeatureID*144]` vs `0x18000c1e0`'s own return (undistinguished — needs a gdb break at
+`_nvngx+0xe194` on the native process to read the evaluator's return), or (c) the environmental /
+Wine-DRM-layer class flagged as the stop-and-report point.
+
 ## Legal
 
 `nvngx_dlssg.dll` is NVIDIA-licensed and shipped for the driver's Wine/Proton runtime. This
