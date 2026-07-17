@@ -531,6 +531,40 @@ unmeasured `GPU_GetLogicalGpuInfo` DATA field, or (b) the per-feature dispatch
 `_nvngx+0xe194` on the native process to read the evaluator's return), or (c) the environmental /
 Wine-DRM-layer class flagged as the stop-and-report point.
 
+## S5i — native FG GetFeatureRequirements == Proton, FeatureSupported=0x0 (2026-07-17)
+
+The gdb break-chain (following the forked child; SIGSEGV passed through; breakpoints anchored to the
+measured `_nvngx` base) **resolved the three-candidate fork in one native run**:
+
+```
+after 0x180061730 (nvapi driver check): al=1     after 0x18003b370 (validator): eax=1
+after 0x18000b720: eax=1                 EVALUATOR 0x18000c1e0 RETURNED: eax=1  (success!)
+after per-feature DISPATCH [0x114838]:   eax=0xBAD00002   <-- the reject is here
+```
+
+So the shared evaluator did NOT compute the reject — the per-feature **dispatch** did. Its target
+was `snippet_base + 0x8D030` = the **snippet's own `NVSDK_NGX_VULKAN_GetFeatureRequirements`**
+(ordinal 36). That was candidate "inner call hands back the value" → a data source in that function.
+
+Disassembling snippet 0x8D030: it calls `GetModuleHandleExA(flags=6 = FROM_ADDRESS, <own addr>)` →
+`GetModuleFileNameW(handle)` to discover its own module path, then processes it. Our stubs returned
+the **dummy module** + fixed `C:\game\game.exe`, so the path step failed → `0xBAD00002`. **Fix:**
+`GetModuleHandleExA` honors `FLAG_FROM_ADDRESS` (finds the module whose `[base,base+size)` contains
+the address; added `size` to `Module`); `GetModuleFileNameW` returns the real per-handle path. →
+result `0x1` (Success), `MinHWArch=0x190`, `MinOS=10.0.0` filled.
+
+Last bit: `FeatureSupported=0x8` (`OSVersionBelow`) — the snippet reads the OS version via
+`RtlGetVersion` (our trap left it 0.0.0). Report **Windows 10.0.19041**. →
+
+**`result=0x00000001, FeatureSupported=0x0 (FULLY SUPPORTED), MinHWArch=0x190, MinOS=10.0.0` —
+byte-identical to the Proton Gate-3 oracle. The native NGX host + `nvngx_dlssg.dll` snippet report
+DLSS Frame Generation as fully supported, entirely natively (no Wine, no Proton).** The whole
+`GetFeatureRequirements(FrameGeneration)` capability path is done end to end. Both fixes were
+one-value changes (module path; OS version), the same shape as the LUID and DRS fixes.
+
+**Next phase (separate, multi-stage):** `Init_ProjectID` → `CreateFeature(FG)` (wants model weights +
+the CUDA/Vulkan-interop `EvaluateFeature` float-ABI path) → present/pacing (`VK_NV_low_latency2`).
+
 ## Legal
 
 `nvngx_dlssg.dll` is NVIDIA-licensed and shipped for the driver's Wine/Proton runtime. This
