@@ -41,11 +41,45 @@ Rendering-aware forward-warp + gated-conv fusion (SoftSplat / ExtraNet / ExtraSS
 3. **Inputs:** warped color(s), fwd+bwd flow, occlusion/confidence (from nvofg's REFINE stage), depth,
    engine MV, the OFA-vs-MV disagreement map, a disocclusion mask, and the UI/reactive masks
    (HUD/particles never synthesized from geometry motion).
-4. **Two modes, shared backbone:** **extrapolation primary** (past frames only → no added latency —
-   §21.2); **interpolation fallback** (bidirectional OFA flow, cleaner disocclusion) for
-   latency-insensitive/offline use.
+4. **Two modes, shared backbone — a latency/quality trade-off axis, not "primary = better":**
+   **extrapolation** (past frames only → *no added latency*, the low-latency primary) is the
+   **harder** learning task — it must guess newly-revealed disocclusion, direction changes,
+   acceleration, fade-ins, for which no signal exists in past-only inputs. **Interpolation**
+   (bidirectional OFA flow → both surrounding frames) is *easier and higher-quality* — the OFA bidir
+   flow nearly solves it — but incurs the hold-back latency. We ship extrapolation primary **despite**
+   its lower quality, to buy latency; both are trained and measured (A4, per-regime) from the start so
+   the quality gap is known before the server run, not after.
 5. **Precision:** train AMP fp16; deploy fp16 over `VK_KHR_cooperative_matrix` (Tensor cores), the
    path proven by `src/spike/cuda_tensor.cu` / `cuda_vk_interop.cu`; TensorRT optional above threshold.
+
+## Frame-generation multiplier — target 6× from 60–100 fps, seamless 2×–6×
+
+**Requirement:** the model must generate up to **5 intermediate frames (6×)** cleanly from a **60–100
+fps base** (→ 360–600 fps for 240/360 Hz displays), and handle **any 2×–6×** with no problems.
+
+Why this is the *right* target rather than 6× from a low base: intermediate-frame quality is bounded
+by **motion per interval**, not by the multiplier itself. At a 60–100 fps base the inter-frame gap is
+10–17 ms, so even the 5th intermediate spans little motion → the flow stays near-linear, disocclusion
+gaps are small, and error-from-endpoint stays low. The same 6× from 20 fps (50 ms gap) would show
+artifacts and a 50 ms hold-back; from 60 fps the hold-back is ~16 ms. (Industry tops out at DLSS 4
+MFG = 3 generated / 4×; 6× is only sane in this high-base regime.)
+
+**How one net serves 2×–6× with no retraining — phase-conditioned training (the key design choice):**
+- The net takes the target **phase `t∈(0,1)`** as a conditioning input (already in `nvofg.h`:
+  `NvofgGenerateInfo.phase` + `nvofg_record_warp(phase)` which reuses the computed flow and only
+  re-warps at a new phase — cheap, no OFA re-run).
+- **Train with random `t` per sample** (not fixed 0.5), drawn across (0,1), so the net learns
+  continuous phase interpolation → at inference any N maps to phases `k/(N+1)` for k=1..N. 2× uses
+  t=0.5; 6× uses t∈{1/6,…,5/6}; nothing about the weights changes.
+- **Cost of N intermediates:** flow + fusion inputs once per real-frame pair, then the synthesis runs
+  N times over the interval. At the 60–100 fps base each interval is long enough that 5× the ~1–1.5 ms
+  synthesis fits comfortably; compute is not the limiter, motion-per-interval is.
+- **Quality target by regime:** train/validate 2×–4× as the primary quality band (matches DLSS 4 MFG);
+  6× is validated specifically on the **high-base (≥60 fps) / small-motion** clips where it holds.
+  A4 reports quality vs multiplier so the "clean up to 6× from 60 fps" claim is measured, not assumed.
+- **Extrapolation + high multiplier:** extrapolating 5 frames ahead is too speculative; the
+  extrapolation mode targets **1–2 future frames**. High multipliers (up to 6×) are an
+  **interpolation-mode** capability (the "between two frames" case) — matching the user's framing.
 
 ## Training plan on `ki-pc-fisch-101` (RTX 5080)
 
@@ -55,22 +89,57 @@ matmul on the 5080 before anything else.
 
 - **T0. Env + smoke test.** PyTorch (Blackwell-capable) + CUDA; confirm fp16 Tensor-core matmul runs
   on the 5080; pin versions in a lockfile.
-- **T1. Data pipeline (A2).** (a) **Rendered GT (primary):** capture harness dumps color+MV+depth+
-  UI/reactive at **2× target fps** so every other frame is GT (coordinate format with the RMC agent);
-  tens of thousands of triplets across varied motion. (b) **Vimeo-90K/X4K bootstrap** for RGB
-  synthesis pretraining (no aux — warm-start only). Dataloaders + augmentation (540p–1080p crops).
-- **T2. Model impl.** SoftSplat warp + gated-conv fusion net (~1M), both modes; verify the
-  identity-init (residual add, zeroed final conv) reproduces the classical warp exactly.
+- **T1. Data pipeline (A2) — BEFORE the model; ships with an alignment gate.** (a) **Rendered GT
+  (primary):** capture at **2× target fps** so every other frame is GT (color+MV+depth+UI/reactive);
+  **first a sub-pixel alignment round-trip test** — warp captured N-1/N+1 to phase 0.5 with the known
+  flow, assert it lands on capture-GT frame N to sub-pixel (identical jitter/MV-convention/HUD-mask);
+  **must pass before mass capture** (a silent offset trains the net to compensate, not interpolate).
+  Then tens of thousands of triplets across pans/fast-entities/transparency. (b) **Vimeo-90K/X4K
+  bootstrap** for RGB synthesis warm-start (no aux). Dataloaders + augmentation (540p–1080p crops),
+  `num_workers ≤ 3`.
+- **T2. Model impl — phase-conditioned, bit-exact identity.** SoftSplat warp + gated-conv fusion net
+  (~1M); **phase `t` as a conditioning input, trained with random t∈(0,1)** so one net serves any
+  2×–6× (§ multiplier). Both modes (interp/extrap). **Identity-init assertion is BIT-EXACT:**
+  zeroed final conv + residual add reproduces `classical_warp` exactly (to the warp's own fp16
+  output, computed identically) — not "looks the same".
 - **T3. Losses (§21.6).** Charbonnier/L1 + LPIPS/VGG + census/warping + light GAN (micro-detail) +
   temporal-stability; **UI/reactive masked out of all losses**; disocclusion regions up-weighted.
 - **T4. Schedule.** Pretrain on Vimeo (synthesis) → fine-tune on rendered data with real MV/depth/
   masks. AMP fp16, largest batch the 16 GB fits (1080p crops). ~**days** for a competitive v1 (§21.7).
-- **T5. Eval (A4 harness).** PSNR/SSIM/**LPIPS**/VMAF + temporal-stability vs GT, and vs the (private)
-  Path B reference on a fixed clip set. Gate every checkpoint on the harness.
+- **T5. Eval (A4 harness) — stratified, both modes, vs multiplier.** PSNR/SSIM/**LPIPS**/VMAF +
+  temporal-stability vs GT, **reported per difficulty regime** (easy / disocclusion-heavy /
+  shading-change) and **per mode** (interp/extrap) — an averaged metric is warp-dominated and hides
+  the win. Also **quality vs multiplier** (2×…6×) so the "clean to 6× from 60 fps" claim is measured.
+  Path B reference is a **read-only** comparison metric — never a training target. Gate every
+  checkpoint.
 - **T6. Export (A5).** Trained weights → fp16 coopmat/WMMA tile layout (versioned header) that the
-  `recordCnnRefine` backend loads. Then the A1 identity is replaced by the real model — no ABi change.
-- **T7. Ablate to the param ceiling.** Sweep ~0.5M → ~4M on the 5080; measure quality (T5) vs
-  measured 1080p/1440p/4K latency on a Blackwell deployment card; pick the v1 point.
+  `recordCnnRefine` backend loads. Then the A1 identity is replaced by the real model — no ABI change.
+- **T7. Ablate params + multiplier.** Sweep ~0.5M → ~4M vs measured 1080p/1440p/4K latency on a
+  Blackwell deployment card; and sweep multiplier 2×–6× vs per-regime quality at 60–100 fps base; pick
+  the v1 point and the safe max multiplier per base-fps band.
+
+## Training runtime & resumability (connection-independent, pausable)
+
+The run must **survive SSH disconnect** and **pause/resume with no loss**. Built as a harness *before*
+the model (identity-first discipline), proven with a placeholder net, so T2 only drops in the real
+model/data.
+
+- **Connection-independent:** the trainer runs under **`tmux`** (session `plana`) — closing SSH leaves
+  it running; re-attach anytime. Falls back to `nohup … & disown` if tmux is absent. My SSH sessions
+  are only for launch/monitor, never the process parent.
+- **Atomic checkpoints:** every `--ckpt-every` steps **and** on signal, save
+  `{model, optimizer, AMP scaler, scheduler, step, epoch, dataloader position, CPU/CUDA/Python RNG
+  states}` via temp-file + `os.replace` (atomic — a crash mid-write never corrupts). Keep `latest.pt`
+  + rolling `ckpt_<step>.pt` + `best.pt`.
+- **Auto-resume:** on start the trainer loads `latest.pt` and continues bit-for-bit (step, RNG,
+  optimizer, scaler) — so restart-after-crash/reboot is a no-op beyond relaunch.
+- **Clean pause (keeps the process, frees the GPU):** `touch PAUSE` → the loop checkpoints, then idles
+  polling until `PAUSE` is removed; `rm PAUSE` resumes. No kill, no loss.
+- **Graceful stop:** `SIGTERM`/`SIGUSR1`/`SIGINT` → checkpoint, exit; relaunch auto-resumes.
+- **Control scripts:** `launch.sh` (start under tmux), `pause.sh` / `resume.sh` (PAUSE file),
+  `stop.sh` (SIGTERM), `status.sh` (tail log + latest step). Run dir: `~/plana_runs/<run>/`.
+- **Proven now:** the placeholder harness was run → checkpointed → killed → relaunched → resumed from
+  the exact step, before any real model exists.
 
 ## Environment status (`ki-pc-fisch-101`) — T0 DONE ✅
 

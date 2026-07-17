@@ -38,50 +38,89 @@ separately (RenderFX ROADMAP discipline). Priority: correctness > image quality 
   passthrough "model"** (emits the classical warp) so the entire path — registration, interop, sync,
   output — is exercised and headless-verified (0 VUIDs) *before* any weights exist. Real weights then
   drop in with no plumbing changes. Mirror a **coopmat path** (vendor-neutral) next to the CUDA one.
-- **A2. Data-capture harness.** Offline tool: render/capture sequences at **2× target fps** so every
-  other frame is GT, dumping per-frame color + MV + depth + UI/reactive masks → training triplets.
-  Coordinate the capture format with the RMC/Minecraft consumer (other agent). Target: tens of
-  thousands of triplets across varied motion (pans, fast entities, transparency).
-- **A3. Model + training pipeline (PyTorch).** Implement §21.4's SoftSplat forward-warp + gated-conv
-  fusion net and §21.6's losses (Charbonnier + LPIPS + census/warp + light GAN + temporal; UI/reactive
-  masked out, disocclusion up-weighted). Data loaders: Vimeo-90K/X4K bootstrap + rendered fine-tune.
-  **Validate end-to-end at tiny scale** (overfit a few clips) to prove the pipeline before any big run.
-- **A4. Validation harness (gates every quality claim).** Golden metrics vs the GT in-between frame:
-  PSNR/SSIM/**LPIPS**/VMAF + a temporal-stability metric. Compares warp-only vs learned vs (privately)
-  the Path B reference on a fixed clip set. Reused unchanged by all of Track 2.
+  **Identity test is a BIT-EXACT assertion:** `output == classical_warp` exactly, not "looks the
+  same" — if the fp16/coopmat path or a colorspace rounding shifts the passthrough off the pure warp,
+  the "identity" isn't one and every later quality delta is measured against a shifted baseline. Pin
+  the tolerance to 0 (or the warp's own fp16 output, computed the same way).
+- **A2. Data-capture harness — the real bottleneck; do it BEFORE A3.** At ~1M params neither VRAM nor
+  compute limits us — **data does.** Offline tool: render/capture at **2× target fps** so every other
+  frame is GT, dumping per-frame color + MV + depth + UI/reactive masks → triplets. **A2 ships with
+  its own correctness gate FIRST: a sub-pixel alignment round-trip** — warp the captured N-1/N+1 to
+  phase 0.5 with the *known* flow and confirm it lands on the capture-GT frame N to sub-pixel, with
+  identical jitter state, MV convention, and HUD exclusion. A silent sub-pixel offset between
+  capture-GT and model-input poisons the loss (the net learns to compensate the offset, not to
+  interpolate) and only shows up as bad generalisation. **The alignment test must pass before
+  generating tens of thousands of triplets** — else they are tens of thousands of subtly-wrong ones.
+  (Same discipline as catching a silent error class before the expensive run.) Coordinate the format
+  with the RMC/Minecraft consumer (other agent). Aim: tens of thousands across pans, fast entities,
+  transparency.
+- **A3. Model + training pipeline (PyTorch) — BOTH modes at tiny scale.** Implement §21.4's SoftSplat
+  forward-warp + gated-conv fusion net and §21.6's losses (Charbonnier + LPIPS + census/warp + light
+  GAN + temporal; UI/reactive masked out, disocclusion up-weighted). **Phase-conditioned** (random
+  t∈(0,1) per sample) so one net serves any multiplier (see model doc). **Overfit BOTH
+  interpolation AND extrapolation at tiny scale** and record the quality gap between them *before*
+  committing 10²–10³ GPU-h — extrapolation is the *harder* learning task (below), so the first server
+  run must not be the moment you discover the quality is inverted from the plan. Vimeo/X4K bootstrap +
+  rendered fine-tune loaders.
+- **A4. Validation harness — stratified by difficulty regime, both modes (gates every quality
+  claim).** Golden metrics vs GT: PSNR/SSIM/**LPIPS**/VMAF + temporal-stability. **Stratify the clip
+  set into `easy` / `disocclusion-heavy` / `shading-change` regimes and report per-regime**, because
+  our classical warp is already best-in-class: on easy clips it is near-perfect and the learned model
+  can only tie, so an *averaged* metric is warp-dominated and hides the win (and risks discarding a
+  real gain). The learned model's value lives *only* in the hard regimes — measure it there. Report
+  interpolation AND extrapolation separately. Reused unchanged by all of Track 2.
 - **A5. Weight export/import.** Trained model → the fp16 layout the `CudaTensorInterpolator` /
   coopmat path loads (WMMA/coopmat tile layout, versioned header).
 
-## Track 2 — training (gated on the RTX 5070/5080 server, ~10²–10³ GPU-h per §21.7)
+## Hard invariants (protect §21's shippability)
+
+- **Path B is a READ-ONLY metric in A4, never a training tensor.** The Path B reference output may be
+  *measured against* (a benchmark target) but must **never** reach A3/B1/B2 as a target, distillation
+  signal, or pseudo-GT — no Path-B tensor enters the training graph, ever. This is the line that keeps
+  §21 legally shippable; A4/B5 is exactly where "I measure against DLSS" could silently become "I
+  train on DLSS" if someone later takes a shortcut. Enforce it as a repo firewall.
+- **Latency choice ≠ quality choice.** Extrapolation is chosen for *latency* (no held-back frame),
+  **despite** being the *harder, lower-quality* learning task — it must guess newly-revealed
+  disocclusion, direction changes, acceleration, fade-ins, for which no signal exists in past-only
+  inputs. Interpolation has both surrounding frames (the OFA bidir flow nearly solves it; the rest is
+  disocclusion). Treat mode as a deliberate trade-off axis, not "primary = the good one."
+
+## Track 2 — training (on the RTX 5080 `ki-pc-fisch-101`, ~10²–10³ GPU-h per §21.7)
 
 - **B1.** Vimeo-90K/X4K pretraining of the RGB synthesis net.
 - **B2.** Rendered-data fine-tune with real MV/depth/masks (the A2 captures).
-- **B3.** Ship **extrapolation as the primary mode** (predict next frame from past only → **no added
-  latency**, no flip-metering dependence — §21.2); add the **interpolation mode** (bidirectional OFA
-  flow, cleaner disocclusion) as the quality/offline fallback.
+- **B3.** Train **both modes** from the shared backbone: **extrapolation = the low-latency primary**
+  (past-only → no held-back frame, no flip-metering — §21.2), **interpolation = the quality path**
+  (bidirectional OFA flow, cleaner disocclusion, for latency-insensitive/offline use). The plan ships
+  extrapolation primary for latency, *knowing* it trades quality — hence both are measured (A4) from
+  the start.
 - **B4.** fp16 + `VK_KHR_cooperative_matrix` (Tensor Cores) to hit **<2–3 ms @1080p**; optional
   TensorRT backend above the size threshold (ADR 0004).
-- **B5.** Quality iteration against the A4 harness + the Path B reference; close the disocclusion /
-  ghosting / shading-correction cases where classical warp fails.
+- **B5.** Quality iteration against the A4 **per-regime** metrics + the Path B reference (read-only);
+  close the disocclusion / ghosting / shading-correction cases where classical warp fails.
 
 ## Sequencing — the immediate next steps (all Track 1, no server needed)
 
-1. **A1 scaffold first** — identity model through `NVOFG_INTERP_CNN`, headless-verified. This makes
-   the whole rest drop-in and is the single highest-leverage build step.
-2. **A4 harness in parallel** — nothing about quality is claimed without it.
-3. **A3 model + training pipeline** — validated at tiny scale so the server run is turnkey.
-4. **A2 data capture** — coordinate format with the RMC agent.
-5. When the server lands → Track 2.
+1. **A1 scaffold first** — identity model through `NVOFG_INTERP_CNN`, bit-exact-verified. Highest
+   leverage: makes everything downstream drop-in.
+2. **A2 with its alignment test** — the data bottleneck; the alignment gate must pass before mass
+   capture, or the server run trains on subtly-misaligned data.
+3. **A4 harness, stratified + both modes** — nothing about quality is claimed without it, and it must
+   measure the right thing (per-regime, per-mode).
+4. **A3 model + pipeline, both modes tiny-scale** — validated (and the extrap-vs-interp gap known)
+   before the expensive run.
+5. When the server run starts → Track 2.
 
-**Note on pacing.** Because the **primary path is extrapolation (no held-back frame → no added
-latency)**, `VK_NV_low_latency2` pacing is **only** needed for the secondary *interpolation* mode —
-so it is a later, lower-priority item, not the critical path. (This supersedes the earlier
-"pacing first" note.)
+**Note on pacing.** Extrapolation-primary holds back no frame → `VK_NV_low_latency2` pacing is needed
+**only** for the interpolation mode, so it is later/lower-priority, not the critical path. (Supersedes
+the earlier "pacing first" note.)
 
 ## Definition of "ready"
 
-- **Track-1-ready:** `NVOFG_INTERP_CNN` selectable end-to-end with an identity model, headless-clean;
-  training pipeline validated at small scale; harness live. Ships nothing user-visible yet but makes
-  the model turnkey.
-- **v1-ready:** extrapolation model trained, <2–3 ms @1080p, **visibly better than classical warp**
-  on the harness, no NVIDIA code, no clearance needed — the shippable product.
+- **Track-1-ready:** `NVOFG_INTERP_CNN` selectable end-to-end with a **bit-exact** identity model,
+  headless-clean; A2 alignment test green; stratified both-mode harness live; pipeline validated at
+  tiny scale with the extrap-vs-interp gap measured. Ships nothing user-visible yet — makes the model
+  turnkey and the server run honest.
+- **v1-ready:** trained model, <2–3 ms @1080p, **wins in the hard regimes** (disocclusion / ghosting /
+  shading) on the per-regime harness and at least ties on easy — measured for both modes, no NVIDIA
+  code, no clearance needed. The shippable product.
