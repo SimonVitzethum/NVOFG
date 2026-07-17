@@ -204,6 +204,42 @@ instance/device Vulkan calls the host's arch path makes and what property it can
 deep, iterative, and the ultimate go/no-go (does Linux NGX report FG-available at all) is still
 unknown — the own model (§21) remains the pragmatic parallel path.
 
+### S5(c) deep RE — crossed PlatformError; NGX accepts Blackwell; wall = Windows adapter correlation
+
+Iteratively RE'd the nvapi call chain NGX makes at Init (IDs mapped via the official
+NVIDIA/nvapi headers), bridging each function to real values. Each bridged fn advances NGX:
+
+```
+Initialize + DRS_{CreateSession,LoadSettings,GetBaseProfile,GetSetting}
+vkGetPhysicalDeviceProperties2 (interposed) -> NGX sees device=0x2D18 "RTX 5070", asks
+    VkPhysicalDeviceIDProperties (LUIDValid=0 natively; we force a consistent fake LUID)
+SYS_GetDriverAndBranchVersion(610.43)   ===> error 0xBAD00002 -> 0xBAD00001
+EnumPhysicalGPUs(1) -> GPU_GetArchInfo -> report GB200/Blackwell   [NGX ACCEPTS the arch]
+GetLogicalGPUFromPhysicalGPU + GPU_{PCIIdentifiers,FullName,GPUType,BusType} (real 5070)
+GPU_GetLogicalGpuInfo -> fill pOSAdapterId (=our LUID) + physicalGpuCount=1 + handle
+```
+
+**Two milestones:** (1) **crossed the PlatformError gate** (0xBAD00002 → 0xBAD00001) once the
+driver-version bridge was added; (2) **NGX accepts the Blackwell arch** we report via nvapi.
+The fake nvapi handles must point to **real zeroed memory** (the Windows nvapi handles are
+internally pointers — NGX dereferences them; a bare token like `0x600D2` crashes at the deref).
+
+**Current wall:** right after `GPU_GetLogicalGpuInfo` fills the logical-GPU struct (OS-adapter
+LUID + physical handles), NGX crashes at NULL inside its **Windows OS-adapter correlation** —
+it processes the LUID/adapter data and dereferences state we can't synthesise (precise struct
+offsets + ultimately a real DXGI/OS adapter to match the LUID against). This is the same
+Windows-adapter-platform dependency identified at the top of S5, now reached from *deep inside*:
+NGX gets the Blackwell 5070 fine but wants to correlate it to an OS/DXGI adapter, which has no
+native-Linux equivalent. `0xBAD00001` (FeatureNotSupported) is the still-initialising state; NGX
+crashes before returning a definitive Init result.
+
+**Assessment:** Path B is proven through *the entire loader + MS-x64 ABI + CRT/TEB + nvapi
+surface + GPU-arch acceptance* — an extraordinary distance. The residual is NGX's internal
+Windows-adapter correlation: iterative precise-struct RE that converges on needing a real
+Windows/DXGI adapter (the DXVK dependency). The go/no-go (does Linux NGX report FG-available)
+remains unreached because Init crashes in that correlation before completing. The own model
+(§21) stays the pragmatic parallel path.
+
 ### Honest status & decision point
 
 Path B went from "infeasible in practice" to: **both NVIDIA PEs load natively, DllMain→1, the

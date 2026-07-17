@@ -149,16 +149,27 @@ MSABI static int s_DRS_DestroySession(void* h){ (void)h; return 0; }
 MSABI static int s_DRS_GetBaseProfile(void* h,void** ph){ (void)h; if(ph)*ph=(void*)0x1B45E; return 0; }
 MSABI static int s_DRS_GetSetting(void* h,void* p,u32 id,void* out){ (void)h;(void)p;(void)id;(void)out; return 0xBAD00004; } // SETTING_NOT_FOUND -> NGX uses default
 MSABI static int s_SYS_GetDriverAndBranchVersion(u32* pver,char* branch){ if(pver)*pver=61043; /*610.43*/ if(branch){const char* b="r610_00";int i=0;for(;b[i]&&i<63;i++)branch[i]=b[i];branch[i]=0;} return 0; }
-#define FAKE_GPU ((void*)0x600D1)   // opaque nvapi GPU handle NGX passes back to GPU_* funcs
+// Back the fake nvapi handles with REAL zeroed memory, so if NGX dereferences a handle
+// (the Windows nvapi handles are internally pointers) it lands in valid memory, not a crash.
+static u8 g_gpubuf[8192];
+#define FAKE_GPU  ((void*)(g_gpubuf))
+#define FAKE_LGPU ((void*)(g_gpubuf+4096))
 MSABI static int s_EnumPhysicalGPUs(void** h,u32* c){ if(h)h[0]=FAKE_GPU; if(c)*c=1; return 0; }
 // NV_GPU_ARCH_INFO = {version@0 (set by caller), architecture@4, implementation@8, revision@12}.
 // We know the device is a Blackwell RTX 5070 -> report GB200 (0x1B0), which is >= Ada, so FG-eligible.
 MSABI static int s_GPU_GetArchInfo(void* gpu,u32* ai){ (void)gpu; if(ai){ ai[1]=0x000001B0; /*GB200/Blackwell*/ ai[2]=0x00000005; /*GB20x impl*/ ai[3]=0x000000A1; /*rev*/ } return 0; }
-MSABI static int s_GetLogicalGPU(void* p,void** l){ (void)p; if(l)*l=(void*)0x600D2; return 0; }
+MSABI static int s_GetLogicalGPU(void* p,void** l){ (void)p; if(l)*l=FAKE_LGPU; return 0; }
 MSABI static int s_GPU_GetPCIIdentifiers(void* g,u32* dev,u32* sub,u32* rev,u32* ext){ (void)g; u32 id=(0x2D18u<<16)|0x10DE; if(dev)*dev=id; if(sub)*sub=0; if(rev)*rev=0xA1; if(ext)*ext=id; return 0; }
 MSABI static int s_GPU_GetFullName(void* g,char* name){ (void)g; const char* s="NVIDIA GeForce RTX 5070 Laptop GPU"; if(name){int i=0;for(;s[i]&&i<63;i++)name[i]=s[i];name[i]=0;} return 0; }
 MSABI static int s_GPU_GetGPUType(void* g,u32* t){ (void)g; if(t)*t=2; /*DGPU*/ return 0; }
 MSABI static int s_GPU_GetBusType(void* g,u32* t){ (void)g; if(t)*t=3; /*PCI_EXPRESS*/ return 0; }
+// A consistent fake Windows adapter LUID, used for BOTH the Vulkan deviceLUID (forced into
+// VkPhysicalDeviceIDProperties) and the nvapi OS-AdapterId, so NGX's adapter correlation matches.
+static const u8 g_luid[8]={0x70,0x50,0xB1,0xAC,0x4E,0x11,0x00,0x00};
+// NV_LOGICAL_GPU_DATA: version@0, pOSAdapterId@8, physicalGpuCount@16, physicalGpuHandles@24.
+MSABI static int s_GPU_GetLogicalGpuInfo(void* lgpu,u8* d){ (void)lgpu; logs("[LGI entered]\n"); if(!d) return 0;
+    void* osid=*(void**)(d+8); if(osid) memcpy(osid,g_luid,8);
+    *(u32*)(d+16)=1; *(void**)(d+24)=FAKE_GPU; logs("[LGI filled]\n"); return 0; }
 MSABI static void* s_nvapi_QueryInterface(u32 id){
     void* f=0; const char* nm="?";
     switch(id){
@@ -173,6 +184,7 @@ MSABI static void* s_nvapi_QueryInterface(u32 id){
         case 0xE5AC921F: f=(void*)s_EnumPhysicalGPUs; nm="EnumPhysicalGPUs"; break;
         case 0xD8265D24: f=(void*)s_GPU_GetArchInfo; nm="GPU_GetArchInfo(Blackwell)"; break;
         case 0xADD604D1: f=(void*)s_GetLogicalGPU; nm="GetLogicalGPUFromPhysicalGPU"; break;
+        case 0x842B066E: f=(void*)s_GPU_GetLogicalGpuInfo; nm="GPU_GetLogicalGpuInfo"; break;
         case 0x2DDFB66E: f=(void*)s_GPU_GetPCIIdentifiers; nm="GPU_GetPCIIdentifiers"; break;
         case 0xCEEE8E9F: f=(void*)s_GPU_GetFullName; nm="GPU_GetFullName"; break;
         case 0xC33BAEB1: f=(void*)s_GPU_GetGPUType; nm="GPU_GetGPUType"; break;
@@ -337,7 +349,7 @@ MSABI static void s_vkGPDP2(void* pd,void* pprops){
                 idp->deviceLUIDValid,idp->deviceLUID[0],idp->deviceLUID[1],idp->deviceLUID[2],idp->deviceLUID[3],
                 idp->deviceLUID[4],idp->deviceLUID[5],idp->deviceLUID[6],idp->deviceLUID[7]); logs(c);
             // TEST: force a valid Windows-style LUID so the host can 'identify the adapter'.
-            if(!idp->deviceLUIDValid){ idp->deviceLUIDValid=1; for(int i=0;i<8;i++) idp->deviceLUID[i]=(u8)(0x5070+i); idp->deviceNodeMask=1; logs("   -> forced LUIDValid=1\n"); }
+            if(!idp->deviceLUIDValid){ idp->deviceLUIDValid=1; memcpy(idp->deviceLUID,g_luid,8); idp->deviceNodeMask=1; }
         } else { char c[48]; snprintf(c,sizeof c,"   pNext sType=%u\n",(unsigned)s->sType); logs(c);} } }
 MSABI static void* my_gipa(void* inst,const char* n){ if(n)logn("[gipa] ",n);
     if(n&&!strcmp(n,"vkGetPhysicalDeviceProperties2")) return (void*)s_vkGPDP2;
