@@ -12,6 +12,7 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model import build_model, train_step, forward_batch   # real model (T2)
 import data, align                                          # loader + alignment gate (T1)
+import losses                                                # §21.6 composite loss (T3)
 
 
 def atomic_save(state, path):
@@ -30,11 +31,12 @@ class Trainer:
         self.scaler = torch.amp.GradScaler(self.dev, enabled=(self.dev == 'cuda'))
         self.step = 0
         self.stop = False
-        self.data_iter = None
+        self.data_iter = None; self.criterion = None
         if a.data_dir:                                        # real rendered triplets (T1)
             loader = data.make_loader(a.data_dir, batch=a.batch, target_fps=a.target_fps, workers=3)
             self._gate(loader)                                # MUST pass before training on real data
             self.data_iter = itertools.cycle(loader)
+            self.criterion = losses.CompositeLoss(self.dev)   # §21.6 (T3)
             self._log(f"[data] {len(loader.dataset)} triplets from {a.data_dir}")
         else:
             self._log("[data] no --data-dir -> synthetic self-supervised batch (pipeline validation)")
@@ -111,9 +113,11 @@ class Trainer:
                 if not self.stop:
                     self._log("[resume] PAUSE cleared -> continue")
                 continue
-            if self.data_iter is not None:                    # real triplets
-                out, _, target = forward_batch(self.model, next(self.data_iter), self.dev)
-                loss = F.l1_loss(out, target)                 # T3 swaps in the §21.6 losses
+            comps = None
+            if self.data_iter is not None:                    # real triplets + §21.6 losses
+                batch = next(self.data_iter)
+                out, _, target = forward_batch(self.model, batch, self.dev)
+                loss, comps = self.criterion(out, target, batch)
             else:
                 loss = train_step(self.model, self.dev)       # synthetic pipeline validation
             self.opt.zero_grad(set_to_none=True)
@@ -121,7 +125,8 @@ class Trainer:
             self.scaler.step(self.opt); self.scaler.update()
             self.step += 1
             if self.step % self.a.log_every == 0:
-                self._log(f"[step {self.step}] loss {loss.item():.4f}")
+                extra = (" " + " ".join(f"{k}={v:.3f}" for k, v in comps.items())) if comps else ""
+                self._log(f"[step {self.step}] loss {loss.item():.4f}{extra}")
             if self.step % self.a.ckpt_every == 0:
                 self._save(snapshot=True)
         self._save()
