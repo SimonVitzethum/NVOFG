@@ -72,6 +72,16 @@ matmul on the 5080 before anything else.
 - **T7. Ablate to the param ceiling.** Sweep ~0.5M → ~4M on the 5080; measure quality (T5) vs
   measured 1080p/1440p/4K latency on a Blackwell deployment card; pick the v1 point.
 
+## Environment status (`ki-pc-fisch-101`) — T0 DONE ✅
+
+Verified 2026-07-17: RTX 5080 (GB203, **sm_120**, 16.6 GB) passed through to an Ubuntu 24.04 VM;
+NVIDIA **open kernel driver 595.71.05** loaded (`/dev/nvidia*`, `libcuda.so.1` present). Python 3.12
+venv at `~/plana` (pip bootstrapped via get-pip; system pip absent). **PyTorch 2.11.0+cu128**
+installed; smoke test passes: `torch.cuda.is_available()=True`, device `RTX 5080`, fp16 Tensor-core
+matmul ~**118 TFLOPS** (8192³ in 9.3 ms). Confirms the inference-budget headroom (~3–4× a 3090 → a
+~1M net ≈ 1–1.5 ms @1080p, room to ~3–4M). Resource envelope for this box: GPU free, RAM < 80 GB,
+CPU ≤ 20% (~3 cores) — so **dataloader `num_workers` ≤ 3**, GPU/AMP unconstrained.
+
 ## Immediate next steps
 
 1. **T0 on `ki-pc-fisch-101`** — bring up a Blackwell-capable PyTorch and prove a Tensor-core matmul.
