@@ -5,11 +5,13 @@ T2 replaces `build_model` + `train_step` with the real SoftSplat+fusion net and 
 Everything else — atomic checkpointing, auto-resume, pause file, signal-graceful stop — is the
 provable-now plumbing. Run under tmux so SSH disconnect never kills it.
 """
-import argparse, os, random, signal, sys, time
+import argparse, itertools, os, random, signal, sys, time
 import torch
+import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from model import build_model, train_step   # real SoftSplat + gated-conv fusion model (T2)
+from model import build_model, train_step, forward_batch   # real model (T2)
+import data, align                                          # loader + alignment gate (T1)
 
 
 def atomic_save(state, path):
@@ -28,9 +30,30 @@ class Trainer:
         self.scaler = torch.amp.GradScaler(self.dev, enabled=(self.dev == 'cuda'))
         self.step = 0
         self.stop = False
+        self.data_iter = None
+        if a.data_dir:                                        # real rendered triplets (T1)
+            loader = data.make_loader(a.data_dir, batch=a.batch, target_fps=a.target_fps, workers=3)
+            self._gate(loader)                                # MUST pass before training on real data
+            self.data_iter = itertools.cycle(loader)
+            self._log(f"[data] {len(loader.dataset)} triplets from {a.data_dir}")
+        else:
+            self._log("[data] no --data-dir -> synthetic self-supervised batch (pipeline validation)")
         self._resume()
         for s in (signal.SIGTERM, signal.SIGUSR1, signal.SIGINT):
             signal.signal(s, self._on_signal)
+
+    def _gate(self, loader):
+        # alignment gate: the warp candidate must land on the capture-GT to sub-pixel, else the
+        # capture has a silent offset that would poison the loss. Abort rather than train on it.
+        self.model.eval()
+        with torch.no_grad():
+            _, cand, target = forward_batch(self.model, next(iter(loader)), self.dev)
+            ok, off, mag = align.alignment_gate(cand.float(), target.float())
+        self.model.train()
+        self._log(f"[align-gate] offset={off[0]:+.2f},{off[1]:+.2f}px |{mag:.2f}| -> {'PASS' if ok else 'FAIL'}")
+        if not ok:
+            self._log("[align-gate] FAILED: capture is sub-pixel-misaligned; fix the harness before training")
+            raise SystemExit(2)
 
     def _ckpt(self, name):
         return os.path.join(self.a.run_dir, name)
@@ -88,7 +111,11 @@ class Trainer:
                 if not self.stop:
                     self._log("[resume] PAUSE cleared -> continue")
                 continue
-            loss = train_step(self.model, self.dev)
+            if self.data_iter is not None:                    # real triplets
+                out, _, target = forward_batch(self.model, next(self.data_iter), self.dev)
+                loss = F.l1_loss(out, target)                 # T3 swaps in the §21.6 losses
+            else:
+                loss = train_step(self.model, self.dev)       # synthetic pipeline validation
             self.opt.zero_grad(set_to_none=True)
             self.scaler.scale(loss).backward()
             self.scaler.step(self.opt); self.scaler.update()
@@ -109,6 +136,9 @@ def main():
     p.add_argument('--log-every', type=int, default=50)
     p.add_argument('--lr', type=float, default=1e-3)
     p.add_argument('--mode', default='interp', choices=['interp','extrap'])
+    p.add_argument('--data-dir', default=None, help='rendered-triplet root (A2); omit -> synthetic')
+    p.add_argument('--target-fps', type=int, default=60)
+    p.add_argument('--batch', type=int, default=4)
     Trainer(p.parse_args()).train()
 
 

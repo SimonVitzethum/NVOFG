@@ -118,6 +118,16 @@ def build_model(mode='interp'):
     return FrameGenModel(mode=mode)
 
 
+def forward_batch(model, batch, device):
+    """Run the model on a data.py batch dict -> (out, cand, target)."""
+    prev = batch['prev'].to(device); curr = batch['curr'].to(device)
+    ff = batch['flow_fwd'].to(device); fb = batch['flow_bwd'].to(device)
+    t = batch['t'].to(device).view(-1, 1, 1, 1)
+    target = batch['target'].to(device)
+    out, cand = model(prev, curr, ff, fb, t)
+    return out, cand, target
+
+
 # --- synthetic self-supervised batch (T1 replaces with rendered triplets) --------------------
 def _grid_warp(img, flow):
     B, C, H, W = img.shape
