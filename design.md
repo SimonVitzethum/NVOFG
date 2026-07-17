@@ -1169,3 +1169,35 @@ single-GPU-trainable milestone that slots into the reserved `NVOFG_INTERP_CNN` i
 public API change. Uncertainties to keep honest: DLSS-G's and QW-Net's exact params/ms are
 unpublished (figures above are from comparable open academic nets), and matching DLSS 4's
 transformer-grade polish is a stretch goal, not a v1 promise.
+
+### 21.10 Strategic realities & the honest ceiling
+
+Five findings that should shape expectations and priorities:
+
+1. **The hard part is the *system*, not the interpolation kernel.** Every shipped solution
+   (DLSS-G, FSR3 FG, AFMF, Lossless Scaling) produces decent generated *pixels*; they diverge on
+   **HUD/transparency masking, disocclusion fill, and latency/pacing/VRR**. AMD's FSR3 shipped
+   ~11–12 months after DLSS3 and still trailed — mostly on VSync/VRR/pacing, not pixel quality.
+   → Invest in MV/depth ingestion, mask handling, disocclusion, and `VK_NV_low_latency2` pacing at
+   least as much as in the network.
+2. **Better inputs beat a bigger model.** Meta's ASW jumped in quality from 1.0→2.0 chiefly by
+   **adding depth** to separate layers before reprojection — not by a larger net. We already have
+   depth + MV + OFA flow; exploiting them well is the highest-leverage work.
+3. **DLSS 4 moved past hardware optical flow.** DLSS 4 replaced the OFA with an efficient AI motion
+   model and a **transformer** FG net, and put pacing in **Blackwell hardware flip-metering**
+   (excludes RTX 40). Implication for nvofg: the **OFA is still a perfectly good flow source for
+   *us*** (it's free, native, and Linux-exposed), but the durable parts of NVIDIA's moat we cannot
+   match are **FP8 tensor throughput, hardware flip-metering, the Streamline/engine ecosystem, and a
+   ~6-year training corpus** — not the OFA block itself.
+4. **FSR 3 FG is fully MIT-licensed source** ([GPUOpen FidelityFX-SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)) —
+   a proven, MV-driven, *non-neural* optical-flow + disocclusion/reprojection interpolator. It is the
+   **strongest licensable reference/starting point**: a v0.5 could port its algorithm (portable, no
+   NN, no training) as an interim FG quality bump while the learned model (§21.4) is trained.
+5. **A solo dev shipped usable ML frame-gen** (Lossless Scaling, RGB-only, no engine data, 2–5M
+   sales) — proof the *floor* is reachable by a tiny team. With our engine data we start well above
+   that floor. But nobody small has *matched* DLSS-G, and we should not promise to.
+
+**Honest ceiling:** target **"clearly beats classical warp at occlusion boundaries (v1) → FSR3-FG-
+competitive, DLSS-G-adjacent (v2)"**. A pixel-match of DLSS-G — especially its latency story — is not
+a realistic goal without flip-metering hardware and NVIDIA-scale training. That is an acceptable
+outcome: FSR3-competitive *native Linux* frame generation is already a category no one else ships.
