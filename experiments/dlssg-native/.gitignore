@@ -1,6 +1,8 @@
-pe_probe
-*.o
-# never commit NVIDIA's DLLs
 *.dll
+*.exe
+# never commit NVIDIA's DLLs
+ngxfg_result.txt
+*.o
 pe_load
+pe_probe
 s5_host

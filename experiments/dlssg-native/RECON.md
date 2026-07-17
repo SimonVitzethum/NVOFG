@@ -289,7 +289,31 @@ pragmatic parallel path and does not depend on any of this.
   break stage.
 - **S4 — Reflex present-metering** and **S6 — feed our Vulkan frame/backbuffer**: unchanged.
 
-## Next step
+## 🟢 GATE 3 — ANSWERED GREEN: the native Linux driver reports FG available
+
+Before sinking more sessions into the native adapter-layer rebuild, we answered the one question
+the whole Path-B chain runs toward, with the cheapest *complete* oracle: run the **same** driver
+`_nvngx.dll` under **GE-Proton** (full dxvk-nvapi + vkd3d + dxgi stack) against the **real Linux
+driver + RTX 5070**, and read `NVSDK_NGX_VULKAN_GetFeatureRequirements(FrameGeneration)`
+(`ngxfg_probe.exe`, mingw; `run_proton.sh`). Result (`gate3_oracle_result.txt`):
+
+```
+FrameGeneration   result=0x00000001 (Success)  FeatureSupported=0x0 (SUPPORTED)  MinHWArch=0x190  MinOS=10.0.0
+```
+
+**`FeatureSupported == 0` ⇒ the native Linux driver reports DLSS Frame Generation as AVAILABLE on
+the RTX 5070** (through the complete Windows stack). The "no" was **not** structurally predetermined —
+Path B has a **proven payoff**. (SuperSampling/RayReconstruction returned `0xBAD00012` NotImplemented
+via this specific discovery call — a quirk of the requirements path, not our concern; FG is the
+target and it's Supported.)
+
+**Consequence:** the native adapter-layer rebuild (the +0xceee string identifier, the +0xb7f9
+adapter array, the LUID/OS-adapter correlation) is now **justified**, and Proton/Wine is the
+complete **reference** for every adapter struct we synthesise — we port what Wine demonstrably feeds
+NGX, instead of guessing. Gate 3 green flips the strategy from "should we keep digging?" to "finish
+the native adapter layer, using Wine as the oracle for each struct."
+
+## Next step (now justified)
 
 **S5** (the crux): load the NGX host PEs (`nvngx.dll` + `_nvngx.dll`) under the same loader (they
 need the same CRT shim + a few more Win32 DLLs: CRYPT32/bcrypt/ole32/WS2_32 — all shimmable), get

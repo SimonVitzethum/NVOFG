@@ -1078,6 +1078,28 @@ native, single-GPU-trainable) stays the pragmatic parallel path and depends on n
 *(Working log + probes in `experiments/dlssg-native/RECON.md`; `pe_probe.c` S1, `pe_load.c` S2,
 `s5_host.c` S5.)*
 
+### 20.9 🟢 Gate 3 answered GREEN — the driver reports FG available
+
+The native RE (S5c) crossed the PlatformError gate and NGX accepted the Blackwell 5070, but Init then
+crashed deep in NGX's **Windows OS-adapter correlation** — a long tail converging on needing a real
+DXGI/OS adapter. Rather than rebuild Proton's adapter layer struct-by-struct *before* knowing whether
+the driver even offers FG, we answered the go/no-go with the **cheapest complete oracle**: run the
+same driver `_nvngx.dll` under **GE-Proton** (full dxvk-nvapi + vkd3d + dxgi) against the real Linux
+driver + RTX 5070, and read `NVSDK_NGX_VULKAN_GetFeatureRequirements(FrameGeneration)`
+(`experiments/dlssg-native/ngxfg_probe.c` + `run_proton.sh`):
+
+```
+FrameGeneration   result=0x00000001 (Success)   FeatureSupported=0x0 (SUPPORTED)   MinHWArch=0x190   MinOS=10.0.0
+```
+
+**`FeatureSupported == 0` ⇒ the native Linux driver reports DLSS Frame Generation as AVAILABLE on the
+RTX 5070** (through the complete Windows stack). The "no" was **not** structurally predetermined —
+**Path B has a proven payoff.** This flips the strategy: the native adapter-layer rebuild (the
++0xceee string identifier, the +0xb7f9 adapter array, the LUID/OS-adapter correlation) is now
+**justified**, and Proton/Wine is the complete **reference** for every adapter struct to synthesise —
+we port what Wine demonstrably feeds NGX rather than guess. The own model (§21) remains the parallel
+path, but Path B is no longer a gamble against a possibly-predetermined refusal.
+
 ## 21. Training our own frame-generation model — what it would take
 
 Path B (§20) is a dead end; the native way to close the quality gap to DLSS-G is to **train

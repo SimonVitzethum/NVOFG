@@ -1,13 +1,13 @@
 # ADR 0008 — Path B: native in-process loader for DLSS Frame Generation (`nvngx_dlssg.dll`)
 
-- **Status:** Accepted — **experiment underway, strongly positive.** S0–S2 (snippet loads + DllMain
-  native) + S5(a) (host loads, API reachable) + **S5(b): `NVSDK_NGX_VULKAN_Init_ProjectID` runs
-  natively end-to-end via ms_abi↔SysV Vulkan/CUDA thunks + a live VkDevice, returning a clean
-  `0xBAD00002` FAIL_PlatformError — failing ONLY because nvapi64.dll isn't bridged**. The single
-  remaining dependency to a successful Init is an **nvapi shim** (dxvk-nvapi role). **S5(c): Gate 2
-  characterised** — NGX resolves *private/undocumented* nvapi interface IDs for arch detection (no
-  NVML fallback in this build; dxvk-nvapi pulls the DXVK d3d stack), so crossing it needs RE of the
-  ~6 private interfaces or hosting DXVK; until then Gate 3 (FG-available go/no-go) is unreachable.
+- **Status:** Accepted — **experiment underway, 🟢 GATE 3 GREEN.** S0–S2 (snippet+DllMain native) +
+  S5(a) (host loads) + S5(b) (Init runs via ms_abi↔SysV thunks) + S5(c) nvapi RE (crossed
+  PlatformError; NGX accepts the Blackwell 5070; wall = Windows OS-adapter correlation). **Gate 3
+  answered GREEN via the Proton oracle** (`experiments/dlssg-native/ngxfg_probe.exe` under GE-Proton):
+  `NVSDK_NGX_VULKAN_GetFeatureRequirements(FrameGeneration)` on the real Linux driver + RTX 5070
+  returns **Success + FeatureSupported=0 — the driver DOES report FG available**. So the "no" was not
+  predetermined; the native adapter-layer rebuild is **justified**, with Wine as the per-struct
+  reference. Own trained model (§21) stays the parallel path (24h to the 5080 server).
   Own trained model (§21) kept as the parallel — and now pragmatically favoured — fallback.
 - **Date:** 2026-07-17
 - **Relates to:** design.md §20 (Path B plan), §21 (own model); ADR 0006 (NGX).
