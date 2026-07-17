@@ -73,14 +73,43 @@ def verify(ckpt, mode='interp', base=24):
     return ok
 
 
+def _save_t(path, t):
+    import numpy as np
+    t = t.detach().cpu().to(torch.float16).contiguous()
+    with open(path, 'wb') as f:
+        f.write(struct.pack('<I', t.dim()))
+        for d in t.shape:
+            f.write(struct.pack('<I', d))
+        f.write(t.numpy().tobytes())
+
+
+def export_golden(ckpt, prefix, mode='interp', base=24, H=32, W=32):
+    """Golden test for the C++/GPU inference: a fixed fusion input x (12,H,W) and the fusion residual
+    output y (3,H,W), so the backend's forward can be checked against PyTorch bit-close."""
+    torch.manual_seed(0)
+    m = build_model(mode)
+    if ckpt and os.path.exists(ckpt):
+        m.load_state_dict(torch.load(ckpt, map_location='cpu', weights_only=False)['model'])
+    m.eval()
+    x = torch.rand(1, 12, H, W)
+    with torch.no_grad():
+        y = m.fusion(x)
+    _save_t(prefix + '_x.bin', x); _save_t(prefix + '_y.bin', y)
+    print(f"golden: x{tuple(x.shape)} y{tuple(y.shape)} -> {prefix}_x.bin {prefix}_y.bin")
+
+
 if __name__ == '__main__':
     p = argparse.ArgumentParser()
     p.add_argument('--ckpt', default=None)
     p.add_argument('--out', default='fg_v1.nvfgw')
     p.add_argument('--mode', default='interp')
     p.add_argument('--verify', action='store_true')
+    p.add_argument('--golden', default=None, help='prefix -> <prefix>.nvfgw + _x/_y.bin')
     a = p.parse_args()
     if a.verify:
         assert verify(a.ckpt, a.mode), "round-trip failed"
+    elif a.golden:
+        export(a.ckpt, a.golden + '.nvfgw', a.mode)
+        export_golden(a.ckpt, a.golden, a.mode)
     else:
         export(a.ckpt, a.out, a.mode)
