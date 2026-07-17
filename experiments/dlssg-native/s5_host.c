@@ -406,6 +406,11 @@ MSABI static void* s_LoadLibraryA(const char* n){ const char* s=strrchr(n,'\\');
 MSABI static int   s_GetModuleHandleExW(u32 f,void* n,void** out){ (void)f;(void)n; if(out)*out=g_mod[0].base; return 1; }
 // GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS (0x4): resolve which loaded module CONTAINS the address.
 // The snippet uses this to find its own module (then its path). Returning the dummy module broke it.
+// The snippet checks the OS version (RtlGetVersion) against MinOS=10.0.0; an unfilled struct reads
+// as 0.0.0 -> FeatureSupported bit 0x8 (OSVersionBelow). Report Windows 10.0.19041 (like Wine/Proton).
+// RTL_OSVERSIONINFOW: size@0, major@4, minor@8, build@12, platformId@16, szCSDVersion@20.
+MSABI static int s_RtlGetVersion(u8* vi){ if(vi){ *(u32*)(vi+4)=10; *(u32*)(vi+8)=0; *(u32*)(vi+12)=19041; *(u32*)(vi+16)=2; *(u16*)(vi+20)=0; } return 0; }
+MSABI static int s_GetVersionExW(u8* vi){ if(vi){ *(u32*)(vi+4)=10; *(u32*)(vi+8)=0; *(u32*)(vi+12)=19041; *(u32*)(vi+16)=2; *(u16*)(vi+20)=0; } return 1; }
 MSABI static int   s_GetModuleHandleExA(u32 f,void* n,void** out){
     if((f&4) && n){ for(int i=0;i<g_nmod;i++) if(g_mod[i].base && (u8*)n>=g_mod[i].base && (u8*)n<g_mod[i].base+g_mod[i].size){ if(out)*out=g_mod[i].base; return 1; } }
     if(out)*out=g_mod[0].base; return 1; }
@@ -424,6 +429,7 @@ struct { const char* name; void* fn; } g_stubs[]={
  {"GetLastError",s_GetLastError},{"SetLastError",s_SetLastError},
  {"GetModuleHandleW",s_GetModuleHandleW},{"GetModuleHandleA",s_GetModuleHandleW},{"GetProcAddress",s_GetProcAddress},
  {"GetModuleHandleExW",s_GetModuleHandleExW},{"GetModuleHandleExA",s_GetModuleHandleExA},
+ {"RtlGetVersion",s_RtlGetVersion},{"GetVersionExW",s_GetVersionExW},{"GetVersionExA",s_GetVersionExW},
  {"LoadLibraryW",s_LoadLibraryExW},{"LoadLibraryExW",s_LoadLibraryExW},{"LoadLibraryA",s_LoadLibraryA},{"LoadLibraryExA",s_LoadLibraryA},
  {"GetStartupInfoW",s_GetStartupInfoW},{"GetCommandLineW",s_GetCommandLineW},{"GetCommandLineA",s_GetCommandLineW},
  {"OutputDebugStringA",s_OutputDebugStringA},
