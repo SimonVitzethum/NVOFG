@@ -26,6 +26,7 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <ucontext.h>
 #include <unistd.h>
 #include <vulkan/vulkan.h>
 
@@ -356,7 +357,15 @@ MSABI static void* my_gipa(void* inst,const char* n){ if(n)logn("[gipa] ",n);
     void* f=(void*)vkGetInstanceProcAddr((VkInstance)inst,n); return f?make_ms2sysv(f):0; }
 MSABI static void* my_gdpa(void* dev,const char* n){ if(n)logn("[gdpa] ",n); PFN_vkGetDeviceProcAddr g=(PFN_vkGetDeviceProcAddr)vkGetInstanceProcAddr(g_inst,"vkGetDeviceProcAddr"); void* f=g?(void*)g((VkDevice)dev,n):0; return f?make_ms2sysv(f):0; }
 
-static void segv(int s,siginfo_t* si,void* u){(void)s;(void)u;char b[19]="0x0000000000000000";u64 a=(u64)si->si_addr;for(int i=0;i<16;i++){int d=(a>>((15-i)*4))&0xF;b[2+i]=d<10?'0'+d:'a'+d-10;}logs("[SIGSEGV @ ");(void)write(2,b,18);logs("]\n");_exit(42);}
+static void hex64(char* o,u64 a){ for(int i=0;i<16;i++){int d=(a>>((15-i)*4))&0xF;o[i]=d<10?'0'+d:'a'+d-10;} o[16]=0; }
+static void segv(int s,siginfo_t* si,void* uc){ (void)s;
+    u64 addr=(u64)si->si_addr; u64 rip=0;
+    if(uc){ ucontext_t* c=(ucontext_t*)uc; rip=(u64)c->uc_mcontext.gregs[REG_RIP]; }
+    char b[20]; char out[256]="[SIGSEGV addr=0x"; hex64(b,addr); strcat(out,b); strcat(out," rip=0x"); hex64(b,rip); strcat(out,b);
+    // which loaded module is rip in?
+    for(int i=0;i<g_nmod;i++){ u64 lo=(u64)g_mod[i].base; if(rip>=lo&&rip<lo+0x2000000){ strcat(out," in "); strcat(out,g_mod[i].name); strcat(out,"+0x"); hex64(b,rip-lo); strcat(out,b); break; } }
+    if(rip>=(u64)g_code&&rip<(u64)g_code+(1<<20)) strcat(out," in <thunk/trap>");
+    strcat(out,"]\n"); (void)write(2,out,strlen(out)); _exit(42); }
 
 int main(void){
     printf("== Path B / S5(a): load Windows NGX host natively\n");

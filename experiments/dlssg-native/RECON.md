@@ -240,6 +240,26 @@ Windows/DXGI adapter (the DXVK dependency). The go/no-go (does Linux NGX report 
 remains unreached because Init crashes in that correlation before completing. The own model
 (§21) stays the pragmatic parallel path.
 
+### S5(c) crash-site RE — both pinpointed inside `_nvngx.dll`'s adapter enumeration
+
+Enhanced the SIGSEGV handler to resolve the faulting RIP to `module+offset`. Both crashes are
+in the NGX host `_nvngx.dll`, in its GPU/adapter-enumeration processing:
+
+- **`_nvngx.dll+0xb7f9`** (after `GPU_GetLogicalGpuInfo`): iterates an internal pointer array —
+  `rax=*(r14)`, `r8=&array[i]`, `mov (%r8),%rdx` faults. NGX walks an internal GPU/adapter list
+  our synthesized nvapi enumeration didn't fully/correctly populate.
+- **`_nvngx.dll+0xceee`** (the earlier, intermittent one): builds a ~40-byte struct on the stack
+  (2×`movups` + `movsd`), then `movzbl (%rcx),%eax` with `rcx=NULL` and a length check `esi >= 19`
+  — reading a **string identifier** (UUID / name / path, ≥19 chars) we return null or too short.
+
+So beyond the arch acceptance, NGX processes a **fuller GPU/adapter representation** — an internal
+adapter array + string identifiers — before it will complete Init. This is precise, disassembly-
+driven RE of NGX internals, and it keeps converging on NGX's **Windows adapter model** (the LUID/
+UUID/adapter-list correlation), whose ultimate backing is a real DXGI/OS adapter with no native-
+Linux equivalent. Each fix advances NGX one instruction-region further; the tail is long and points
+at the DXVK/DXGI dependency. `0xBAD00001` remains the still-initialising state; Init crashes before
+a definitive FG-available result. Own model (§21) stays the pragmatic parallel path.
+
 ### Honest status & decision point
 
 Path B went from "infeasible in practice" to: **both NVIDIA PEs load natively, DllMain→1, the
