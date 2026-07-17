@@ -1,9 +1,0 @@
-  vk device: vendor=0x8086 device=0xA78B Intel(R) Graphics (RPL-S)
-  vk device: vendor=0x10DE device=0x2D18 NVIDIA GeForce RTX 5070 Laptop GPU
-  nvngx loaded: 00006FFFFC830000
-  GetFeatureRequirements export: 00006FFFFC83DF80
-  SuperSampling(DLSS)  result=0xBAD00012 FeatureSupported=0x0 MinHWArch=0x0 MinOS=
-  FrameGeneration      result=0x00000001 FeatureSupported=0x0 MinHWArch=0x190 MinOS=10.0.0
-  RayReconstruction    result=0xBAD00012 FeatureSupported=0x0 MinHWArch=0x0 MinOS=
-VERDICT: FrameGeneration FeatureSupported==0 => Gate 3 GREEN (driver reports FG available);
-         ==16 NotImplemented => Gate 3 RED (driver lacks FG path); ==4 AdapterUnsupported; ==2 DriverVersion.

@@ -1,72 +1,60 @@
-# ADR 0008 — Path B: native in-process loader for DLSS Frame Generation (`nvngx_dlssg.dll`)
+# ADR 0008 — Native DLSS Frame Generation loader ("Path B"): private research, not a product
 
-- **Status:** Accepted — **experiment underway, 🟢 GATE 3 GREEN.** S0–S2 (snippet+DllMain native) +
-  S5(a) (host loads) + S5(b) (Init runs via ms_abi↔SysV thunks) + S5(c) nvapi RE (crossed
-  PlatformError; NGX accepts the Blackwell 5070; wall = Windows OS-adapter correlation). **Gate 3
-  answered GREEN via the Proton oracle** (`experiments/dlssg-native/ngxfg_probe.exe` under GE-Proton):
-  `NVSDK_NGX_VULKAN_GetFeatureRequirements(FrameGeneration)` on the real Linux driver + RTX 5070
-  returns **Success + FeatureSupported=0 — the driver DOES report FG available**. So the "no" was not
-  predetermined; the native adapter-layer rebuild is **justified**, with Wine as the per-struct
-  reference. Own trained model (§21) stays the parallel path (24h to the 5080 server).
-  Own trained model (§21) kept as the parallel — and now pragmatically favoured — fallback.
+- **Status:** Decided — **Path B kept as PRIVATE interoperability research; NOT shipped.** The
+  shippable product path is the own native model (ADR-tracked as "Plan A", see
+  `docs/plan-a-native-framegen.md`).
 - **Date:** 2026-07-17
-- **Relates to:** design.md §20 (Path B plan), §21 (own model); ADR 0006 (NGX).
+- **Supersedes** the earlier "pursue Path B" framing of this ADR.
 
 ## Context
 
-DLSS Frame Generation has no native Linux runtime — it ships only as the Windows PE
-`/usr/lib/nvidia/wine/nvngx_dlssg.dll`, and the native NGX host returns
-`FrameGeneration = FAIL_FeatureNotSupported (0xBAD00004)`. §20 planned "Path B" (load that PE in a
-native Linux process without Proton) and rated it *infeasible in practice*. The user chose to
-**pursue B anyway**, because it **scales to future DLSS FG versions** for free (a newer snippet drops
-in), with an own trained model (§21) as fallback. This ADR records the decision to run Path B as a
-staged, empirically-gated experiment under `experiments/dlssg-native/`.
+DLSS Frame Generation has no native Linux runtime — it ships only as a Windows PE inside the driver's
+Wine/Proton directory, and the native NGX host reports it unsupported. "Path B" explored loading that
+module in a native Linux process (no Wine/Proton) so nvofg/RenderFX could interoperate with it.
+
+## What was learned (kept private)
+
+- **Feasibility is proven.** The native driver does support FG, and a native host↔module bridge can
+  drive the capability query to the exact result the reference stack gives ("fully supported"). The
+  functional path (init → create → evaluate → pacing) is a multi-week reverse-engineering tail.
+- The concrete findings are interoperability information obtained by decompilation and are retained
+  **locally only**, git-ignored, never published (see Compliance).
 
 ## Decision
 
-Pursue Path B in stages, each gated by an empirical result, and **stop the moment a stage proves a
-hard blocker** (rather than sinking XL effort blind). The own-model track (§21) stays alive in
-parallel as the fallback. The Windows DLL is **never vendored/redistributed** — the experiment loads
-the on-disk driver file in place (legal posture per §20.6; product use needs NVIDIA clearance).
+1. **Retain Path B as private interoperability research** under `experiments/dlssg-native/`, which is
+   **git-ignored** (not tracked, not published). It exists to (a) prove feasibility and (b) serve as
+   an **offline quality reference** for the own model.
+2. **Do not publish or ship Path B**, in any form, and do not distribute NVIDIA binaries.
+3. **Build the product on "Plan A"** — an own native frame generator (own/open weights, no NVIDIA
+   binary loaded), see `docs/plan-a-native-framegen.md`.
 
-## What the recon changed (the reason to continue)
+## Compliance rationale
 
-The §20 plan assumed the snippet dragged in D3D12/DXGI/COM (→ "re-host Proton in-process", XL). The
-S0/S1 recon **disproved that for the snippet**:
-
-- `nvngx_dlssg.dll` imports **only Vulkan (22) + CUDA (26) + MSVC-CRT (KERNEL32 143) + 7 trivial
-  Win32** (VERSION/ADVAPI32/USER32). **No D3D12, no DXGI, no COM** in the snippet.
-- `pe_probe.c` maps + relocates the 9 MB PE natively (3770 relocations) and **resolves all 48
-  Vulkan+CUDA imports against native `libvulkan.so.1` / `libcuda.so.1`**. The snippet is a
-  CUDA+Vulkan compute module (NN on CUDA, shared with Vulkan via external memory/semaphores).
-- The only remainder to *load* the snippet is **150 standard MSVC-CRT symbols + a PE-aware CRT/SEH
-  init** — a bounded, reusable shim (Wine `ucrtbase`/`kernel32` or taviso/loadlibrary).
-
-So the **snippet-loading** half is now demonstrably tractable.
-
-**S2 update — it loads and runs.** `pe_load.c` executes the snippet's `DllMain(DLL_PROCESS_ATTACH)`
-natively and it **returns TRUE** (3/3 runs). Required, beyond S1: executable section protections;
-the **MS-x64 ABI boundary** (`ms_abi` shims); a **~40-stub MSVC-CRT shim** with `GetProcAddress`
-returning callable stubs for the CRT's optional-API probes; and a **fake Windows TEB on `gs`** +
-**PE-TLS** via `arch_prctl(ARCH_SET_GS)` (the Wine TEB mechanism — the `gs:[0x58]` fault was the last
-blocker). No D3D12/DXGI/COM, no exotic dependency.
-
-**The crux is now S5**: the snippet exports **0 named functions**, so the host↔snippet interface is
-an **internal, undocumented NGX ABI** — either load the Windows host PEs (`_nvngx.dll` adds
-crypto/COM/winsock, all CRT-shimmable) so `CreateFeature(FrameGeneration)` reaches the native
-snippet, or reverse the entry ABI and drive it from a minimal custom host. That, plus S4 Reflex
-present-metering, is where Path B still may die.
+- Reverse engineering **for interoperability** of an independently created program is permitted in
+  Germany by **§ 69e UrhG**; the EULA's reverse-engineering ban is **void to that extent** under
+  **§ 69g Abs. 2 UrhG**, and **§ 3 Abs. 1 Nr. 2 GeschGehG** permits disassembling a lawfully acquired
+  product. The driver is licensed and its files are loaded in place, never copied/redistributed.
+- **"Legal in Germany under §69e" is NOT "NVIDIA-compliant."** NVIDIA's EULA forbids the reverse
+  engineering, the derivative shim environment, running the module outside its supported runtime, and
+  the signature check the loader had to satisfy. No realistic NVIDIA license (including the NGX/DLSS
+  SDK license, which blesses only the official SDK integration + redistribution of their *signed*
+  runtime) covers a native loader driving the module outside the supported path. So Path B **cannot
+  be published NVIDIA-compliant**, and **§ 69e Abs. 2 Nr. 2** independently forbids passing the
+  obtained internals to third parties beyond interoperability necessity → it stays private.
+- (Even replacing the loader's faked signature assertion with *faithful* Authenticode verification of
+  the genuine NVIDIA signature — a cleaner posture, worth doing for the private artifact — removes the
+  circumvention concern but not the EULA use/derivative limits, so it does not enable publication.)
 
 ## Consequences
 
-- **Positive:** the biggest assumed blocker (D3D12/COM in the snippet) is gone; S1 is a concrete,
-  reproducible milestone; the effort is now honestly scoped to S2 (CRT shim) → S5 (host handshake).
-- **Negative / open:** S5 is undecided and could still be fatal; S4 latency/pacing remains; the
-  legal posture forbids shipping without NVIDIA clearance. If S5 blocks, we fall back to §21.
-- **No product coupling yet:** this lives entirely under `experiments/dlssg-native/` and touches no
-  nvofg/RenderFX shipping code.
+- No product coupling to Path B; nvofg/RenderFX ship on Plan A only.
+- The only NVIDIA-compliant route to native DLSS-G would be NVIDIA shipping it natively or an explicit
+  written agreement — neither is assumed.
 
 ## Alternatives
-- **Own trained model (§21)** — kept as the parallel fallback; more practical to *ship*, does not
-  scale to future DLSS versions for free, needs training compute (a 5080 server, ~100–200 h).
-- **Proton/Wine** — rejected (native-Linux, no-Wine mandate).
+
+- **Plan A — own native model** (chosen for the product): own/open weights, native from day one, no
+  NVIDIA binary, no clearance needed. See `docs/plan-a-native-framegen.md`.
+- **Official NGX/DLSS SDK integration** — compliant, but provides no native-Linux Frame Generation
+  (the gap this project addresses).

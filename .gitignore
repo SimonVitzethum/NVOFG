@@ -43,3 +43,6 @@ flow.png
 renderfx/vendor/ngx/
 /build-ngx/
 renderfx/vendor/xess/
+
+# Path B (native DLSS-G loader) — private §69e interoperability research, NOT published
+experiments/dlssg-native/
