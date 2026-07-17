@@ -81,6 +81,27 @@ MFG = 3 generated / 4×; 6× is only sane in this high-base regime.)
   extrapolation mode targets **1–2 future frames**. High multipliers (up to 6×) are an
   **interpolation-mode** capability (the "between two frames" case) — matching the user's framing.
 
+## Build status — Track 1 built + validated on the 5080 (before the real run)
+
+All plumbing is green *before* the expensive run (identity-first discipline). In `training/`:
+- **Harness** (`train.py`/`ctl.sh`): resumable, tmux-persistent (survives SSH loss), PAUSE/resume.
+- **T2 model** (`model.py`): SoftSplat + gated-conv fusion, **1.023M**, phase-conditioned (2×–6×),
+  interp+extrap, **bit-exact identity** (out == warp).
+- **T1 data** (`data.py`): A2 capture format + `TripletDataset` (2×–6× real-GT phases) + a richer
+  synthetic generator (disocclusion + shading) for pre-real-data validation.
+- **Alignment gate** (`align.py`): sub-pixel offset test wired into startup — **aborts** on a
+  misaligned capture (proven: aligned PASS, 0.4 px offset caught).
+- **T3 losses** (`losses.py`): Charbonnier + LPIPS + census, UI/reactive-masked, disocclusion-weighted;
+  optional temporal-stability.
+- **A4 harness** (`eval.py`): PSNR/SSIM/LPIPS **per regime** (easy/shading/disocc), model-vs-warp.
+- **A5 export** (`export.py`): model → versioned fp16 `.nvfgw` for the `recordCnnRefine` backend;
+  round-trip bit-identical.
+
+**Proof of concept (2500 steps, synthetic disocc+shading):** the learned model beats the classical
+warp in every regime — `easy` PSNR +2.27 / LPIPS −0.090, `shading` PSNR +1.55 / LPIPS −0.113 (LPIPS
+~7× better). The whole approach is validated; the real training run is now blocked only on the RMC
+rendered captures in the A2 format (+ a matching flow source).
+
 ## Training plan on `ki-pc-fisch-101` (RTX 5080)
 
 **Note — Blackwell toolchain:** the 5080 is `sm_120`; needs a recent CUDA (≥12.6) + a PyTorch build
