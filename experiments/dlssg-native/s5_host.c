@@ -148,6 +148,17 @@ MSABI static int s_DRS_LoadSettings(void* h){ (void)h; return 0; }
 MSABI static int s_DRS_DestroySession(void* h){ (void)h; return 0; }
 MSABI static int s_DRS_GetBaseProfile(void* h,void** ph){ (void)h; if(ph)*ph=(void*)0x1B45E; return 0; }
 MSABI static int s_DRS_GetSetting(void* h,void* p,u32 id,void* out){ (void)h;(void)p;(void)id;(void)out; return 0xBAD00004; } // SETTING_NOT_FOUND -> NGX uses default
+MSABI static int s_SYS_GetDriverAndBranchVersion(u32* pver,char* branch){ if(pver)*pver=61043; /*610.43*/ if(branch){const char* b="r610_00";int i=0;for(;b[i]&&i<63;i++)branch[i]=b[i];branch[i]=0;} return 0; }
+#define FAKE_GPU ((void*)0x600D1)   // opaque nvapi GPU handle NGX passes back to GPU_* funcs
+MSABI static int s_EnumPhysicalGPUs(void** h,u32* c){ if(h)h[0]=FAKE_GPU; if(c)*c=1; return 0; }
+// NV_GPU_ARCH_INFO = {version@0 (set by caller), architecture@4, implementation@8, revision@12}.
+// We know the device is a Blackwell RTX 5070 -> report GB200 (0x1B0), which is >= Ada, so FG-eligible.
+MSABI static int s_GPU_GetArchInfo(void* gpu,u32* ai){ (void)gpu; if(ai){ ai[1]=0x000001B0; /*GB200/Blackwell*/ ai[2]=0x00000005; /*GB20x impl*/ ai[3]=0x000000A1; /*rev*/ } return 0; }
+MSABI static int s_GetLogicalGPU(void* p,void** l){ (void)p; if(l)*l=(void*)0x600D2; return 0; }
+MSABI static int s_GPU_GetPCIIdentifiers(void* g,u32* dev,u32* sub,u32* rev,u32* ext){ (void)g; u32 id=(0x2D18u<<16)|0x10DE; if(dev)*dev=id; if(sub)*sub=0; if(rev)*rev=0xA1; if(ext)*ext=id; return 0; }
+MSABI static int s_GPU_GetFullName(void* g,char* name){ (void)g; const char* s="NVIDIA GeForce RTX 5070 Laptop GPU"; if(name){int i=0;for(;s[i]&&i<63;i++)name[i]=s[i];name[i]=0;} return 0; }
+MSABI static int s_GPU_GetGPUType(void* g,u32* t){ (void)g; if(t)*t=2; /*DGPU*/ return 0; }
+MSABI static int s_GPU_GetBusType(void* g,u32* t){ (void)g; if(t)*t=3; /*PCI_EXPRESS*/ return 0; }
 MSABI static void* s_nvapi_QueryInterface(u32 id){
     void* f=0; const char* nm="?";
     switch(id){
@@ -158,6 +169,14 @@ MSABI static void* s_nvapi_QueryInterface(u32 id){
         case 0xDA8466A0: f=(void*)s_DRS_GetBaseProfile; nm="DRS_GetBaseProfile"; break;
         case 0x0DD462FB: f=(void*)s_DRS_DestroySession; nm="DRS_DestroySession"; break;
         case 0x73BF8338: f=(void*)s_DRS_GetSetting; nm="DRS_GetSetting"; break;
+        case 0x2926AAAD: f=(void*)s_SYS_GetDriverAndBranchVersion; nm="SYS_GetDriverAndBranchVersion"; break;
+        case 0xE5AC921F: f=(void*)s_EnumPhysicalGPUs; nm="EnumPhysicalGPUs"; break;
+        case 0xD8265D24: f=(void*)s_GPU_GetArchInfo; nm="GPU_GetArchInfo(Blackwell)"; break;
+        case 0xADD604D1: f=(void*)s_GetLogicalGPU; nm="GetLogicalGPUFromPhysicalGPU"; break;
+        case 0x2DDFB66E: f=(void*)s_GPU_GetPCIIdentifiers; nm="GPU_GetPCIIdentifiers"; break;
+        case 0xCEEE8E9F: f=(void*)s_GPU_GetFullName; nm="GPU_GetFullName"; break;
+        case 0xC33BAEB1: f=(void*)s_GPU_GetGPUType; nm="GPU_GetGPUType"; break;
+        case 0x1BB18724: f=(void*)s_GPU_GetBusType; nm="GPU_GetBusType"; break;
         default: nm="(unimpl->null)"; break;
     }
     char b[64]; snprintf(b,sizeof b,"[nvapi_QI 0x%08X %s]\n",id,nm); logs(b); return f; }
@@ -304,8 +323,26 @@ static int setup_vulkan(void){
     if(try_device(de,5) && try_device(de,3) && try_device(0,0)) return 3;   // degrade until a device is created
     vkGetDeviceQueue(g_dev,g_qfam,0,&g_queue); return 0; }
 // ms_abi gipa/gdpa: the host calls these MS-x64; return ms2sysv-wrapped native entry points.
-MSABI static void* my_gipa(void* inst,const char* n){ void* f=(void*)vkGetInstanceProcAddr((VkInstance)inst,n); return f?make_ms2sysv(f):0; }
-MSABI static void* my_gdpa(void* dev,const char* n){ PFN_vkGetDeviceProcAddr g=(PFN_vkGetDeviceProcAddr)vkGetInstanceProcAddr(g_inst,"vkGetDeviceProcAddr"); void* f=g?(void*)g((VkDevice)dev,n):0; return f?make_ms2sysv(f):0; }
+// Interpose vkGetPhysicalDeviceProperties2 (the ONE fn NGX's arch path resolves): call
+// native, then log the device id NGX sees + the pNext structs it asked to be filled.
+MSABI static void s_vkGPDP2(void* pd,void* pprops){
+    vkGetPhysicalDeviceProperties2((VkPhysicalDevice)pd,(VkPhysicalDeviceProperties2*)pprops);
+    VkPhysicalDeviceProperties2* p2=(VkPhysicalDeviceProperties2*)pprops;
+    char b[160]; snprintf(b,sizeof b,"[GPDP2] vendor=0x%04X device=0x%04X name=%s\n",
+        p2->properties.vendorID,p2->properties.deviceID,p2->properties.deviceName); logs(b);
+    for(VkBaseOutStructure* s=(VkBaseOutStructure*)p2->pNext;s;s=s->pNext){
+        if(s->sType==VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES){
+            VkPhysicalDeviceIDProperties* idp=(VkPhysicalDeviceIDProperties*)s;
+            char c[96]; snprintf(c,sizeof c,"   ID_PROPS: LUIDValid=%u LUID=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                idp->deviceLUIDValid,idp->deviceLUID[0],idp->deviceLUID[1],idp->deviceLUID[2],idp->deviceLUID[3],
+                idp->deviceLUID[4],idp->deviceLUID[5],idp->deviceLUID[6],idp->deviceLUID[7]); logs(c);
+            // TEST: force a valid Windows-style LUID so the host can 'identify the adapter'.
+            if(!idp->deviceLUIDValid){ idp->deviceLUIDValid=1; for(int i=0;i<8;i++) idp->deviceLUID[i]=(u8)(0x5070+i); idp->deviceNodeMask=1; logs("   -> forced LUIDValid=1\n"); }
+        } else { char c[48]; snprintf(c,sizeof c,"   pNext sType=%u\n",(unsigned)s->sType); logs(c);} } }
+MSABI static void* my_gipa(void* inst,const char* n){ if(n)logn("[gipa] ",n);
+    if(n&&!strcmp(n,"vkGetPhysicalDeviceProperties2")) return (void*)s_vkGPDP2;
+    void* f=(void*)vkGetInstanceProcAddr((VkInstance)inst,n); return f?make_ms2sysv(f):0; }
+MSABI static void* my_gdpa(void* dev,const char* n){ if(n)logn("[gdpa] ",n); PFN_vkGetDeviceProcAddr g=(PFN_vkGetDeviceProcAddr)vkGetInstanceProcAddr(g_inst,"vkGetDeviceProcAddr"); void* f=g?(void*)g((VkDevice)dev,n):0; return f?make_ms2sysv(f):0; }
 
 static void segv(int s,siginfo_t* si,void* u){(void)s;(void)u;char b[19]="0x0000000000000000";u64 a=(u64)si->si_addr;for(int i=0;i<16;i++){int d=(a>>((15-i)*4))&0xF;b[2+i]=d<10?'0'+d:'a'+d-10;}logs("[SIGSEGV @ ");(void)write(2,b,18);logs("]\n");_exit(42);}
 
