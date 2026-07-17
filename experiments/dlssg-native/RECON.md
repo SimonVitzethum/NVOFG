@@ -350,6 +350,31 @@ filesystem/path shim** (make `NGXGetPath` succeed, or the ApplicationDataPath re
 again available from the Proton run. This is engineering with a known-green endpoint (Gate 3), not a
 feasibility risk.
 
+## S5e — path + adapter shims: native GetFeatureRequirements now RUNS (no crash)
+
+The `NGXGetPath` crash was **`SHGetKnownFolderPath`** (SHELL32) returning null (my trap didn't write
+`*out`) → null path string → `wcslen` crash. Implemented it (returns a valid path + `CoTaskMemFree`
+stub). The crash then moved forward, revealing (via file-API + IAT logging) the real consumers of
+that path and the adapter identity:
+
+- **`SHGetKnownFolderPath`** → NGX builds `…\NVIDIA\NGX\models\config\versions\1\files\nvngx_deny_list.txt`
+  and probes it via **`PathFileExistsW`** / `CreateFileW`. Absent is fine (empty deny list); stubbed.
+- **`D3DKMTEnumAdapters2`** (win32u kernel display-adapter enumeration) — **this is where NGX gets the
+  OS-adapter LUID to correlate with the GPU.** Implemented to report one adapter whose
+  `AdapterLuid == g_luid` (our deviceUUID-derived LUID, matching the Vulkan `deviceLUID`). Under
+  Proton this is Wine's win32u.
+
+With these, **native `NVSDK_NGX_VULKAN_GetFeatureRequirements(FrameGeneration)` now RUNS to completion
+without crashing** (it returned `0xBAD00012`/NotImplemented rather than Proton's Success — the
+requirements path still degrades when the adapter correlation isn't 100%, but it no longer faults).
+
+**Remaining:** the full `Init_ProjectID` path still crashes at its own earlier sites (`_nvngx.dll`
++0xb7f9 adapter-array iteration, +0xceee string) — it takes a heavier path than GetFeatureRequirements
+and wants a more complete D3DKMT adapter model (likely `D3DKMTOpenAdapterFromLuid` +
+`D3DKMTQueryAdapterInfo`, and the exact `D3DKMT_ADAPTERINFO` struct). This is the deep adapter-
+correlation tail — grind each against the Proton reference (WINEDEBUG / dxvk trace). Multi-session,
+but with a known-green endpoint (Gate 3). The own model (§21) stays the parallel path.
+
 ## Next step (now justified)
 
 **S5** (the crux): load the NGX host PEs (`nvngx.dll` + `_nvngx.dll`) under the same loader (they

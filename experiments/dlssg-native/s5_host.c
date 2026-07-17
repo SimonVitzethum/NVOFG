@@ -76,6 +76,7 @@ static u64 g_hcount=0x2000;
 static u8 g_teb[0x2000],g_peb[0x800]; static void* g_tlsslots[512];   // fake Windows TEB + PE-TLS array
 static void* make_trap(const char* name);   // fwd (defined below)
 static void* make_ms2sysv(void* target);     // fwd (defined below)
+static u8 g_luid[8];                          // synthetic adapter LUID (deviceUUID-derived; filled in GPDP2)
 MSABI static void* my_gipa(void*,const char*);   // ms_abi vkGetInstanceProcAddr wrapper (below)
 MSABI static void* my_gdpa(void*,const char*);   // ms_abi vkGetDeviceProcAddr wrapper (below)
 static void* g_hvk,*g_hcu;                    // native libvulkan / libcuda (defined below)
@@ -136,10 +137,29 @@ MSABI static u32 s_GetFullPathNameW(const u16* n,u32 sz,u16* buf,void** fp){ (vo
 // --- S5e file-API trace: log the exact paths NGX asks for during NGXGetPath, so we can tell
 // whether it wants a WRITABLE DIRECTORY (scenario A) or concrete MODEL FILES (scenario B). ---
 static void wlog(const char* tag,const void* w){ char b[320]; const u16* p=w; int i=0; if(p) for(;p[i]&&i<319;i++) b[i]=(char)(p[i]&0xFF); b[i]=0; logn(tag,b); }
-MSABI static void* s_CreateFileW(void* name,u32 a,u32 s,void* sa,u32 cd,u32 fa,void* t){ (void)a;(void)s;(void)sa;(void)cd;(void)fa;(void)t; wlog("[CreateFileW] ",name); return (void*)-1; } // INVALID_HANDLE_VALUE
-MSABI static u32   s_GetFileAttributesW(void* name){ wlog("[GetFileAttributesW] ",name); return 0xFFFFFFFF; }                 // INVALID_FILE_ATTRIBUTES
+MSABI static void* s_CreateFileW(void* name,u32 a,u32 s,void* sa,u32 cd,u32 fa,void* t){ (void)a;(void)s;(void)sa;(void)cd;(void)fa;(void)t; wlog("[CreateFileW] ",name); g_lasterr=2/*ERROR_FILE_NOT_FOUND*/; return (void*)-1; } // INVALID_HANDLE_VALUE
+MSABI static u32   s_GetFileAttributesW(void* name){ wlog("[GetFileAttributesW] ",name); g_lasterr=2/*ERROR_FILE_NOT_FOUND*/; return 0xFFFFFFFF; } // INVALID_FILE_ATTRIBUTES
 MSABI static int   s_GetFileAttributesExW(void* name,u32 lvl,void* info){ (void)lvl;(void)info; wlog("[GetFileAttributesExW] ",name); return 0; } // FALSE
 MSABI static void* s_FindFirstFileExW(void* name,u32 a,void* d,u32 b,void* c,u32 e){ (void)a;(void)d;(void)b;(void)c;(void)e; wlog("[FindFirstFileExW] ",name); return (void*)-1; }
+// NGX's NGXGetPath calls SHGetKnownFolderPath(rfid, flags, token, &out) to locate its
+// model/config dir (ProgramData/LocalAppData). Return a real writable path (the §19 pattern
+// from the Win32 side). Caller frees with CoTaskMemFree -> stub it. HRESULT S_OK = 0.
+MSABI static int s_SHGetKnownFolderPath(void* rfid,u32 fl,void* tok,u16** out){ (void)rfid;(void)fl;(void)tok;
+    const char* path="C:\\ProgramData"; u16* w=malloc(64*2); int i=0; for(;path[i];i++) w[i]=(u8)path[i]; w[i]=0;
+    if(out)*out=w; logn("[SHGetKnownFolderPath] -> ",path); return 0; }
+MSABI static void s_CoTaskMemFree(void* p){ free(p); }
+// D3DKMTEnumAdapters2: NGX's OS display-adapter enumeration (this is where the OS-adapter LUID
+// comes from, to correlate with the GPU). Report ONE adapter whose LUID == our synthetic
+// deviceUUID-derived LUID (g_luid), matching the Vulkan deviceLUID. Under Proton this is Wine's
+// win32u; natively we synthesize it. STATUS_SUCCESS=0.
+// D3DKMT_ENUMADAPTERS2{ ULONG NumAdapters@0; D3DKMT_ADAPTERINFO* pAdapters@8 }
+// D3DKMT_ADAPTERINFO{ UINT hAdapter@0; LUID AdapterLuid@4; ULONG NumOfSources@12; BOOL @16 } (20B)
+MSABI static int s_D3DKMTEnumAdapters2(void* pe){ if(!pe) return (int)0xC000000D /*STATUS_INVALID_PARAMETER*/;
+    u32* n=(u32*)pe; void** pa=(void**)((u8*)pe+8);
+    if(!*pa){ *n=1; return 0; }                       // query: report count only
+    u8* a=(u8*)*pa; memset(a,0,20); *(u32*)(a+0)=0x21; memcpy(a+4,g_luid,8); *(u32*)(a+12)=1; *n=1;
+    logn("[D3DKMTEnumAdapters2] ","1 adapter, LUID=deviceUUID-derived"); return 0; }
+MSABI static int s_PathFileExistsW(void* p){ (void)p; return 0; } // FALSE (deny_list etc. absent = fine)
 // --- nvapi shim (S5c): the host resolves NvAPI_* via nvapi_QueryInterface(id). First pass:
 // log every requested interface id and hand back a 0-returning stub (NVAPI_OK) so the host
 // keeps querying and we can enumerate the full set it needs for GPU-arch detection. ---
@@ -274,6 +294,8 @@ struct { const char* name; void* fn; } g_stubs[]={
  {"VerifyVersionInfoW",s_VerifyVersionInfoW},{"VerSetConditionMask",s_VerSetConditionMask},{"GetFullPathNameW",s_GetFullPathNameW},
  {"nvapi_QueryInterface",s_nvapi_QueryInterface},
  {"CreateFileW",s_CreateFileW},{"GetFileAttributesW",s_GetFileAttributesW},{"GetFileAttributesExW",s_GetFileAttributesExW},{"FindFirstFileExW",s_FindFirstFileExW},
+ {"SHGetKnownFolderPath",s_SHGetKnownFolderPath},{"CoTaskMemFree",s_CoTaskMemFree},
+ {"D3DKMTEnumAdapters2",s_D3DKMTEnumAdapters2},{"PathFileExistsW",s_PathFileExistsW},
  {0,0}};
 static void* g_stubs_lookup(const char* fn){ for(int i=0;g_stubs[i].name;i++) if(!strcmp(g_stubs[i].name,fn)) return g_stubs[i].fn; return 0; }
 
