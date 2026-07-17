@@ -175,6 +175,35 @@ because the capability query needs a *successful* Init.
 fixed 0xa8ec8148cb inside NGX — a data-dependent path off a time/seed stub; clean runs deterministically
 reach `0xBAD00002`. Not worth determinising until Gate 2 is crossed.)*
 
+### S5(c) RE round — nvapi IDs mapped; blocker refined to the Vulkan arch path
+
+RE'd the private IDs via the official **NVIDIA/nvapi** `nvapi_interface.h` + **dxvk-nvapi** source:
+
+| ID | Function | Needed? |
+|---|---|---|
+| 0x0150E828 | `NvAPI_Initialize` | yes |
+| 0x0694D52E | `NvAPI_DRS_CreateSession` | yes (reads DLSS driver-settings) |
+| 0x375DBD6B | `NvAPI_DRS_LoadSettings` | yes |
+| 0xDA8466A0 | `NvAPI_DRS_GetBaseProfile` | yes |
+| 0x73BF8338 | `NvAPI_DRS_GetSetting` | yes (→ SETTING_NOT_FOUND ⇒ NGX uses defaults) |
+| 0xAD298D3F, 0x33C7358C, 0x593E8644 | private/internal | **optional** — dxvk-nvapi doesn't implement them either, yet DLSS-G works under Proton |
+
+Implemented `nvapi_QueryInterface` dispatch for `Initialize` + the DRS set (no-op successes, empty
+settings) and NULL for the 3 optional private IDs — matching dxvk-nvapi. **Init still returns
+`0xBAD00002`.** The trace then shows the host `LoadLibrary("vulkan-1.dll")` +
+`GetProcAddress("vkGetInstanceProcAddr")` — so GPU-arch resolution is **Vulkan-side**, not via the
+nvapi arch functions. Bridged that too (`vkGetInstanceProcAddr` → our ms_abi `gipa`; other `vk*` →
+native libvulkan via ms2sysv). **Still `0xBAD00002`**, and the intermittent crash rate rises in this
+deeper path.
+
+**Refined blocker:** the nvapi surface NGX needs is now satisfied (Init + DRS); the residual
+`PlatformError` lives in NGX's **Vulkan GPU-arch/platform resolution** — the host presumably creates
+its own instance / queries device props (likely `VK_KHR_driver_properties` / vendor+device ID) and
+isn't yet getting a classifiable Blackwell. Next concrete sub-step: trace exactly which
+instance/device Vulkan calls the host's arch path makes and what property it can't satisfy. This is
+deep, iterative, and the ultimate go/no-go (does Linux NGX report FG-available at all) is still
+unknown — the own model (§21) remains the pragmatic parallel path.
+
 ### Honest status & decision point
 
 Path B went from "infeasible in practice" to: **both NVIDIA PEs load natively, DllMain→1, the

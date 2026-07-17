@@ -74,6 +74,9 @@ static u64 g_hcount=0x2000;
 static u8 g_teb[0x2000],g_peb[0x800]; static void* g_tlsslots[512];   // fake Windows TEB + PE-TLS array
 static void* make_trap(const char* name);   // fwd (defined below)
 static void* make_ms2sysv(void* target);     // fwd (defined below)
+MSABI static void* my_gipa(void*,const char*);   // ms_abi vkGetInstanceProcAddr wrapper (below)
+MSABI static void* my_gdpa(void*,const char*);   // ms_abi vkGetDeviceProcAddr wrapper (below)
+static void* g_hvk,*g_hcu;                    // native libvulkan / libcuda (defined below)
 
 // ---- ms_abi CRT shim (subset proven in pe_load.c) ----
 MSABI static void* s_GetProcessHeap(void){return g_heap;}
@@ -131,12 +134,33 @@ MSABI static u32 s_GetFullPathNameW(const u16* n,u32 sz,u16* buf,void** fp){ (vo
 // --- nvapi shim (S5c): the host resolves NvAPI_* via nvapi_QueryInterface(id). First pass:
 // log every requested interface id and hand back a 0-returning stub (NVAPI_OK) so the host
 // keeps querying and we can enumerate the full set it needs for GPU-arch detection. ---
-MSABI static int s_nv_ok(void){ return 0; }   // NVAPI_OK
-// nvapi uses PRIVATE/undocumented interface IDs for arch detection -> return NULL so NGX
-// treats nvapi as unavailable and (hopefully) falls back to its nvml path, which is the
-// PUBLIC NVML API and bridges cleanly to native libnvidia-ml.so.1.
-MSABI static void* s_nvapi_QueryInterface(u32 id){ char b[48]; snprintf(b,sizeof b,"[nvapi_QI 0x%08X -> null]\n",id); logs(b); return 0; }
 static void* g_hnvml;   // native libnvidia-ml.so.1
+// nvapi shim (S5c, RE'd via NVIDIA/nvapi + dxvk-nvapi): NGX resolves NvAPI_Initialize +
+// the DRS (driver-settings) functions to read DLSS overrides. dxvk-nvapi implements exactly
+// these and NOT the 3 private IDs NGX also probes (0xAD298D3F/0x33C7358C/0x593E8644) — yet
+// DLSS-G works under Proton, so those are optional. We provide Init + DRS as no-op successes
+// (empty settings -> NGX uses defaults) and NULL for everything else; GPU arch comes from
+// Vulkan (native). NVAPI_OK = 0.
+MSABI static int s_NvAPI_Initialize(void){ return 0; }
+MSABI static int s_NvAPI_Unload(void){ return 0; }
+MSABI static int s_DRS_CreateSession(void** ph){ if(ph)*ph=(void*)0x1D25; return 0; }
+MSABI static int s_DRS_LoadSettings(void* h){ (void)h; return 0; }
+MSABI static int s_DRS_DestroySession(void* h){ (void)h; return 0; }
+MSABI static int s_DRS_GetBaseProfile(void* h,void** ph){ (void)h; if(ph)*ph=(void*)0x1B45E; return 0; }
+MSABI static int s_DRS_GetSetting(void* h,void* p,u32 id,void* out){ (void)h;(void)p;(void)id;(void)out; return 0xBAD00004; } // SETTING_NOT_FOUND -> NGX uses default
+MSABI static void* s_nvapi_QueryInterface(u32 id){
+    void* f=0; const char* nm="?";
+    switch(id){
+        case 0x0150E828: f=(void*)s_NvAPI_Initialize; nm="Initialize"; break;
+        case 0xD22BDD7E: f=(void*)s_NvAPI_Unload; nm="Unload"; break;
+        case 0x0694D52E: f=(void*)s_DRS_CreateSession; nm="DRS_CreateSession"; break;
+        case 0x375DBD6B: f=(void*)s_DRS_LoadSettings; nm="DRS_LoadSettings"; break;
+        case 0xDA8466A0: f=(void*)s_DRS_GetBaseProfile; nm="DRS_GetBaseProfile"; break;
+        case 0x0DD462FB: f=(void*)s_DRS_DestroySession; nm="DRS_DestroySession"; break;
+        case 0x73BF8338: f=(void*)s_DRS_GetSetting; nm="DRS_GetSetting"; break;
+        default: nm="(unimpl->null)"; break;
+    }
+    char b[64]; snprintf(b,sizeof b,"[nvapi_QI 0x%08X %s]\n",id,nm); logs(b); return f; }
 
 // forward decls
 static void* resolve(const char* dll,const char* fn);
@@ -148,6 +172,12 @@ static void* module_export(Module* m,const char* fn);
 MSABI static void* s_GetModuleHandleW(void* n){ (void)n; return g_mod[0].base; }
 MSABI static void* s_GetProcAddress(void* m,const char* n){ if(!n)return 0;
     for(int i=0;i<g_nmod;i++) if(g_mod[i].base==(u8*)m){ void* e=module_export(&g_mod[i],n); if(e)return e; break; }
+    // Vulkan loader: the host's GPU-arch path LoadLibrary's vulkan-1.dll + resolves entry
+    // points. gipa/gdpa must be our ms_abi wrappers (they ms2sysv-wrap what they return);
+    // other vk* funcs bridge straight to native libvulkan via ms2sysv.
+    if(!strcmp(n,"vkGetInstanceProcAddr")){ logn("[vk->native] ",n); return (void*)my_gipa; }
+    if(!strcmp(n,"vkGetDeviceProcAddr")){ logn("[vk->native] ",n); return (void*)my_gdpa; }
+    if(!strncmp(n,"vk",2)&&g_hvk){ void* f=dlsym(g_hvk,n); if(f){ logn("[vk->native] ",n); return make_ms2sysv(f); } }
     // NVML is public + native: bridge nvml.dll's functions to libnvidia-ml.so.1 via ms2sysv.
     if(!strncmp(n,"nvml",4)&&g_hnvml){ void* f=dlsym(g_hnvml,n); if(f){ logn("[nvml->native] ",n); return make_ms2sysv(f); } }
     // fall back to our CRT stub table by name, else a logging trap
