@@ -92,7 +92,8 @@ def write_clip(frames, out_dir, name, K, capture_fps, target_fps, dev, batch=8):
             mv[i] = fl[j].astype(np.float16)
     for n in range(N):
         col = frames[n].permute(1, 2, 0).numpy().astype(np.float16)
-        np.savez(os.path.join(d, f'frame_{n:06d}.npz'),
+        # compressed: smooth flow + constant depth/masks shrink a lot vs np.savez (real-data disk win)
+        np.savez_compressed(os.path.join(d, f'frame_{n:06d}.npz'),
                  color=col, mv=mv[n], depth=np.full((H, W), 0.5, np.float16),
                  ui=np.zeros((H, W), np.uint8), reactive=np.zeros((H, W), np.uint8))
     return N
