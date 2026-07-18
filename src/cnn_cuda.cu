@@ -23,6 +23,8 @@ __global__ void k_gated(const __half* a, const __half* fb, const __half* g, cons
     o[i] = __float2half((av > 0 ? av : 0.1f * av) * (1.f / (1.f + expf(-gv)))); }
 __global__ void k_bias(const __half* a, const __half* b, __half* o, int C, int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= C * N) return; o[i] = __float2half(__half2float(a[i]) + __half2float(b[i / N])); }
+__global__ void k_f2h(const float* in, __half* o, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) o[i] = __float2half(in[i]); }
+__global__ void k_h2f(const __half* in, float* o, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) o[i] = __half2float(in[i]); }
 __global__ void k_up(const __half* in, __half* o, int C, int H, int W, int Ho, int Wo) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x; if (idx >= C * Ho * Wo) return; int c = idx / (Ho * Wo), r = idx % (Ho * Wo), oy = r / Wo, ox = r % Wo;
     float iy = (oy + 0.5f) * H / Ho - 0.5f, ix = (ox + 0.5f) * W / Wo - 0.5f; int y0 = floorf(iy), x0 = floorf(ix); float fy = iy - y0, fx = ix - x0;
@@ -102,6 +104,22 @@ void runFusionCUDADevice(const CnnModel& m, const void* d_in, void* d_out, int H
     if (!m.valid) return;
     ensureInit();
     fusionCore(ensure(m), static_cast<const __half*>(d_in), static_cast<__half*>(d_out), H, W);
+}
+
+// float32 device variant for the Vulkan interop: the pack/residual-add compute shaders write/read
+// fp32 (no 16-bit-storage capability needed on the Vulkan side); we convert f32<->fp16 on the GPU
+// around the Tensor-Core fusion. d_in = [12,H,W] fp32, d_out = [3,H,W] fp32 (Vulkan-shared buffers).
+void runFusionCUDADeviceF32(const CnnModel& m, const void* d_in, void* d_out, int H, int W) {
+    if (!m.valid) return;
+    ensureInit();
+    int ni = 12 * H * W, no = 3 * H * W;
+    __half* hin = nullptr; __half* hout = nullptr;
+    cudaMallocAsync(&hin, sizeof(__half) * ni, 0);
+    cudaMallocAsync(&hout, sizeof(__half) * no, 0);
+    k_f2h<<<(ni + 255) / 256, 256>>>(static_cast<const float*>(d_in), hin, ni);
+    fusionCore(ensure(m), hin, hout, H, W);
+    k_h2f<<<(no + 255) / 256, 256>>>(hout, static_cast<float*>(d_out), no);
+    FR(hin); FR(hout);
 }
 
 std::vector<float> runFusionCUDA(const CnnModel& m, const std::vector<float>& x, int H, int W) {

@@ -20,4 +20,9 @@ std::vector<float> runFusionCUDA(const CnnModel& m, const std::vector<float>& x,
 // src/spike/cnn_vk_interop.cu for the end-to-end Vulkan-shared verification on real hardware.
 void runFusionCUDADevice(const CnnModel& m, const void* d_in, void* d_out, int H, int W);
 
+// float32 device variant (Vulkan interop path): d_in=[12,H,W] fp32, d_out=[3,H,W] fp32. Converts
+// f32<->fp16 around the Tensor-Core fusion so the Vulkan pack/residual-add shaders need no 16-bit
+// storage capability. Same stream/sync contract as runFusionCUDADevice.
+void runFusionCUDADeviceF32(const CnnModel& m, const void* d_in, void* d_out, int H, int W);
+
 }  // namespace nvofg

@@ -72,6 +72,15 @@ struct NvofgContext {
     // --- learned interpolator model (NVOFG_INTERP_CNN); null => identity (== classical warp) ---
     nvofg::CnnModel*  cnn = nullptr;
 
+    // --- NVOFG_INTERP_CNN Vulkan<->CUDA interop (only wired when built with NVOFG_ENABLE_CUDA and a
+    //     model is loaded). cnnInBuf/cnnOutBuf are exportable fp32 [12,H,W]/[3,H,W] buffers the pack/
+    //     residual-add passes write/read and CUDA runs the fusion over; cnnInterop is the CUDA import
+    //     handle (src/cnn_interop). null cnnInterop => fall back to identity (== classical warp). ---
+    nvofg::Buffer   cnnInBuf, cnnOutBuf;
+    nvofg::Stage    cnnPackStage, cnnAddStage;
+    VkDescriptorSet cnnPackSet = VK_NULL_HANDLE, cnnAddSet = VK_NULL_HANDLE;
+    void*           cnnInterop = nullptr;
+
     // --- optical-flow queue (dedicated family) ---
     VkQueue  ofQueue = VK_NULL_HANDLE;
     uint32_t ofFamily = 0;

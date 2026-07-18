@@ -51,6 +51,11 @@ nvofg_add_shader(NVOFG_SHADER_HEADERS SOURCE ${CMAKE_SOURCE_DIR}/src/shaders/hin
                  ENTRY main SYMBOL nvofg_spv_hint)
 nvofg_add_shader(NVOFG_SHADER_HEADERS SOURCE ${CMAKE_SOURCE_DIR}/src/shaders/blockmatch.slang
                  ENTRY main SYMBOL nvofg_spv_blockmatch)
+# NVOFG_INTERP_CNN interop bridge passes (pack images->buffer, add residual->output).
+nvofg_add_shader(NVOFG_SHADER_HEADERS SOURCE ${CMAKE_SOURCE_DIR}/src/shaders/cnn.slang
+                 ENTRY pack SYMBOL nvofg_spv_cnnpack)
+nvofg_add_shader(NVOFG_SHADER_HEADERS SOURCE ${CMAKE_SOURCE_DIR}/src/shaders/cnn.slang
+                 ENTRY add SYMBOL nvofg_spv_cnnadd)
 add_custom_target(nvofg_shaders DEPENDS ${NVOFG_SHADER_HEADERS})
 
 add_library(nvofg
@@ -97,8 +102,8 @@ if(NVOFG_ENABLE_CUDA)
   if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES native)
   endif()
-  # The NVOFG_INTERP_CNN CUDA backend (runFusionCUDA): compiled into libnvofg, links cuBLAS.
-  target_sources(nvofg PRIVATE src/cnn_cuda.cu)
+  # The NVOFG_INTERP_CNN CUDA backend (runFusionCUDA) + Vulkan interop: compiled into libnvofg.
+  target_sources(nvofg PRIVATE src/cnn_cuda.cu src/cnn_interop.cu)
   target_compile_definitions(nvofg PRIVATE NVOFG_ENABLE_CUDA)
   set_target_properties(nvofg PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
   get_filename_component(NVOFG_CUDA_BINDIR "${CMAKE_CUDA_COMPILER}" DIRECTORY)

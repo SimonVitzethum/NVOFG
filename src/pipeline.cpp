@@ -19,7 +19,17 @@
 #include "nvofg_spv_hint.spv.h"
 #include "nvofg_spv_blockmatch.spv.h"
 
+#ifdef NVOFG_ENABLE_CUDA
+#include "nvofg_spv_cnnpack.spv.h"
+#include "nvofg_spv_cnnadd.spv.h"
+#include "cnn_interop.hpp"
+#endif
+
 namespace {
+
+#ifdef NVOFG_ENABLE_CUDA
+void setupCnnInterop(NvofgContext* ctx);   // defined below; wires the Vulkan<->CUDA CNN fusion
+#endif
 
 uint32_t findMemoryType(VkPhysicalDevice pd, uint32_t bits, VkMemoryPropertyFlags props) {
     VkPhysicalDeviceMemoryProperties mp{};
@@ -372,13 +382,13 @@ NvofgResult ensurePipeline(NvofgContext* ctx) {
 
     // --- descriptor pool + sets ---
     VkDescriptorPoolSize sizes[] = {
-        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 20},
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 10},
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6},
+        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 24},   // +3 for the CNN pack set (prev/curr/flow)
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 13},   // +2 for the CNN pack/add output binding
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 9},   // +2 for the CNN in/out buffers
         {VK_DESCRIPTOR_TYPE_SAMPLER, 2}};
     VkDescriptorPoolCreateInfo dpci{};
     dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    dpci.maxSets = 7;
+    dpci.maxSets = 9;   // +2 CNN sets (pack, add)
     dpci.poolSizeCount = 4;
     dpci.pPoolSizes = sizes;
     if (vkCreateDescriptorPool(ctx->device, &dpci, nullptr, &ctx->descPool) != VK_SUCCESS)
@@ -439,6 +449,11 @@ NvofgResult ensurePipeline(NvofgContext* ctx) {
 
     ctx->pipelineReady = true;
     refreshDescriptors(ctx);   // write the static descriptor sets once
+#ifdef NVOFG_ENABLE_CUDA
+    // NVOFG_INTERP_CNN: if a model is loaded, wire the Vulkan<->CUDA fusion interop (load the model
+    // before the first generate). Failure leaves cnnInterop null -> the identity (classical warp) path.
+    setupCnnInterop(ctx);
+#endif
     return NVOFG_OK;
 }
 
@@ -517,9 +532,21 @@ void destroyPipeline(NvofgContext* ctx) {
         ctx->slotSignal[i] = 0;
     }
     ctx->frameIndex = 0;
+#ifdef NVOFG_ENABLE_CUDA
+    if (ctx->cnnInterop) { nvofg::cnnInteropDestroy(ctx->cnnInterop); ctx->cnnInterop = nullptr; }
+    for (Buffer* b : {&ctx->cnnInBuf, &ctx->cnnOutBuf}) {
+        if (b->buffer) vkDestroyBuffer(d, b->buffer, nullptr);
+        if (b->memory) vkFreeMemory(d, b->memory, nullptr);
+        *b = {};
+    }
+#endif
     if (ctx->descPool) vkDestroyDescriptorPool(d, ctx->descPool, nullptr);
     for (Stage* s : {&ctx->prepStage, &ctx->refineStage, &ctx->warpStage, &ctx->debugStage,
-                     &ctx->hintStage, &ctx->blockmatchStage}) {
+                     &ctx->hintStage, &ctx->blockmatchStage,
+#ifdef NVOFG_ENABLE_CUDA
+                     &ctx->cnnPackStage, &ctx->cnnAddStage,
+#endif
+                     }) {
         if (s->pipeline) vkDestroyPipeline(d, s->pipeline, nullptr);
         if (s->pipeLayout) vkDestroyPipelineLayout(d, s->pipeLayout, nullptr);
         if (s->setLayout) vkDestroyDescriptorSetLayout(d, s->setLayout, nullptr);
@@ -594,9 +621,91 @@ VkCommandBuffer beginCmd(NvofgContext* ctx, VkCommandPool pool) {
 // SCAFFOLD (Plan A A1): the *identity model* is a no-op — the warp output already IS the result — so
 // selecting NVOFG_INTERP_CNN works end to end and produces the classical warp today. Real weights
 // drop in here with no change to registration, sync, or the C ABI.
-static void recordCnnRefine(NvofgContext* ctx, VkCommandBuffer cmd) {
+#ifdef NVOFG_ENABLE_CUDA
+struct CnnPush { uint32_t width, height; float phase; };
+
+// Exportable device-local buffer (OPAQUE_FD) the CUDA CNN backend maps and runs the fusion over.
+bool createBufferExportable(NvofgContext* ctx, nvofg::Buffer& buf, VkDeviceSize size,
+                            VkBufferUsageFlags usage) {
+    buf.size = size;
+    VkExternalMemoryBufferCreateInfo ext{};
+    ext.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
+    ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+    VkBufferCreateInfo bci{};
+    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO; bci.pNext = &ext;
+    bci.size = size; bci.usage = usage; bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(ctx->device, &bci, nullptr, &buf.buffer) != VK_SUCCESS) return false;
+    VkMemoryRequirements req{}; vkGetBufferMemoryRequirements(ctx->device, buf.buffer, &req);
+    uint32_t mt = findMemoryType(ctx->physicalDevice, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (mt == UINT32_MAX) return false;
+    VkExportMemoryAllocateInfo exp{};
+    exp.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
+    exp.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO; mai.pNext = &exp;
+    mai.allocationSize = req.size; mai.memoryTypeIndex = mt;
+    if (vkAllocateMemory(ctx->device, &mai, nullptr, &buf.memory) != VK_SUCCESS) return false;
+    return vkBindBufferMemory(ctx->device, buf.buffer, buf.memory, 0) == VK_SUCCESS;
+}
+
+// One-time: build the exportable in/out buffers, the pack/add compute stages + descriptors, and the
+// CUDA import. Any failure leaves ctx->cnnInterop null -> recordCnnRefine stays the identity path.
+void setupCnnInterop(NvofgContext* ctx) {
+    if (!ctx->cnn || ctx->cnnInterop) return;
+    const uint32_t W = ctx->width, H = ctx->height;
+    const VkBufferUsageFlags U = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (!createBufferExportable(ctx, ctx->cnnInBuf, (VkDeviceSize)12 * W * H * sizeof(float), U) ||
+        !createBufferExportable(ctx, ctx->cnnOutBuf, (VkDeviceSize)3 * W * H * sizeof(float), U))
+        return;
+    const auto ST = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, SI = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+               SB = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    std::vector<VkDescriptorSetLayoutBinding> packB{bind(0, ST), bind(1, SI), bind(2, SI), bind(3, SI), bind(4, SB)};
+    std::vector<VkDescriptorSetLayoutBinding> addB{bind(0, ST), bind(1, SB)};
+    if (!createStage(ctx, ctx->cnnPackStage, nvofg_spv_cnnpack, nvofg_spv_cnnpack_size, packB, sizeof(CnnPush)) ||
+        !createStage(ctx, ctx->cnnAddStage, nvofg_spv_cnnadd, nvofg_spv_cnnadd_size, addB, sizeof(CnnPush)))
+        return;
+    VkDescriptorSetAllocateInfo ai{}; ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    ai.descriptorPool = ctx->descPool; ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &ctx->cnnPackStage.setLayout;
+    if (vkAllocateDescriptorSets(ctx->device, &ai, &ctx->cnnPackSet) != VK_SUCCESS) return;
+    ai.pSetLayouts = &ctx->cnnAddStage.setLayout;
+    if (vkAllocateDescriptorSets(ctx->device, &ai, &ctx->cnnAddSet) != VK_SUCCESS) return;
+    VkDevice d = ctx->device;
+    writeImg(d, ctx->cnnPackSet, 0, ST, ctx->output.view, VK_NULL_HANDLE);
+    writeImg(d, ctx->cnnPackSet, 1, SI, ctx->prevColor.view, VK_NULL_HANDLE);
+    writeImg(d, ctx->cnnPackSet, 2, SI, ctx->currColor.view, VK_NULL_HANDLE);
+    writeImg(d, ctx->cnnPackSet, 3, SI, ctx->refinedFlow.view, VK_NULL_HANDLE);
+    writeBuf(d, ctx->cnnPackSet, 4, ctx->cnnInBuf.buffer, ctx->cnnInBuf.size);
+    writeImg(d, ctx->cnnAddSet, 0, ST, ctx->output.view, VK_NULL_HANDLE);
+    writeBuf(d, ctx->cnnAddSet, 1, ctx->cnnOutBuf.buffer, ctx->cnnOutBuf.size);
+    ctx->cnnInterop = nvofg::cnnInteropCreate(ctx);   // export fds + CUDA import; null => identity
+}
+#endif
+
+// NVOFG_INTERP_CNN: record the PACK pass (warp output + prev/curr/flow + phase -> packed [12,H,W]
+// fp32 input buffer) into the warp command buffer, right after the warp writes `output`. The CUDA
+// fusion + residual-add then run as later stages on the pipeline timeline (see cnnDispatchResidual).
+// If the interop is unavailable (identity path), this is a no-op and the warp output is the result.
+static void recordCnnRefine(NvofgContext* ctx, VkCommandBuffer cmd, float phase) {
     if (ctx->interpolator != NVOFG_INTERP_CNN) return;
-    (void)cmd;  // identity model: warp output is the candidate; learned backend inserts its pass here
+#ifdef NVOFG_ENABLE_CUDA
+    if (!ctx->cnnInterop) return;
+    const VkImageLayout G = VK_IMAGE_LAYOUT_GENERAL;
+    // warp finished writing `output` (GENERAL, SHADER_WRITE); the pack reads it.
+    imgBarrier(cmd, ctx->output.image, G, G, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    CnnPush pc{ctx->width, ctx->height, phase};
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->cnnPackStage.pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->cnnPackStage.pipeLayout, 0, 1, &ctx->cnnPackSet, 0, nullptr);
+    vkCmdPushConstants(cmd, ctx->cnnPackStage.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(cmd, (ctx->width + 7) / 8, (ctx->height + 7) / 8, 1);
+    // make the pack's buffer writes available to the external (CUDA) reader before this submit signals.
+    VkBufferMemoryBarrier bb{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, nullptr,
+        VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, ctx->cnnInBuf.buffer, 0, ctx->cnnInBuf.size};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 1, &bb, 0, nullptr);
+#else
+    (void)cmd; (void)phase;
+#endif
 }
 
 void submitTimeline(VkQueue queue, VkCommandBuffer cmd,
@@ -628,6 +737,33 @@ void submitTimeline(VkQueue queue, VkCommandBuffer cmd,
 
 struct WarpPush   { uint32_t width, height; float phase; uint32_t flags; };
 enum { WARP_FLAG_UI = 1u, WARP_FLAG_REACTIVE = 2u, WARP_FLAG_BIDIR = 4u, WARP_FLAG_MATERIAL = 8u, WARP_FLAG_RESET = 16u };
+
+#ifdef NVOFG_ENABLE_CUDA
+// After the warp+pack submit signals `warpVal`, run the CNN as two more timeline stages:
+//   CUDA: wait warpVal, fusion cnnInBuf -> cnnOutBuf, signal warpVal+1
+//   Vulkan add: wait warpVal+1, output += cnnOutBuf residual, signal warpVal+2
+// Returns the final signalled value (warpVal+2), or warpVal if the interop is unavailable.
+uint64_t cnnDispatchResidual(NvofgContext* ctx, uint32_t slot, uint64_t warpVal) {
+    if (!ctx->cnnInterop) return warpVal;
+    const VkImageLayout G = VK_IMAGE_LAYOUT_GENERAL;
+    uint64_t cnnVal = nvofg::cnnInteropDispatch(ctx, ctx->cnnInterop, warpVal);   // -> warpVal+1
+    uint64_t addVal = cnnVal + 1;
+    VkCommandBuffer cmd = beginCmd(ctx, ctx->computePools[slot]);
+    // CUDA wrote cnnOutBuf (visible via the timeline wait); make it readable by the add shader.
+    VkBufferMemoryBarrier bb{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, nullptr,
+        VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, ctx->cnnOutBuf.buffer, 0, ctx->cnnOutBuf.size};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &bb, 0, nullptr);
+    imgBarrier(cmd, ctx->output.image, G, G, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    CnnPush pc{ctx->width, ctx->height, 0.f};
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->cnnAddStage.pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->cnnAddStage.pipeLayout, 0, 1, &ctx->cnnAddSet, 0, nullptr);
+    vkCmdPushConstants(cmd, ctx->cnnAddStage.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(cmd, (ctx->width + 7) / 8, (ctx->height + 7) / 8, 1);
+    submitTimeline(ctx->queue, cmd, ctx->timeline, cnnVal, ctx->timeline, addVal);
+    return addVal;
+}
+#endif
 
 }  // namespace
 
@@ -779,7 +915,7 @@ NvofgResult nvofg_record_generate(NvofgContext* ctx, const NvofgGenerateInfo* in
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->warpStage.pipeLayout, 0, 1, &ctx->warpSet, 0, nullptr);
         vkCmdPushConstants(cmd, ctx->warpStage.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(wp), &wp);
         vkCmdDispatch(cmd, gx, gy, 1);
-        recordCnnRefine(ctx, cmd);   // NVOFG_INTERP_CNN drop-in (identity today)
+        recordCnnRefine(ctx, cmd, info->phase);   // NVOFG_INTERP_CNN: pack pass (identity if no model)
 
         if (ctx->debugView != NVOFG_DEBUG_NONE && ctx->haveDebugTarget) {
             imgBarrier(cmd, ctx->debugTarget.image, VK_IMAGE_LAYOUT_UNDEFINED, G, 0, VK_ACCESS_SHADER_WRITE_BIT);
@@ -790,11 +926,15 @@ NvofgResult nvofg_record_generate(NvofgContext* ctx, const NvofgGenerateInfo* in
             vkCmdDispatch(cmd, gx, gy, 1);
         }
         submitTimeline(ctx->queue, cmd, info->input_timeline, info->input_value, ctx->timeline, v1);
-        ctx->slotSignal[slot] = v1;
+        uint64_t vf = v1;
+#ifdef NVOFG_ENABLE_CUDA
+        vf = cnnDispatchResidual(ctx, slot, v1);   // CUDA fusion + residual-add stages on the timeline
+#endif
+        ctx->slotSignal[slot] = vf;
         ctx->frameIndex++;
-        ctx->timelineValue = v1;
+        ctx->timelineValue = vf;
         out_sync->semaphore = ctx->timeline;
-        out_sync->value = v1;
+        out_sync->value = vf;
         return NVOFG_OK;
     }
 
@@ -907,7 +1047,7 @@ NvofgResult nvofg_record_generate(NvofgContext* ctx, const NvofgGenerateInfo* in
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->warpStage.pipeLayout, 0, 1, &ctx->warpSet, 0, nullptr);
         vkCmdPushConstants(cmd, ctx->warpStage.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(wp), &wp);
         vkCmdDispatch(cmd, gx, gy, 1);
-        recordCnnRefine(ctx, cmd);   // NVOFG_INTERP_CNN drop-in (identity today)
+        recordCnnRefine(ctx, cmd, info->phase);   // NVOFG_INTERP_CNN: pack pass (identity if no model)
 
         // Optional debug visualisation into an app-provided target.
         if (ctx->debugView != NVOFG_DEBUG_NONE && ctx->haveDebugTarget) {
@@ -921,11 +1061,15 @@ NvofgResult nvofg_record_generate(NvofgContext* ctx, const NvofgGenerateInfo* in
         submitTimeline(ctx->queue, cmd, ctx->timeline, v2, ctx->timeline, v3);
     }
 
-    ctx->slotSignal[slot] = v3;
+    uint64_t vf = v3;
+#ifdef NVOFG_ENABLE_CUDA
+    vf = cnnDispatchResidual(ctx, slot, v3);   // CUDA fusion + residual-add stages on the timeline
+#endif
+    ctx->slotSignal[slot] = vf;
     ctx->frameIndex++;
-    ctx->timelineValue = v3;
+    ctx->timelineValue = vf;
     out_sync->semaphore = ctx->timeline;
-    out_sync->value = v3;
+    out_sync->value = vf;
     return NVOFG_OK;
 }
 
@@ -965,14 +1109,18 @@ NvofgResult nvofg_record_warp(NvofgContext* ctx, float phase,
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->warpStage.pipeLayout, 0, 1, &ctx->warpSet, 0, nullptr);
     vkCmdPushConstants(cmd, ctx->warpStage.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(wp), &wp);
     vkCmdDispatch(cmd, gx, gy, 1);
-    recordCnnRefine(ctx, cmd);   // NVOFG_INTERP_CNN drop-in (identity today)
+    recordCnnRefine(ctx, cmd, phase);   // NVOFG_INTERP_CNN: pack pass (identity if no model)
     submitTimeline(ctx->queue, cmd, wait_sem, wait_val, ctx->timeline, v1);
 
-    ctx->slotSignal[slot] = v1;
+    uint64_t vf = v1;
+#ifdef NVOFG_ENABLE_CUDA
+    vf = cnnDispatchResidual(ctx, slot, v1);   // CUDA fusion + residual-add stages on the timeline
+#endif
+    ctx->slotSignal[slot] = vf;
     ctx->frameIndex++;
-    ctx->timelineValue = v1;
+    ctx->timelineValue = vf;
     out_sync->semaphore = ctx->timeline;
-    out_sync->value = v1;
+    out_sync->value = vf;
     return NVOFG_OK;
 }
 

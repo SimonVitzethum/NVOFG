@@ -184,6 +184,15 @@ NvofgResult nvofg_create(const NvofgCreateInfo* info, NvofgContext** out) {
     VkSemaphoreCreateInfo sci{};
     sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
     sci.pNext = &st;
+#ifdef NVOFG_ENABLE_CUDA
+    // Export the pipeline timeline so the CUDA CNN backend can wait/signal on it as another stage
+    // (src/cnn_interop). Harmless if the app's device lacks VK_KHR_external_semaphore_fd — the CNN
+    // interop create then fails and falls back to the identity (== classical warp) path.
+    VkExportSemaphoreCreateInfo esc{};
+    esc.sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO;
+    esc.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+    st.pNext = &esc;
+#endif
     if (createSem(info->device, &sci, nullptr, &ctx->timeline) != VK_SUCCESS) {
         ctx->setError("failed to create timeline semaphore");
         delete ctx;
