@@ -34,14 +34,19 @@ void pack(uint3 tid : SV_DispatchThreadID) {
 }
 
 // ---- add --------------------------------------------------------------------------------------
-[[vk::binding(0, 0)]] RWTexture2D<float4>      gOut;    // warp output image (read-modify-write)
-[[vk::binding(1, 0)]] RWStructuredBuffer<float> gRes;   // [3*H*W] channel-major residual
+[[vk::binding(0, 0)]] RWTexture2D<float4>      gOut;     // warp output image (read-modify-write)
+[[vk::binding(1, 0)]] RWStructuredBuffer<float> gRes;    // [3*H*W] channel-major residual
+[[vk::binding(2, 0)]] Texture2D<float>         gUiMask;  // 1 = UI/HUD (never modify)
+[[vk::binding(3, 0)]] Texture2D<float>         gReactive;// 1 = reactive (particles/alpha)
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void add(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= pc.width || tid.y >= pc.height) return;
     int2 p = int2(tid.xy);
+    // Mandatory invariant: the CNN residual must never touch UI/HUD (came straight from a real frame)
+    // or reactive pixels (particles/alpha where flow is meaningless). Absent masks bind a 0 dummy.
+    if (gUiMask.Load(int3(p, 0)) > 0.5 || gReactive.Load(int3(p, 0)) > 0.5) return;
     uint base = tid.y * pc.width + tid.x;
     uint plane = pc.width * pc.height;
     float3 res = float3(gRes[base], gRes[plane + base], gRes[2 * plane + base]);

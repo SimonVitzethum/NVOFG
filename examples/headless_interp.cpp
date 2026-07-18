@@ -74,9 +74,14 @@ int main(int argc, char** argv) {
     f2.features.shaderStorageImageWriteWithoutFormat = VK_TRUE; f2.pNext = &v12;
 
     uint32_t reqN = 0; const char* const* reqE = nvofg_required_device_extensions(&reqN);
+    std::vector<const char*> devExts(reqE, reqE + reqN);
+    // External memory/semaphore fd: needed for the NVOFG_INTERP_CNN Vulkan<->CUDA interop (harmless
+    // otherwise). Standard on NVIDIA; if a runtime lacks them the CNN path falls back to the warp.
+    devExts.push_back("VK_KHR_external_memory_fd");
+    devExts.push_back("VK_KHR_external_semaphore_fd");
     VkDeviceCreateInfo dci{}; dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO; dci.pNext = &f2;
     dci.queueCreateInfoCount = qcCount; dci.pQueueCreateInfos = qc;
-    dci.enabledExtensionCount = reqN; dci.ppEnabledExtensionNames = reqE;
+    dci.enabledExtensionCount = (uint32_t)devExts.size(); dci.ppEnabledExtensionNames = devExts.data();
     VkDevice dev; VKCHECK(vkCreateDevice(pd, &dci, nullptr, &dev));
     VkQueue gfxQ, ofQ; vkGetDeviceQueue(dev, gfxFamily, 0, &gfxQ); vkGetDeviceQueue(dev, ofFamily, 0, &ofQ);
 
@@ -164,11 +169,16 @@ int main(int argc, char** argv) {
     // --- create nvofg + register + generate ---
     NvofgCreateInfo ci{}; ci.instance=instance; ci.physical_device=pd; ci.device=dev; ci.queue=gfxQ; ci.queue_family_index=gfxFamily;
     ci.of_queue=ofQ; ci.of_queue_family_index=ofFamily; ci.gipa=vkGetInstanceProcAddr; ci.width=W; ci.height=H;
-    ci.quality=NVOFG_QUALITY_HIGH; ci.interpolator=NVOFG_INTERP_WARP; ci.mode=NVOFG_MODE_AUTOMATIC;
+    const char* cnnModel = std::getenv("NVOFG_TEST_CNN");   // set to a .nvfgw to exercise the CNN path
+    ci.quality=NVOFG_QUALITY_HIGH; ci.interpolator= cnnModel ? NVOFG_INTERP_CNN : NVOFG_INTERP_WARP; ci.mode=NVOFG_MODE_AUTOMATIC;
     ci.flags = NVOFG_FLAG_USE_UI_MASK | NVOFG_FLAG_BIDIRECTIONAL | NVOFG_FLAG_USE_MOTION;
     if (std::getenv("NVOFG_FORCE_SHADER")) { ci.flags |= NVOFG_FLAG_FORCE_SHADER_FLOW; std::printf("[Tier B: portable shader flow]\n"); }
     NvofgContext* ctx=nullptr;
     if (nvofg_create(&ci,&ctx)!=NVOFG_OK){ std::fprintf(stderr,"nvofg_create failed\n"); return 3; }
+    if (cnnModel) {   // must load before the first generate (ensurePipeline wires the CUDA interop)
+        if (nvofg_load_cnn_model(ctx, cnnModel)!=NVOFG_OK){ std::fprintf(stderr,"load_cnn_model failed\n"); return 3; }
+        std::printf("[NVOFG_INTERP_CNN: loaded %s]\n", cnnModel);
+    }
 
     NvofgImageDesc pd0{prev.image,prev.view,VK_FORMAT_R8G8B8A8_UNORM,W,H};
     NvofgImageDesc cd0{curr.image,curr.view,VK_FORMAT_R8G8B8A8_UNORM,W,H};

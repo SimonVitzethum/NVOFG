@@ -382,7 +382,7 @@ NvofgResult ensurePipeline(NvofgContext* ctx) {
 
     // --- descriptor pool + sets ---
     VkDescriptorPoolSize sizes[] = {
-        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 24},   // +3 for the CNN pack set (prev/curr/flow)
+        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 26},   // +3 CNN pack (prev/curr/flow) +2 CNN add (ui/reactive)
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 13},   // +2 for the CNN pack/add output binding
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 9},   // +2 for the CNN in/out buffers
         {VK_DESCRIPTOR_TYPE_SAMPLER, 2}};
@@ -660,7 +660,7 @@ void setupCnnInterop(NvofgContext* ctx) {
     const auto ST = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, SI = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
                SB = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     std::vector<VkDescriptorSetLayoutBinding> packB{bind(0, ST), bind(1, SI), bind(2, SI), bind(3, SI), bind(4, SB)};
-    std::vector<VkDescriptorSetLayoutBinding> addB{bind(0, ST), bind(1, SB)};
+    std::vector<VkDescriptorSetLayoutBinding> addB{bind(0, ST), bind(1, SB), bind(2, SI), bind(3, SI)};
     if (!createStage(ctx, ctx->cnnPackStage, nvofg_spv_cnnpack, nvofg_spv_cnnpack_size, packB, sizeof(CnnPush)) ||
         !createStage(ctx, ctx->cnnAddStage, nvofg_spv_cnnadd, nvofg_spv_cnnadd_size, addB, sizeof(CnnPush)))
         return;
@@ -678,6 +678,8 @@ void setupCnnInterop(NvofgContext* ctx) {
     writeBuf(d, ctx->cnnPackSet, 4, ctx->cnnInBuf.buffer, ctx->cnnInBuf.size);
     writeImg(d, ctx->cnnAddSet, 0, ST, ctx->output.view, VK_NULL_HANDLE);
     writeBuf(d, ctx->cnnAddSet, 1, ctx->cnnOutBuf.buffer, ctx->cnnOutBuf.size);
+    writeImg(d, ctx->cnnAddSet, 2, SI, ctx->hasUiMask ? ctx->uiMask.view : ctx->dummyR8.view, VK_NULL_HANDLE);
+    writeImg(d, ctx->cnnAddSet, 3, SI, ctx->hasReactive ? ctx->reactive.view : ctx->dummyR8.view, VK_NULL_HANDLE);
     ctx->cnnInterop = nvofg::cnnInteropCreate(ctx);   // export fds + CUDA import; null => identity
 }
 #endif
