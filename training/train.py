@@ -5,7 +5,7 @@ T2 replaces `build_model` + `train_step` with the real SoftSplat+fusion net and 
 Everything else — atomic checkpointing, auto-resume, pause file, signal-graceful stop — is the
 provable-now plumbing. Run under tmux so SSH disconnect never kills it.
 """
-import argparse, itertools, os, random, signal, sys, time
+import argparse, itertools, math, os, random, signal, sys, time
 import torch
 import torch.nn.functional as F
 
@@ -56,6 +56,22 @@ class Trainer:
         if not ok:
             self._log("[align-gate] FAILED: capture is sub-pixel-misaligned; fix the harness before training")
             raise SystemExit(2)
+
+    def _set_lr(self):
+        # resumable cosine schedule with linear warmup — a pure function of self.step, so nothing to
+        # checkpoint and resume lands on the exact same lr. Decays lr -> lr_min over --lr-decay-steps
+        # (defaults to max-steps): essential for a long 100-300h run to actually converge rather than
+        # bounce at the base lr forever.
+        a = self.a
+        horizon = a.lr_decay_steps if a.lr_decay_steps > 0 else a.max_steps
+        if self.step < a.warmup:
+            lr = a.lr * (self.step + 1) / max(1, a.warmup)
+        else:
+            prog = min(1.0, (self.step - a.warmup) / max(1, horizon - a.warmup))
+            lr = a.lr_min + 0.5 * (a.lr - a.lr_min) * (1 + math.cos(math.pi * prog))
+        for g in self.opt.param_groups:
+            g['lr'] = lr
+        return lr
 
     def _ckpt(self, name):
         return os.path.join(self.a.run_dir, name)
@@ -113,6 +129,7 @@ class Trainer:
                 if not self.stop:
                     self._log("[resume] PAUSE cleared -> continue")
                 continue
+            lr_now = self._set_lr()
             comps = None
             # AMP fp16 autocast -> the conv fusion net runs on the Tensor Cores (the big lever);
             # the SoftSplat scatter stays fp32 (autocast keeps it there). GradScaler handles fp16.
@@ -132,7 +149,7 @@ class Trainer:
             self.step += 1
             if self.step % self.a.log_every == 0:
                 extra = (" " + " ".join(f"{k}={v:.3f}" for k, v in comps.items())) if comps else ""
-                self._log(f"[step {self.step}] loss {loss.item():.4f}{extra}")
+                self._log(f"[step {self.step}] loss {loss.item():.4f} lr={lr_now:.2e}{extra}")
             if self.step % self.a.ckpt_every == 0:
                 self._save(snapshot=True)
         self._save()
@@ -146,6 +163,9 @@ def main():
     p.add_argument('--ckpt-every', type=int, default=500)
     p.add_argument('--log-every', type=int, default=50)
     p.add_argument('--lr', type=float, default=1e-3)
+    p.add_argument('--lr-min', type=float, default=1e-5, help='cosine floor')
+    p.add_argument('--warmup', type=int, default=2000, help='linear warmup steps')
+    p.add_argument('--lr-decay-steps', type=int, default=0, help='cosine horizon (0 -> max-steps)')
     p.add_argument('--mode', default='interp', choices=['interp','extrap'])
     p.add_argument('--data-dir', default=None, help='rendered-triplet root (A2); omit -> synthetic')
     p.add_argument('--target-fps', type=int, default=60)

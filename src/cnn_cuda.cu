@@ -72,24 +72,48 @@ Cache& ensure(const CnnModel& m) {
     return c;
 }
 
-}  // namespace
+void ensureInit() {
+    if (g_cb) return;
+    cublasCreate(&g_cb); cublasSetMathMode(g_cb, CUBLAS_TENSOR_OP_MATH);
+    cudaMemPool_t pool; cudaDeviceGetDefaultMemPool(&pool, 0); uint64_t thr = ~0ull;
+    cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &thr);
+}
 
-std::vector<float> runFusionCUDA(const CnnModel& m, const std::vector<float>& x, int H, int W) {
-    if (!m.valid || (int)x.size() != 12 * H * W) return {};
-    if (!g_cb) { cublasCreate(&g_cb); cublasSetMathMode(g_cb, CUBLAS_TENSOR_OP_MATH);
-        cudaMemPool_t pool; cudaDeviceGetDefaultMemPool(&pool, 0); uint64_t thr = ~0ull;
-        cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &thr); }
-    Cache& c = ensure(m);
-    std::vector<__half> hx(x.size()); for (size_t i = 0; i < x.size(); ++i) hx[i] = __float2half(x[i]);
-    T in = galloc(12, H, W); cudaMemcpy(in.d, hx.data(), sizeof(__half) * hx.size(), cudaMemcpyHostToDevice);
+// Core forward on DEVICE pointers: d_in=[12,H,W] half, d_out=[3,H,W] half. Neither is freed — the
+// caller owns them (for the in-pipeline path they are Vulkan-shared external memory). Runs on the
+// given stream (0 = the interop stream after it has waited on the Vulkan timeline semaphore).
+void fusionCore(Cache& c, const __half* d_in, __half* d_out, int H, int W) {
+    T in{const_cast<__half*>(d_in), 12, H, W};
     T s1 = seq2(c, in, "fusion.e1", 1), s2 = seq2(c, s1, "fusion.e2", 2), s3 = seq2(c, s2, "fusion.e3", 2), s4 = seq2(c, s3, "fusion.e4", 2);
     T u3 = up(s4, s3.H, s3.W), c3 = cat(u3, s3), d3 = seq2(c, c3, "fusion.d3", 1);
     T u2 = up(d3, s2.H, s2.W), c2 = cat(u2, s2), d2 = seq2(c, c2, "fusion.d2", 1);
     T u1 = up(d2, s1.H, s1.W), c1 = cat(u1, s1), d1 = seq2(c, c1, "fusion.d1", 1);
-    T raw = conv_raw(c, d1, "fusion.out.weight", 1); T o = galloc(3, raw.H, raw.W);
-    k_bias<<<(3 * raw.H * raw.W + 255) / 256, 256>>>(raw.d, c.wt["fusion.out.bias"], o.d, 3, raw.H * raw.W);
+    T raw = conv_raw(c, d1, "fusion.out.weight", 1);
+    k_bias<<<(3 * raw.H * raw.W + 255) / 256, 256>>>(raw.d, c.wt["fusion.out.bias"], d_out, 3, raw.H * raw.W);
+    FR(s1.d); FR(s2.d); FR(s3.d); FR(s4.d); FR(u3.d); FR(c3.d); FR(d3.d); FR(u2.d); FR(c2.d); FR(d2.d); FR(u1.d); FR(c1.d); FR(d1.d); FR(raw.d);
+}
+
+}  // namespace
+
+// In-pipeline entry point: run the fusion residual straight over device memory (e.g. a Vulkan-shared
+// external buffer holding the packed 12-channel warp input), writing the [3,H,W] residual to d_out.
+// Does NOT synchronize — the caller sequences it via the cross-API timeline semaphore.
+void runFusionCUDADevice(const CnnModel& m, const void* d_in, void* d_out, int H, int W) {
+    if (!m.valid) return;
+    ensureInit();
+    fusionCore(ensure(m), static_cast<const __half*>(d_in), static_cast<__half*>(d_out), H, W);
+}
+
+std::vector<float> runFusionCUDA(const CnnModel& m, const std::vector<float>& x, int H, int W) {
+    if (!m.valid || (int)x.size() != 12 * H * W) return {};
+    ensureInit();
+    Cache& c = ensure(m);
+    std::vector<__half> hx(x.size()); for (size_t i = 0; i < x.size(); ++i) hx[i] = __float2half(x[i]);
+    T in = galloc(12, H, W); cudaMemcpy(in.d, hx.data(), sizeof(__half) * hx.size(), cudaMemcpyHostToDevice);
+    T o = galloc(3, H, W);
+    fusionCore(c, in.d, o.d, H, W);
     std::vector<__half> ho(3 * H * W); cudaMemcpy(ho.data(), o.d, sizeof(__half) * ho.size(), cudaMemcpyDeviceToHost);
-    FR(in.d); FR(s1.d); FR(s2.d); FR(s3.d); FR(s4.d); FR(u3.d); FR(c3.d); FR(d3.d); FR(u2.d); FR(c2.d); FR(d2.d); FR(u1.d); FR(c1.d); FR(d1.d); FR(raw.d); FR(o.d);
+    FR(in.d); FR(o.d);
     cudaStreamSynchronize(0);
     std::vector<float> out(ho.size()); for (size_t i = 0; i < out.size(); ++i) out[i] = __half2float(ho[i]);
     return out;
