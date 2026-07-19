@@ -32,10 +32,15 @@ def _decode(png_bytes, dev):
 def iter_triplets(parquet_dir):
     import pyarrow.parquet as pq
     for pf in sorted(glob.glob(os.path.join(parquet_dir, '*.parquet'))):
-        imgs = pq.read_table(pf, columns=['image']).to_pydict()['image']   # struct {bytes, path}
-        for k in range(0, len(imgs) - 2, 3):
-            if imgs[k]['path'] == 'im1.png' and imgs[k + 2]['path'] == 'im3.png':
-                yield (imgs[k]['bytes'], imgs[k + 1]['bytes'], imgs[k + 2]['bytes'])
+        pfile = pq.ParquetFile(pf)
+        buf = []                                               # stream in row batches (low peak RAM)
+        for batch in pfile.iter_batches(batch_size=600, columns=['image']):
+            buf.extend(batch.column('image').to_pylist())      # [{bytes, path}, ...]
+            while len(buf) >= 3:
+                if buf[0]['path'] == 'im1.png' and buf[2]['path'] == 'im3.png':
+                    yield (buf[0]['bytes'], buf[1]['bytes'], buf[2]['bytes']); del buf[:3]
+                else:
+                    del buf[0]                                 # resync to a triplet boundary
 
 
 def main():

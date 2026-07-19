@@ -27,7 +27,11 @@ def _mv_to_flow(mv):  # (2,H,W) pixels prev->this; flow_fwd(prev->curr) accumula
 
 
 class TripletDataset(Dataset):
-    def __init__(self, root, target_fps=60):
+    def __init__(self, root, target_fps=60, cache=False):
+        # cache=False (default): np.load per access and let the OS page cache absorb repeats. The old
+        # in-RAM cache duplicated the page cache in *anonymous shared memory* across persistent workers
+        # and grew unbounded (tens of GB at 448x256) — off by default so RAM stays flat.
+        self.cache = cache
         self.samples = []
         for clip in sorted(glob.glob(os.path.join(root, '*'))):
             meta_p = os.path.join(clip, 'meta.json')
@@ -47,8 +51,10 @@ class TripletDataset(Dataset):
         return len(self.samples)
 
     def _load(self, p):
+        if not self.cache:
+            d = np.load(p); return {k: d[k] for k in d.files}   # OS page cache handles repeats
         c = self._cache.get(p)
-        if c is None:                                          # cache frames in RAM (no per-sample disk I/O)
+        if c is None:
             d = np.load(p); c = {k: d[k] for k in d.files}; self._cache[p] = c
         return c
 
@@ -70,8 +76,8 @@ class TripletDataset(Dataset):
                 't': torch.tensor([t], dtype=torch.float32)}
 
 
-def make_loader(root, batch=4, target_fps=60, workers=3):
-    ds = TripletDataset(root, target_fps)
+def make_loader(root, batch=4, target_fps=60, workers=3, cache=False):
+    ds = TripletDataset(root, target_fps, cache=cache)
     return DataLoader(ds, batch_size=batch, shuffle=True, num_workers=min(workers, 3),
                       pin_memory=True, drop_last=True, persistent_workers=(workers > 0))
 
