@@ -33,7 +33,7 @@ class Trainer:
         self.stop = False
         self.data_iter = None; self.criterion = None
         if a.data_dir:                                        # real rendered triplets (T1)
-            loader = data.make_loader(a.data_dir, batch=a.batch, target_fps=a.target_fps, workers=3)
+            loader = data.make_loader(a.data_dir, batch=a.batch, target_fps=a.target_fps, workers=a.workers)
             self._gate(loader)                                # MUST pass before training on real data
             self.data_iter = itertools.cycle(loader)
             self.criterion = losses.CompositeLoss(self.dev)   # §21.6 (T3)
@@ -176,6 +176,11 @@ def main():
     p.add_argument('--temporal', type=float, default=0.0, help='temporal-stability weight (0=off)')
     p.add_argument('--align-tol', type=float, default=0.15,
                    help='alignment-gate tolerance px (raise for large-motion real data, e.g. 0.4 for Vimeo 2x)')
+    p.add_argument('--workers', type=int, default=0,
+                   help='DataLoader workers. 0 (default) = load in-process: NO inter-process shared '
+                        'memory, so no shmem leak, and low CPU (coexists with other box workloads). '
+                        '>0 parallelises loading but PyTorch persistent-worker shmem can leak unbounded.')
+    torch.multiprocessing.set_sharing_strategy('file_system')  # bounded /dev/shm files if workers>0
     torch.backends.cuda.matmul.allow_tf32 = True               # TF32 Tensor Cores for fp32 matmuls
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True                      # pick fastest conv kernels
