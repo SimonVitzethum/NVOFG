@@ -15,6 +15,15 @@ import data, align                                          # loader + alignment
 import losses                                                # §21.6 composite loss (T3)
 
 
+def _infinite(loader):
+    # Re-iterate the loader forever WITHOUT caching. itertools.cycle() caches every batch it yields to
+    # replay them, so on a DataLoader it holds a whole epoch of batch tensors in RAM (tens of GB at
+    # 448x256) — a silent unbounded-looking leak. This just starts a fresh iterator each epoch.
+    while True:
+        for b in loader:
+            yield b
+
+
 def atomic_save(state, path):
     tmp = path + ".tmp"
     torch.save(state, tmp)
@@ -35,7 +44,7 @@ class Trainer:
         if a.data_dir:                                        # real rendered triplets (T1)
             loader = data.make_loader(a.data_dir, batch=a.batch, target_fps=a.target_fps, workers=a.workers)
             self._gate(loader)                                # MUST pass before training on real data
-            self.data_iter = itertools.cycle(loader)
+            self.data_iter = _infinite(loader)   # NOT itertools.cycle (that caches a whole epoch)
             self.criterion = losses.CompositeLoss(self.dev)   # §21.6 (T3)
             self._log(f"[data] {len(loader.dataset)} triplets from {a.data_dir}")
         else:
