@@ -46,15 +46,18 @@ class Trainer:
 
     def _gate(self, loader):
         # alignment gate: the warp candidate must land on the capture-GT to sub-pixel, else the
-        # capture has a silent offset that would poison the loss. Abort rather than train on it.
+        # capture has a silent offset (flow-convention/sign bug, jitter) that would poison the loss.
+        # --align-tol relaxes the threshold for genuine LARGE-motion real data (e.g. Vimeo 2x, where a
+        # correct flow still leaves a ~0.25px global-fit residual from motion nonlinearity/occlusion);
+        # it stays tight enough to catch a sign flip or convention bug (those blow up to >1px).
         self.model.eval()
         with torch.no_grad():
             _, cand, target = forward_batch(self.model, next(iter(loader)), self.dev)
-            ok, off, mag = align.alignment_gate(cand.float(), target.float())
+            ok, off, mag = align.alignment_gate(cand.float(), target.float(), tol=self.a.align_tol)
         self.model.train()
-        self._log(f"[align-gate] offset={off[0]:+.2f},{off[1]:+.2f}px |{mag:.2f}| -> {'PASS' if ok else 'FAIL'}")
+        self._log(f"[align-gate] offset={off[0]:+.2f},{off[1]:+.2f}px |{mag:.2f}| (tol {self.a.align_tol}) -> {'PASS' if ok else 'FAIL'}")
         if not ok:
-            self._log("[align-gate] FAILED: capture is sub-pixel-misaligned; fix the harness before training")
+            self._log("[align-gate] FAILED: candidate is misaligned; fix flow convention / harness before training")
             raise SystemExit(2)
 
     def _set_lr(self):
@@ -171,6 +174,8 @@ def main():
     p.add_argument('--target-fps', type=int, default=60)
     p.add_argument('--batch', type=int, default=16)
     p.add_argument('--temporal', type=float, default=0.0, help='temporal-stability weight (0=off)')
+    p.add_argument('--align-tol', type=float, default=0.15,
+                   help='alignment-gate tolerance px (raise for large-motion real data, e.g. 0.4 for Vimeo 2x)')
     torch.backends.cuda.matmul.allow_tf32 = True               # TF32 Tensor Cores for fp32 matmuls
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True                      # pick fastest conv kernels
