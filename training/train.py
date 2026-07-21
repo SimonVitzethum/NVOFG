@@ -155,8 +155,17 @@ class Trainer:
                         loss = loss + self.a.temporal * tl; comps['temporal'] = tl.item()
                 else:
                     loss = train_step(self.model, self.dev)   # synthetic pipeline validation
+            # NaN-guard: a single non-finite loss (a bad batch / RAFT-flow inf at an occlusion) would
+            # otherwise turn every weight to NaN and poison all downstream checkpoints. Skip it.
+            if not torch.isfinite(loss):
+                self._log(f"[nan-guard] non-finite loss at step {self.step} -> skip step")
+                self.opt.zero_grad(set_to_none=True); self.step += 1; continue
             self.opt.zero_grad(set_to_none=True)
             self.scaler.scale(loss).backward()
+            # gradient clipping: real data (large motion + perceptual losses) produces occasional huge
+            # gradients that explode fp16 training into NaN (observed ~step 53.5k). Clip the norm.
+            self.scaler.unscale_(self.opt)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.a.grad_clip)
             self.scaler.step(self.opt); self.scaler.update()
             self.step += 1
             if self.step % self.a.log_every == 0:
@@ -185,6 +194,7 @@ def main():
     p.add_argument('--temporal', type=float, default=0.0, help='temporal-stability weight (0=off)')
     p.add_argument('--align-tol', type=float, default=0.15,
                    help='alignment-gate tolerance px (raise for large-motion real data, e.g. 0.4 for Vimeo 2x)')
+    p.add_argument('--grad-clip', type=float, default=1.0, help='max grad-norm (NaN/explosion guard)')
     p.add_argument('--workers', type=int, default=0,
                    help='DataLoader workers. 0 (default) = load in-process: NO inter-process shared '
                         'memory, so no shmem leak, and low CPU (coexists with other box workloads). '
