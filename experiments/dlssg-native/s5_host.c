@@ -1437,10 +1437,11 @@ int main(void){
                         // the first Evaluate -> (0,0) mismatches).
                         SetUI(params,"DLSSG.SynchronousInit",1);
                         SetI(params,"DLSSG.SynchronousInit",1);
-                        // Cache primers: the handle caches extents at Create from
-                        // these keys (Evaluate compares against them; unset -> (0,0)).
-                        SetUI(params,"DLSSG.InternalWidth",W); SetUI(params,"DLSSG.InternalHeight",H);
-                        SetI(params,"DLSSG.InternalWidth",(int)W); SetI(params,"DLSSG.InternalHeight",(int)H);
+                        // Cache primers: DynamicResolution only — InternalWidth/
+                        // Height must STAY UNSET with DynRes=0 (validator exits
+                        // via +0x76a54 if InternalW/H != 0 while DynRes == 0).
+                        SetUI(params,"DLSSG.DynamicResolution",0);
+                        SetI(params,"DLSSG.DynamicResolution",0);
                         // Explicit NULLs for optional resources at CREATE time:
                         // handle fields derived from them must be deterministic
                         // NULL (not malloc garbage) for later checks to skip.
@@ -1660,7 +1661,8 @@ int main(void){
                                   // NO ULL for integrals (single-entry map: ULL would
                                   // clobber uint/int the readers need). ULL only for
                                   // the 4 resource pointers (set above).
-                                  SetU2(params,"DLSSG.InternalWidth",W); SetU2(params,"DLSSG.InternalHeight",H);
+                                  // NO InternalWidth/Height (see create: must stay
+                                  // unset with DynRes=0, else exit via +0x76a54).
                                   SetU2(params,"DLSSG.DynamicResolution",0);
                                   SetI2(params,"DLSSG.Reset",1); SetI2(params,"DLSSG.MultiFrameCount",1);
                                   SetI2(params,"DLSSG.MultiFrameIndex",1); SetI2(params,"DLSSG.DepthInverted",0);
@@ -1669,13 +1671,18 @@ int main(void){
                                   SetI2(params,"DLSSG.AutomodeOverrideReset",0); SetI2(params,"DLSSG.EvalFlags",0);
                                   SetI2(params,"DLSSG.InvertXAxis",0); SetI2(params,"DLSSG.InvertYAxis",0);
                                   SetI2(params,"DLSSG.MvecDilated",0); SetI2(params,"DLSSG.MvecJittered",0);
-                                  SetI2(params,"DLSSG.InternalWidth",(int)W); SetI2(params,"DLSSG.InternalHeight",(int)H);
                                   SetI2(params,"DLSSG.DynamicResolution",0); }
                                 // H1: legacy path REQUIRES CmdQueue+CmdAlloc (silent
                                 // 0xBAD00005 at +0x76b5e/+0x76b6b otherwise).
                                 // S5_CMDALLOC=cmd -> pass cmd buffer instead of pool.
                                 SetV(params,"DLSSG.CmdQueue",(void*)g_queue);
                                 SetV(params,"DLSSG.CmdAlloc",getenv("S5_CMDALLOC")?(void*)cmd:(void*)pool);
+                                // ULL twins: CmdQueue/Alloc are fetched via the ULL
+                                // getter (like resources); void*-only is invisible.
+                                { typedef void MSABI(*setull_q)(void*,const char*,unsigned long long);
+                                  setull_q SetUq=(setull_q)ev[0];
+                                  SetUq(params,"DLSSG.CmdQueue",(unsigned long long)(uintptr_t)(void*)g_queue);
+                                  SetUq(params,"DLSSG.CmdAlloc",(unsigned long long)(uintptr_t)(getenv("S5_CMDALLOC")?(void*)cmd:(void*)pool)); }
                                 logs("[Eval] params set\n");
                                 vkResetCommandPool(g_dev,pool,0);
                                 VkCommandBufferBeginInfo ebi={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
