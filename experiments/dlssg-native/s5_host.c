@@ -780,8 +780,16 @@ int main(void){
         init_t Init=(init_t)module_export(h,"NVSDK_NGX_VULKAN_Init_ProjectID");
         if(Init && getenv("RUN_INIT")){
             logs("\n[calling NVSDK_NGX_VULKAN_Init_ProjectID ...]\n");
+            // Same lesson as GFR: pass a real FeatureCommonInfo (arg10), not NULL.
+            static const void* ici_paths[1]; ici_paths[0]=wpath;
+            struct { const void* path; u32 len; u32 pad_; void* internal_; } ici;
+            memset(&ici,0,sizeof ici); ici.path=ici_paths; ici.len=1; ici.internal_=0;
+            // Ghidra 2026-09-12: Init+d5d0 passes p6=0 and reloads gipa from
+            // vulkan-1.dll itself; arg9 (gdpa) is dereferenced as {qword,dword,ptr*}
+            // by FUN_18000ce40 — a CODE pointer (my_gdpa) feeds it code bytes and
+            // faults at +0xceee, while NULL takes the guarded skip. Pass NULL.
             int r=Init("a0b1c2d3-1234-5678-9abc-def012345678",0,"1.0",wpath,
-                       (void*)g_inst,(void*)g_pd,(void*)g_dev,(void*)my_gipa,(void*)my_gdpa,0,0x15);
+                       (void*)g_inst,(void*)g_pd,(void*)g_dev,(void*)my_gipa,0,&ici,0x15);
             char b[80]; snprintf(b,sizeof b,"[NGX Init returned 0x%08X]\n",(unsigned)r); logs(b);
         }
         _exit(0);
