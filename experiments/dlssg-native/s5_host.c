@@ -1070,7 +1070,7 @@ static Module* load_module(const char* name){
     // run DllMain
     typedef int MSABI(*dm_t)(void*,u32,void*); dm_t dm=(dm_t)(base+entry);
     logn("[loading] ",name); int r=dm((void*)base,1,0);
-    { char b[64]; snprintf(b,sizeof b,"[%s DllMain -> %d, exports@rva=0x%x]\n",name,r,expr); logs(b);}
+    { char b[96]; snprintf(b,sizeof b,"[%s DllMain -> %d, base=%p exports@rva=0x%x]\n",name,r,(void*)base,expr); logs(b);}
     return m;
 }
 
@@ -1090,8 +1090,9 @@ static int setup_vulkan(void){
     if(!g_pd) return 2;
     uint32_t qn=0; vkGetPhysicalDeviceQueueFamilyProperties(g_pd,&qn,0); VkQueueFamilyProperties q[16]; if(qn>16)qn=16; vkGetPhysicalDeviceQueueFamilyProperties(g_pd,&qn,q);
     for(uint32_t i=0;i<qn;i++) if(q[i].queueFlags&VK_QUEUE_GRAPHICS_BIT){g_qfam=i;break;}
-    const char* de[]={"VK_KHR_external_memory","VK_KHR_external_memory_fd","VK_KHR_external_semaphore","VK_KHR_external_semaphore_fd","VK_KHR_push_descriptor"};
-    if(try_device(de,5) && try_device(de,3) && try_device(0,0)) return 3;   // degrade until a device is created
+    const char* de[]={"VK_KHR_external_memory","VK_KHR_external_memory_fd","VK_KHR_external_semaphore","VK_KHR_external_semaphore_fd","VK_KHR_push_descriptor",
+        "VK_NVX_binary_import","VK_NVX_image_view_handle"};
+    if(try_device(de,7) && try_device(de,5) && try_device(de,3) && try_device(0,0)) return 3;   // degrade until a device is created
     vkGetDeviceQueue(g_dev,g_qfam,0,&g_queue); return 0; }
 // ms_abi gipa/gdpa: the host calls these MS-x64; return ms2sysv-wrapped native entry points.
 // Interpose vkGetPhysicalDeviceProperties2 (the ONE fn NGX's arch path resolves): call
@@ -1138,6 +1139,13 @@ static void segv(int s,siginfo_t* si,void* uc){ (void)s;
     // which loaded module is rip in?
     for(int i=0;i<g_nmod;i++){ u64 lo=(u64)g_mod[i].base; if(rip>=lo&&rip<lo+0x2000000){ strcat(out," in "); strcat(out,g_mod[i].name); strcat(out,"+0x"); hex64(b,rip-lo); strcat(out,b); break; } }
     if(rip>=(u64)g_code&&rip<(u64)g_code+(1<<20)) strcat(out," in <thunk/trap>");
+    // ... else resolve via /proc/self/maps (native libs, driver, heap)
+    { FILE* mf=fopen("/proc/self/maps","r");
+      if(mf){ char line[512]; while(fgets(line,sizeof line,mf)){
+          u64 lo=0,hi=0; if(sscanf(line,"%lx-%lx",&lo,&hi)==2&&rip>=lo&&rip<hi){
+              char* p=line; while(*p&&*p!='\n'){ size_t L=strlen(out);
+                  if(L<200) { out[L]=*p; out[L+1]=0; } p++; } break; } }
+          fclose(mf); } }
     strcat(out,"]\n"); (void)write(2,out,strlen(out)); _exit(42); }
 
 // ---- Evaluate scaffolding: native test images + exact NGX resource layout --
@@ -1161,7 +1169,12 @@ static ImgRes MkImg(u32 w,u32 hh,VkFormat f,VkImageUsageFlags u,VkImageAspectFla
         .initialLayout=VK_IMAGE_LAYOUT_UNDEFINED};
     if(vkCreateImage(g_dev,&ii,0,&r.im)!=VK_SUCCESS) return r;
     VkMemoryRequirements mr; vkGetImageMemoryRequirements(g_dev,r.im,&mr);
+    // S5_EXPORT_FD=1: exportable memory (OPAQUE_FD) so the snippet can import
+    // it into CUDA (external-memory interop). Needs _fd ext (enabled).
+    VkExportMemoryAllocateInfo exi={.sType=VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+        .handleTypes=VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT};
     VkMemoryAllocateInfo ai={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext=getenv("S5_EXPORT_FD")?&exi:0,
         .allocationSize=mr.size,.memoryTypeIndex=eval_memidx(mr.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
     if(vkAllocateMemory(g_dev,&ai,0,&r.mm)!=VK_SUCCESS) return r;
     vkBindImageMemory(g_dev,r.im,r.mm,0);
@@ -1300,12 +1313,63 @@ int main(void){
                     { char b2[80]; snprintf(b2,sizeof b2,"[Create] AllocateParameters -> 0x%X params=%p\n",(unsigned)ra,params); logs(b2); }
                     if(ra==1&&params){
                         void** vt=*(void***)params; setui_t SetUI=(setui_t)vt[3]; // vtable[3] = Set(uint)
+                        // vtable roundtrip probe: Set then Get must return the value.
+                        // If this fails, indices are shifted (e.g. hidden dtor slot).
+                        typedef int MSABI(*getui_t)(void*,const char*,u32*);
+                        getui_t GetU=(getui_t)vt[11]; // vtable[11] = Get(uint)
+                        SetUI(params,"Width",1920);
+                        u32 back=0xDEAD; int rg=GetU(params,"Width",&back);
+                        { char b2[96]; snprintf(b2,sizeof b2,"[Create] vtable probe: Get(Width) -> 0x%X val=%u (want 1/1920)\n",(unsigned)rg,back); logs(b2); }
+                        // Slots 1/7/9/15 probe: do SetF/SetVoid stick + Get back?
+                        typedef void MSABI(*setvoid_t)(void*,const char*,void*);
+                        typedef void MSABI(*setf_t)(void*,const char*,float);
+                        typedef int MSABI(*getvoid_t)(void*,const char*,void**);
+                        typedef int MSABI(*getf_t)(void*,const char*,float*);
+                        setvoid_t SetV0=(setvoid_t)vt[7]; setf_t SetF0=(setf_t)vt[1];
+                        getvoid_t GetV0=(getvoid_t)vt[15]; getf_t GetF0=(getf_t)vt[9];
+                        static int dummyobj=0x12345678; void* bv=0; float bf=-1;
+                        SetV0(params,"DLSSG.Backbuffer",&dummyobj); SetF0(params,"DLSSG.JitterOffsetX",0.5f);
+                        int rgv=GetV0(params,"DLSSG.Backbuffer",&bv); int rgf=GetF0(params,"DLSSG.JitterOffsetX",&bf);
+                        { char b2[128]; snprintf(b2,sizeof b2,"[Create] vtable probe2: GetV(Backbuffer) -> 0x%X ptr=%p (want-dummy) GetF(JitterX) -> 0x%X val=%f (want 0.5)\n",
+                            (unsigned)rgv,bv,(unsigned)rgf,bf); logs(b2); }
+                        // Cross-type probe: does GetULL see a SetVoid value? (FG fetches
+                        // resources via vtable[8]=GetULL — if type-strict, need SetULL.)
+                        typedef int MSABI(*getull_t)(void*,const char*,unsigned long long*);
+                        getull_t GetU64=(getull_t)vt[8];
+                        unsigned long long b64=0xDEADDEAD; int rgu=GetU64(params,"DLSSG.Backbuffer",&b64);
+                        { char b2[128]; snprintf(b2,sizeof b2,"[Create] vtable probe4: GetULL(Backbuffer) -> 0x%X val=0x%llX (vs dummy %p)\n",
+                            (unsigned)rgu,b64,&dummyobj); logs(b2); }
+                        // ULL-pair probe: does SetULL store + GetULL retrieve?
+                        typedef void MSABI(*setull_t)(void*,const char*,unsigned long long);
+                        setull_t SetU64=(setull_t)vt[0];
+                        SetU64(params,"DLSSG.Backbuffer",(unsigned long long)(uintptr_t)&dummyobj);
+                        unsigned long long b65=0; int rgu2=GetU64(params,"DLSSG.Backbuffer",&b65);
+                        { char b2[128]; snprintf(b2,sizeof b2,"[Create] vtable probe5: SetULL+GetULL(Backbuffer) -> 0x%X val=0x%llX (want dummy %p)\n",
+                            (unsigned)rgu2,b65,&dummyobj); logs(b2); }
+                        // Float order probe: maybe DLL has float/double swapped vs header?
+                        setf_t SetF2=(setf_t)vt[2]; getf_t GetF2=(getf_t)vt[10];
+                        float bf2=-2; SetF2(params,"DLSSG.JitterOffsetY",0.25f);
+                        int rgf2=GetF2(params,"DLSSG.JitterOffsetY",&bf2);
+                        { char b2[128]; snprintf(b2,sizeof b2,"[Create] vtable probe3 (swapped): GetF2(JitterY) -> 0x%X val=%f (want 0.25)\n",
+                            (unsigned)rgf2,bf2); logs(b2); }
                         const char* ew=getenv("S5_FG_W"); const char* eh=getenv("S5_FG_H"); const char* ef=getenv("S5_FG_FMT");
                         u32 W=ew?(u32)strtoul(ew,0,0):1920, H=eh?(u32)strtoul(eh,0,0):1080, F=ef?(u32)strtoul(ef,0,0):4;
                         SetUI(params,"CreationNodeMask",1); SetUI(params,"VisibilityNodeMask",1);
                         SetUI(params,"Width",W); SetUI(params,"Height",H);
                         SetUI(params,"DLSSG.BackbufferFormat",F);
                         SetUI(params,"DLSSG.Width",W); SetUI(params,"DLSSG.Height",H);
+                        // Type-strict map: snippet may read integrals as INT.
+                        // Double-set every integral key as int too (vtable[4]).
+                        typedef void MSABI(*seti_t)(void*,const char*,int);
+                        seti_t SetI=(seti_t)vt[4];
+                        SetI(params,"CreationNodeMask",1); SetI(params,"VisibilityNodeMask",1);
+                        SetI(params,"Width",(int)W); SetI(params,"Height",(int)H);
+                        SetI(params,"DLSSG.BackbufferFormat",(int)F);
+                        SetI(params,"DLSSG.Width",(int)W); SetI(params,"DLSSG.Height",(int)H);
+                        // Cache primers: the handle caches extents at Create from
+                        // these keys (Evaluate compares against them; unset -> (0,0)).
+                        SetUI(params,"DLSSG.InternalWidth",W); SetUI(params,"DLSSG.InternalHeight",H);
+                        SetI(params,"DLSSG.InternalWidth",(int)W); SetI(params,"DLSSG.InternalHeight",(int)H);
                         { char b2[96]; snprintf(b2,sizeof b2,"[Create] params set W=%u H=%u FMT=%u\n",W,H,F); logs(b2); }
                         u64 scratch=0; int rs=Scratch(11,params,&scratch);
                         { char b2[96]; snprintf(b2,sizeof b2,"[Create] GetScratchBufferSize -> 0x%X bytes=%llu\n",(unsigned)rs,(unsigned long long)scratch); logs(b2); }
@@ -1346,14 +1410,18 @@ int main(void){
                             ImgRes col=MkImg(W,H,VK_FORMAT_R8G8B8A8_UNORM,
                                 VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_STORAGE_BIT,
                                 VK_IMAGE_ASPECT_COLOR_BIT);
-                            ImgRes mv=MkImg(W,H,VK_FORMAT_R16G16_SFLOAT,
+                            ImgRes mv=MkImg(W,H,getenv("S5_MVEC32")?VK_FORMAT_R32G32_SFLOAT:VK_FORMAT_R16G16_SFLOAT,
                                 VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_STORAGE_BIT,
                                 VK_IMAGE_ASPECT_COLOR_BIT);
-                            ImgRes dep=MkImg(W,H,VK_FORMAT_R32_SFLOAT,
-                                VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_STORAGE_BIT,
-                                VK_IMAGE_ASPECT_COLOR_BIT);
+                            // S5_DEPTH_D32=1: true depth format + DEPTH aspect (vs R32F+COLOR default).
+                            int d32=getenv("S5_DEPTH_D32")?1:0;
+                            ImgRes dep=MkImg(W,H,d32?VK_FORMAT_D32_SFLOAT:VK_FORMAT_R32_SFLOAT,
+                                VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_STORAGE_BIT
+                                |(d32?VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT:0),
+                                d32?VK_IMAGE_ASPECT_DEPTH_BIT:VK_IMAGE_ASPECT_COLOR_BIT);
                             ImgRes out=MkImg(W,H,VK_FORMAT_R8G8B8A8_UNORM,
-                                VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_SAMPLED_BIT,
+                                VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_SAMPLED_BIT
+                                |VK_IMAGE_USAGE_TRANSFER_DST_BIT, // setup transitions via TRANSFER_DST (VUID)
                                 VK_IMAGE_ASPECT_COLOR_BIT);
                             { char b2[128]; snprintf(b2,sizeof b2,"[Eval] imgs col=%p mv=%p dep=%p out=%p\n",
                                 (void*)col.im,(void*)mv.im,(void*)dep.im,(void*)out.im); logs(b2); }
@@ -1369,17 +1437,23 @@ int main(void){
                                     .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
                                 vkBeginCommandBuffer(c2,&b2i);
                                 VkImageMemoryBarrier bar[4]; VkImage autos[4]={col.im,mv.im,dep.im,out.im};
+                                VkImageAspectFlags barA[4]={VK_IMAGE_ASPECT_COLOR_BIT,VK_IMAGE_ASPECT_COLOR_BIT,
+                                    d32?VK_IMAGE_ASPECT_DEPTH_BIT:VK_IMAGE_ASPECT_COLOR_BIT,VK_IMAGE_ASPECT_COLOR_BIT};
                                 for(int i=0;i<4;i++){ bar[i]=(VkImageMemoryBarrier){.sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
                                     .srcAccessMask=0,.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT,
                                     .oldLayout=VK_IMAGE_LAYOUT_UNDEFINED,.newLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                     .srcQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,
-                                    .image=autos[i],.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1}}; }
+                                    .image=autos[i],.subresourceRange={barA[i],0,1,0,1}}; }
                                 vkCmdPipelineBarrier(c2,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,
                                     0,0,0,0,0,4,bar);
-                                VkClearColorValue cc[3]={{{{0.2f,0.4f,0.6f,1.0f}}},{{{0,0,0,0}}},{{{1.0f,0,0,0}}}};
-                                VkImage tos[3]={col.im,mv.im,dep.im};
-                                for(int i=0;i<3;i++){ VkImageSubresourceRange r={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+                                VkClearColorValue cc[2]={{{{0.2f,0.4f,0.6f,1.0f}}},{{{0,0,0,0}}}};
+                                VkImage tos[2]={col.im,mv.im};
+                                for(int i=0;i<2;i++){ VkImageSubresourceRange r={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
                                     vkCmdClearColorImage(c2,tos[i],VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,&cc[i],1,&r); }
+                                if(d32){ VkClearDepthStencilValue dv={1.0f,0}; VkImageSubresourceRange r={VK_IMAGE_ASPECT_DEPTH_BIT,0,1,0,1};
+                                    vkCmdClearDepthStencilImage(c2,dep.im,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,&dv,1,&r); }
+                                else { VkClearColorValue dc={{{1.0f,0,0,0}}}; VkImageSubresourceRange r={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+                                    vkCmdClearColorImage(c2,dep.im,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,&dc,1,&r); }
                                 for(int i=0;i<4;i++){ bar[i].srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;
                                     bar[i].dstAccessMask=VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT;
                                     bar[i].oldLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -1397,11 +1471,11 @@ int main(void){
                                     .Type=NVSDK_NGX_RESOURCE_VK_TYPE_VK_IMAGEVIEW,.ReadWrite=false};
                                 NVSDK_NGX_Resource_VK rMv={.Resource.ImageViewInfo=
                                     {(void*)mv.vw,(void*)mv.im,{VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1},
-                                        VK_FORMAT_R16G16_SFLOAT,W,H},
+                                        getenv("S5_MVEC32")?VK_FORMAT_R32G32_SFLOAT:VK_FORMAT_R16G16_SFLOAT,W,H},
                                     .Type=NVSDK_NGX_RESOURCE_VK_TYPE_VK_IMAGEVIEW,.ReadWrite=false};
                                 NVSDK_NGX_Resource_VK rDep={.Resource.ImageViewInfo=
-                                    {(void*)dep.vw,(void*)dep.im,{VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1},
-                                        VK_FORMAT_R32_SFLOAT,W,H},
+                                    {(void*)dep.vw,(void*)dep.im,{d32?VK_IMAGE_ASPECT_DEPTH_BIT:VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1},
+                                        d32?VK_FORMAT_D32_SFLOAT:VK_FORMAT_R32_SFLOAT,W,H},
                                     .Type=NVSDK_NGX_RESOURCE_VK_TYPE_VK_IMAGEVIEW,.ReadWrite=false};
                                 NVSDK_NGX_Resource_VK rOut={.Resource.ImageViewInfo=
                                     {(void*)out.vw,(void*)out.im,{VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1},
@@ -1409,6 +1483,15 @@ int main(void){
                                     .Type=NVSDK_NGX_RESOURCE_VK_TYPE_VK_IMAGEVIEW,.ReadWrite=true};
                                 SetV(params,"DLSSG.Backbuffer",&rBack); SetV(params,"DLSSG.MVecs",&rMv);
                                 SetV(params,"DLSSG.Depth",&rDep); SetV(params,"DLSSG.OutputInterpolated",&rOut);
+                                // FG-Evaluate fetches resources via the ULL getter
+                                // (vtable[8]) — type-strict map, so SetVoid alone is
+                                // invisible to it. Set BOTH representations.
+                                typedef void MSABI(*setull_t)(void*,const char*,unsigned long long);
+                                setull_t SetU64=(setull_t)ev[0];
+                                SetU64(params,"DLSSG.Backbuffer",(unsigned long long)(uintptr_t)&rBack);
+                                SetU64(params,"DLSSG.MVecs",(unsigned long long)(uintptr_t)&rMv);
+                                SetU64(params,"DLSSG.Depth",(unsigned long long)(uintptr_t)&rDep);
+                                SetU64(params,"DLSSG.OutputInterpolated",(unsigned long long)(uintptr_t)&rOut);
                                 static float ident[16]={1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
                                 SetV(params,"DLSSG.ClipToPrevClip",ident); SetV(params,"DLSSG.PrevClipToClip",ident);
                                 SetV(params,"DLSSG.CameraViewToClip",ident); SetV(params,"DLSSG.ClipToCameraView",ident);
@@ -1433,6 +1516,16 @@ int main(void){
                                 // H3: internal extent keys (cached-size validation).
                                 SetU2(params,"DLSSG.InternalWidth",W); SetU2(params,"DLSSG.InternalHeight",H);
                                 SetU2(params,"DLSSG.DynamicResolution",0);
+                                { seti_t SetI2=(seti_t)ev[4];
+                                  SetI2(params,"DLSSG.Reset",1); SetI2(params,"DLSSG.MultiFrameCount",1);
+                                  SetI2(params,"DLSSG.MultiFrameIndex",1); SetI2(params,"DLSSG.DepthInverted",0);
+                                  SetI2(params,"DLSSG.CameraMotionIncluded",1); SetI2(params,"DLSSG.ColorBuffersHDR",0);
+                                  SetI2(params,"DLSSG.OrthoProjection",0); SetI2(params,"DLSSG.NotRenderingGameFrames",0);
+                                  SetI2(params,"DLSSG.AutomodeOverrideReset",0); SetI2(params,"DLSSG.EvalFlags",0);
+                                  SetI2(params,"DLSSG.InvertXAxis",0); SetI2(params,"DLSSG.InvertYAxis",0);
+                                  SetI2(params,"DLSSG.MvecDilated",0); SetI2(params,"DLSSG.MvecJittered",0);
+                                  SetI2(params,"DLSSG.InternalWidth",(int)W); SetI2(params,"DLSSG.InternalHeight",(int)H);
+                                  SetI2(params,"DLSSG.DynamicResolution",0); }
                                 // H1: legacy path REQUIRES CmdQueue+CmdAlloc (silent
                                 // 0xBAD00005 at +0x76b5e/+0x76b6b otherwise).
                                 // S5_CMDALLOC=cmd -> pass cmd buffer instead of pool.
@@ -1449,6 +1542,17 @@ int main(void){
                                 VkSubmitInfo si2={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=1,.pCommandBuffers=&cmd};
                                 vkQueueSubmit(g_queue,1,&si2,0); vkQueueWaitIdle(g_queue);
                                 logs("[Eval] submitted+waited\n");
+                                // Second Evaluate: cache may prime on first call
+                                // (Reset=0 now). Log both results.
+                                SetU2(params,"DLSSG.Reset",0);
+                                { seti_t SetI3=(seti_t)ev[4]; SetI3(params,"DLSSG.Reset",0); }
+                                vkResetCommandPool(g_dev,pool,0);
+                                vkBeginCommandBuffer(cmd,&ebi);
+                                int re2=Eval((void*)cmd,handle,params,0);
+                                { char b2[80]; snprintf(b2,sizeof b2,"[Eval] EvaluateFeature(FG) #2 -> 0x%X\n",(unsigned)re2); logs(b2); }
+                                vkEndCommandBuffer(cmd);
+                                VkSubmitInfo si2b={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=1,.pCommandBuffers=&cmd};
+                                vkQueueSubmit(g_queue,1,&si2b,0); vkQueueWaitIdle(g_queue);
                                 // --- readback: out -> host buffer, checksum ---
                                 VkBuffer stg=0; VkDeviceMemory stm=0;
                                 VkBufferCreateInfo bci={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
