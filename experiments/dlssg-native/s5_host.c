@@ -98,6 +98,7 @@ static void* make_trap(const char* name);   // fwd (defined below)
 static void* make_ms2sysv(void* target);     // fwd (defined below)
 static u8 g_luid[8];                          // synthetic adapter LUID (deviceUUID-derived; filled in GPDP2)
 MSABI static void* my_gipa(void*,const char*);   // ms_abi vkGetInstanceProcAddr wrapper (below)
+MSABI static int s_cuDeviceGetLuid(char*,unsigned*,int); // fwd, defined near my_gipa
 MSABI static void* my_gdpa(void*,const char*);   // ms_abi vkGetDeviceProcAddr wrapper (below)
 static void* g_hvk,*g_hcu;                    // native libvulkan / libcuda (defined below)
 
@@ -619,7 +620,19 @@ MSABI static int s_FreeLibrary(void* h){ (void)h; return 1; }
 MSABI static u32 s_GetFileType(void* h){ (void)h; return 1; /*FILE_TYPE_DISK*/ }
 MSABI static int s_GetStringTypeW(u32 t,const u16* s,int c,u16* out){ (void)t;(void)s; if(out) for(int i=0;i<c;i++) out[i]=0; return 1; }
 MSABI static int s_IsValidCodePage(u32 c){ (void)c; return 1; }
-MSABI static void* s_OpenFileMappingA(u32 a,int inh,const char* n){ (void)a;(void)inh;(void)n; g_lasterr=2; return 0; }
+MSABI static void* s_OpenFileMappingA(u32 a,int inh,const char* n){ (void)a;(void)inh;
+    // S5_SHM=1: real POSIX-shm backing so NGX's override/status shared memory
+    // works. Default (unset): NULL (old behavior — GREEN baseline). The shm
+    // path once crashed GFR at +0x3948c (struct copy into bad buffer), so it
+    // stays opt-in until the mapping-size contract is understood.
+    if(!getenv("S5_SHM")){ g_lasterr=2; return 0; }
+    if(!n||!n[0]){ g_lasterr=2; return 0; }
+    char shm[96]; snprintf(shm,sizeof shm,"/ngx_%s",n);
+    for(char* p=shm+5;*p;p++) if(*p=='\\'||*p=='/'||*p==':') *p='_';
+    int fd=shm_open(shm,O_RDWR|O_CREAT,0600);
+    if(fd<0){ g_lasterr=2; return 0; }
+    struct stat st; if(fstat(fd,&st)==0&&(size_t)st.st_size<65536) ftruncate(fd,65536);
+    return (void*)(uintptr_t)(FILETAG|(u32)fd); }
 MSABI static int s_WriteFile(void* h,const void* buf,u32 n,u32* wr,void* ov){ (void)ov; if(((uintptr_t)h&0xFF000000u)==0x30000000u){ ssize_t r=write(2,buf,n); if(wr)*wr=r>0?(u32)r:0; return 1; } if(is_fileh(h)){ ssize_t r=write(fileh_fd(h),buf,n); if(wr)*wr=r>0?(u32)r:0; return r>=0; } if(wr)*wr=n; return 1; }
 MSABI static u32   s_GetFileAttributesW(void* name){ if(wine_has(name)){ wlog("[GetFileAttributesW OK] ",name); return 0x80; /*FILE_ATTRIBUTE_NORMAL*/ } wlog("[GetFileAttributesW] ",name); g_lasterr=2/*ERROR_FILE_NOT_FOUND*/; return 0xFFFFFFFF; } // INVALID_FILE_ATTRIBUTES
 MSABI static int   s_GetFileAttributesExW(void* name,u32 lvl,void* info){ (void)lvl; if(wine_has(name)){ if(info) memset(info,0,36); if(info)*(u32*)info=0x80; wlog("[GetFileAttributesExW OK] ",name); return 1; } wlog("[GetFileAttributesExW] ",name); return 0; } // FALSE
@@ -1017,7 +1030,9 @@ static void* make_ms2sysv(void* target){ if(!target) return 0; u8* p=g_code+g_co
 static void* resolve(const char* dll,const char* fn){
     // Vulkan/CUDA imports -> native driver via an ms_abi->SysV thunk (the PE calls MS-x64).
     if(!strcasecmp(dll,"vulkan-1.dll")){ void* n=g_hvk?dlsym(g_hvk,fn):0; if(n) return make_ms2sysv(n); }
-    if(!strcasecmp(dll,"nvcuda.dll")){   void* n=g_hcu?dlsym(g_hcu,fn):0; if(n) return make_ms2sysv(n); }
+    if(!strcasecmp(dll,"nvcuda.dll")){   void* n=g_hcu?dlsym(g_hcu,fn):0;
+        if(n&&!strcmp(fn,"cuDeviceGetLuid")){ logn("[cuda->interpose] ",fn); return (void*)s_cuDeviceGetLuid; }
+        if(n){ logn("[cuda->native] ",fn); return make_ms2sysv(n); } logn("[cuda MISSING] ",fn); }
     void* s=g_stubs_lookup(fn); if(s)return s;
     char* nm=malloc(strlen(dll)+strlen(fn)+2); sprintf(nm,"%s:%s",dll,fn); return make_trap(nm); }
 
@@ -1102,6 +1117,17 @@ MSABI static void s_vkGPDP2(void* pd,void* pprops){
 MSABI static void* my_gipa(void* inst,const char* n){ if(n)logn("[gipa] ",n);
     if(n&&!strcmp(n,"vkGetPhysicalDeviceProperties2")) return (void*)s_vkGPDP2;
     void* f=(void*)vkGetInstanceProcAddr((VkInstance)inst,n); return f?make_ms2sysv(f):0; }
+// cuDeviceGetLuid interpose: report the SAME synthetic LUID as the Vulkan
+// deviceLUID (g_luid) so the snippet's Vulkan<->CUDA adapter correlation
+// matches (native CUDA would report the real LUID, Vulkan gets synthesized).
+// CUresult cuDeviceGetLuid(char*, unsigned*, CUdevice): all INT class.
+typedef int (*cuLuid_t)(char*,unsigned*,int);
+MSABI static int s_cuDeviceGetLuid(char* luid,unsigned* mask,int dev){
+    cuLuid_t real=(cuLuid_t)dlsym(g_hcu,"cuDeviceGetLuid");
+    int r=real?real(luid,mask,dev):-1;
+    { char b[96]; snprintf(b,sizeof b,"[cuLuid] dev=%d -> %d mask=%u (forcing synth)\n",
+        dev,r,mask?(unsigned)*mask:9999); logs(b); }
+    if(luid) memcpy(luid,g_luid,8); if(mask) *mask=1; return r; }
 MSABI static void* my_gdpa(void* dev,const char* n){ if(n)logn("[gdpa] ",n); PFN_vkGetDeviceProcAddr g=(PFN_vkGetDeviceProcAddr)vkGetInstanceProcAddr(g_inst,"vkGetDeviceProcAddr"); void* f=g?(void*)g((VkDevice)dev,n):0; return f?make_ms2sysv(f):0; }
 
 static void hex64(char* o,u64 a){ for(int i=0;i<16;i++){int d=(a>>((15-i)*4))&0xF;o[i]=d<10?'0'+d:'a'+d-10;} o[16]=0; }
@@ -1227,8 +1253,16 @@ int main(void){
                 allocparams_t Alloc=(allocparams_t)module_export(h,"NVSDK_NGX_VULKAN_AllocateParameters");
                 Module* snip=0;
                 for(int i=0;i<g_nmod;i++) if(!strcasecmp(g_mod[i].name,"nvngx_dlssg.dll")) snip=&g_mod[i];
-                scratch_t Scratch=snip?(scratch_t)module_export(snip,"NVSDK_NGX_VULKAN_GetScratchBufferSize"):0;
-                create_t Create=snip?(create_t)module_export(snip,"NVSDK_NGX_VULKAN_CreateFeature"):0;
+                // Resolve via the HOST forwarder, NOT the snippet directly: the
+                // snippet's Create/Scratch wrappers check GetModuleHandleExA(
+                // FROM_ADDRESS, retaddr) + wcsstr(path, L"nvngx.dll") and fail
+                // 0xBAD00002 ("Not called from NGX runtime") for a native
+                // caller. Through the host forwarder the inner retaddr lies
+                // inside _nvngx.dll ("...\_nvngx.dll" contains the needle).
+                scratch_t Scratch=(scratch_t)module_export(h,"NVSDK_NGX_VULKAN_GetScratchBufferSize");
+                create_t Create=(create_t)module_export(h,"NVSDK_NGX_VULKAN_CreateFeature");
+                if(!Scratch&&snip) Scratch=(scratch_t)module_export(snip,"NVSDK_NGX_VULKAN_GetScratchBufferSize");
+                if(!Create&&snip) Create=(create_t)module_export(snip,"NVSDK_NGX_VULKAN_CreateFeature");
                 { char b2[128]; snprintf(b2,sizeof b2,"[Create] Alloc=%p snip=%p Scratch=%p Create=%p\n",
                     (void*)Alloc,(void*)snip,(void*)Scratch,(void*)Create); logs(b2); }
                 if(Alloc&&Scratch&&Create){
