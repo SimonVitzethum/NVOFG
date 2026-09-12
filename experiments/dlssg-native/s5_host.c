@@ -139,15 +139,53 @@ MSABI static u64   s_GetTickCount64(void){struct timespec t;clock_gettime(CLOCK_
 MSABI static void  s_GetStartupInfoW(void* si){if(si)memset(si,0,104);}
 MSABI static void* s_GetCommandLineW(void){static const u16 w[]={'a',0};return(void*)w;}
 MSABI static void  s_OutputDebugStringA(const char* s){logn("[dbg] ",s?s:"");}
-// RaiseException is currently swallowed (returns, no unwind): NGX uses SEH around
-// fallible probes, so a swallowed raise continues with error state instead of
-// unwinding — suspect for flaky downstream faults. Log code/args first; real SEH
-// (via .pdata unwind) is future work. NOTE: keep signature exact (4 args).
+// RaiseException decoder: NGX throws MSVC C++ (0xE06D7363) on fallible paths and
+// swallowing it continues with error state (-> flaky SIGTRAP). Decode the
+// EXCEPTION_RECORD instead: info[0]=magic, info[1]=thrown object,
+// info[2]=ThrowInfo -> pCatchableTypeArray -> TypeDescriptor.name (mangled type),
+// plus a best-effort std::runtime_error message. All reads fault-guarded: PE
+// structures are valid by construction, but a corrupt throw must not kill us.
+#include <setjmp.h>
+static sigjmp_buf g_decjmp;
+static void dec_segv(int s){ (void)s; siglongjmp(g_decjmp,1); }
+static int dec_u64(u64 addr,u64* out){ struct sigaction na,oa; memset(&na,0,sizeof na);
+    na.sa_handler=dec_segv; sigemptyset(&na.sa_mask); na.sa_flags=0;
+    if(sigaction(SIGSEGV,&na,&oa)!=0) return -1;
+    int r=0; if(sigsetjmp(g_decjmp,1)==0){ *out=*(volatile u64*)(uintptr_t)addr; }
+    else r=-1;
+    sigaction(SIGSEGV,&oa,0); return r; }
+static int dec_bytes(u64 addr,char* out,u64 max){ // NUL-terminated string, chunked
+    u64 got=0; while(got<max){ u64 v=0; if(dec_u64(addr+got,&v)!=0) break;
+        for(int i=0;i<8&&(got+i)<max;i++){ char c=(char)(v>>(i*8)); out[got+i]=c;
+            if(!c){ return 0; } } got+=8; }
+    if(max) out[max-1]=0; return got?0:-1; }
 MSABI static void s_RaiseException(u32 code,u32 flags,u32 nargs,void* args){
-    char b[128]; unsigned long a0=0,a1=0;
-    if(args){ a0=((unsigned long*)args)[0]; if(nargs>1) a1=((unsigned long*)args)[1]; }
-    snprintf(b,sizeof b,"[RaiseException] code=0x%08X flags=%u nargs=%u a0=%p a1=%p\n",
-        code,flags,nargs,(void*)a0,(void*)a1); logs(b); }
+    char b[160]; unsigned long a0=0,a1=0,a2=0;
+    if(args){ unsigned long* ai=args; a0=ai[0]; if(nargs>1)a1=ai[1]; if(nargs>2)a2=ai[2]; }
+    snprintf(b,sizeof b,"[RaiseException] code=0x%08X flags=%u nargs=%u\n",code,flags,nargs); logs(b);
+    if(code!=0xE06D7363||nargs<3||!args) return;
+    u64 magic=0,obj=0,ti=0;
+    { u64 v=0; if(dec_u64((u64)(uintptr_t)&((unsigned long*)args)[0],&v)==0) magic=v;
+      if(dec_u64((u64)(uintptr_t)&((unsigned long*)args)[1],&v)==0) obj=v;
+      if(dec_u64((u64)(uintptr_t)&((unsigned long*)args)[2],&v)==0) ti=v; }
+    snprintf(b,sizeof b,"[throw] magic=0x%lX obj=%p ThrowInfo=%p\n",(unsigned long)magic,(void*)obj,(void*)ti); logs(b);
+    if(!ti) return;
+    u64 cta=0; if(dec_u64(ti+24,&cta)!=0||!cta){ logs("[throw] ThrowInfo unreadable\n"); return; }
+    u64 nct=0; { u64 v=0; if(dec_u64(cta,&v)!=0) return; nct=v&0xFFFFFFFFu; }
+    snprintf(b,sizeof b,"[throw] catchable=%llu\n",(unsigned long long)nct); logs(b);
+    for(u64 i=0;i<nct&&i<3;i++){ u64 pct=0,ptd=0;
+        if(dec_u64(cta+8+i*8,&pct)!=0||!pct) continue;
+        if(dec_u64(pct+8,&ptd)!=0||!ptd) continue;
+        char nm[256]; memset(nm,0,sizeof nm);
+        if(dec_bytes(ptd+16,nm,sizeof nm)!=0){ logs("[throw] typename unreadable\n"); continue; }
+        snprintf(b,sizeof b,"[throw] type[%llu]=%s\n",(unsigned long long)i,nm); logs(b);
+        if(i==0&&obj){ // best-effort MSVC std::runtime_error message: vfptr@0, string@8
+            u64 sz=0; if(dec_u64(obj+8+16,&sz)!=0) continue; // _Mysize
+            if(sz>512){ snprintf(b,sizeof b,"[throw] msg: <len %llu, skipping>\n",(unsigned long long)sz); logs(b); continue; }
+            char msg[513]; memset(msg,0,sizeof msg);
+            if(sz<16){ if(dec_bytes(obj+8,msg,sz+1)==0){ snprintf(b,sizeof b,"[throw] msg: %s\n",msg); logs(b); } }
+            else { u64 pp=0; if(dec_u64(obj+8,&pp)!=0) continue;
+                if(dec_bytes(pp,msg,sz+1)==0){ snprintf(b,sizeof b,"[throw] msg: %s\n",msg); logs(b); } } } } }
 // Windows environment BLOCK ("NAME=VAL\0NAME=VAL\0\0", UTF-16). NGX reads this (GetEnvironmentStringsW
 // / PEB RtlQueryEnvironmentVariable_U) and splits PATH into a directory list; an empty block left a
 // null wstring in that list -> crash at 0xa1f3. Populated by init_env() before the fork.
@@ -452,15 +490,15 @@ static u8 g_gpubuf[8192];
 #define FAKE_GPU  ((void*)(g_gpubuf))
 #define FAKE_LGPU ((void*)(g_gpubuf+4096))
 MSABI static int s_EnumPhysicalGPUs(void** h,u32* c){ if(h)h[0]=FAKE_GPU; if(c)*c=1; return 0; }
-// NV_GPU_ARCH_INFO = {version@0 (set by caller), architecture@4, implementation@8, revision@12}.
-// We know the device is a Blackwell RTX 5070 -> report GB200 (0x1B0), which is >= Ada, so FG-eligible.
-// MEASURED against dxvk-nvapi (nvapi_dump.exe under Proton): arch=0x1B0, impl=0x2, rev=0xFFFFFFFF
-// (CHIP_REVISION_UNKNOWN). Our earlier impl=5/rev=0xA1 were guesses that diverged from the oracle;
-// the FG evaluator reads impl/rev and rejected the mismatched values.
-MSABI static int s_GPU_GetArchInfo(void* gpu,u32* ai){ (void)gpu; if(ai){ ai[1]=0x000001B0; /*GB2xx/Blackwell*/ ai[2]=0x00000002; /*impl*/ ai[3]=0xFFFFFFFF; /*rev=UNKNOWN*/ } return 0; }
+// NV_GPU_ARCH_INFO = {version@0 (set by caller: size|ver<<16), architecture@4,
+// implementation@8, revision@12, ...}. Zero the FULL versioned size first like
+// dxvk does — leftover stack garbage in ai[4..] flips checks nondeterministically.
+// MEASURED against dxvk-nvapi (nvapi_dump.exe under Proton): arch=0x1B0, impl=0x2,
+// rev=0xFFFFFFFF (CHIP_REVISION_UNKNOWN). Earlier impl=5/rev=0xA1 were guesses.
+MSABI static int s_GPU_GetArchInfo(void* gpu,u32* ai){ (void)gpu; if(ai){ u32 sz=ai[0]&0xFFFF; if(sz>4&&sz<=64) memset(ai+1,0,sz-4); ai[1]=0x000001B0; /*GB2xx/Blackwell*/ ai[2]=0x00000002; /*impl*/ ai[3]=0xFFFFFFFF; /*rev=UNKNOWN*/ } return 0; }
 MSABI static int s_GetLogicalGPU(void* p,void** l){ (void)p; if(l)*l=FAKE_LGPU; return 0; }
-MSABI static int s_GPU_GetPCIIdentifiers(void* g,u32* dev,u32* sub,u32* rev,u32* ext){ (void)g; u32 id=(0x2D18u<<16)|0x10DE; if(dev)*dev=id; if(sub)*sub=0; if(rev)*rev=0xA1; if(ext)*ext=id; return 0; }
-MSABI static int s_GPU_GetFullName(void* g,char* name){ (void)g; const char* s="NVIDIA GeForce RTX 5070 Laptop GPU"; if(name){int i=0;for(;s[i]&&i<63;i++)name[i]=s[i];name[i]=0;} return 0; }
+MSABI static int s_GPU_GetPCIIdentifiers(void* g,u32* dev,u32* sub,u32* rev,u32* ext){ (void)g; u32 id=(0x2D18u<<16)|0x10DE; if(dev)*dev=id; if(sub)*sub=0; if(rev)*rev=0; if(ext)*ext=0x2D18; return 0; } // measured under Proton (was: rev=0xA1/ext=id guesses)
+MSABI static int s_GPU_GetFullName(void* g,char* name){ (void)g; const char* s="NVIDIA GeForce RTX 5070 Laptop GPU"; if(name){ memset(name,0,64); int i=0;for(;s[i]&&i<63;i++)name[i]=s[i];name[i]=0;} return 0; }
 MSABI static int s_GPU_GetGPUType(void* g,u32* t){ (void)g; if(t)*t=2; /*DGPU*/ return 0; }
 MSABI static int s_GPU_GetBusType(void* g,u32* t){ (void)g; if(t)*t=3; /*PCI_EXPRESS*/ return 0; }
 // Synthetic Windows adapter LUID, used for BOTH the Vulkan deviceLUID (forced into
@@ -479,7 +517,13 @@ MSABI static int s_GPU_GetLogicalGpuInfo(void* lgpu,u8* d){ (void)lgpu; if(!d) r
     // version to yield the real bytes to diff (the -9 wall was just a wrong guessed version).
     { char b[96]; u32 v=*(u32*)d; snprintf(b,sizeof b,"[LGI] version=0x%08X (size=%u ver=%u) osidPtr=%p\n",
         v, v&0xFFFF, v>>16, *(void**)(d+8)); logs(b); }
-    void* osid=*(void**)(d+8); if(osid) memcpy(osid,g_luid,8);
+    // Zero the FULL caller-sized struct first like dxvk (all-zero except the
+    // fields below — verified byte-identical under Proton): leftover stack
+    // garbage in the tail flips checks nondeterministically (OutOfDate vs throw).
+    { u32 v=*(u32*)d, sz=v&0xFFFF; void* osid=*(void**)(d+8);
+      if(sz>8&&sz<=2048) memset(d+8,0,sz-8);
+      *(u32*)d=v; *(void**)(d+8)=osid;
+      if(osid) memcpy(osid,g_luid,8); }
     *(u32*)(d+16)=1; *(void**)(d+24)=FAKE_GPU; logs("[LGI filled]\n"); return 0; }
 MSABI static void* s_nvapi_QueryInterface(u32 id){
     void* f=0; const char* nm="?";
