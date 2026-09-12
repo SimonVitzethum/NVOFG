@@ -7,6 +7,7 @@
 DLLSG ?= /usr/lib/nvidia/wine/nvngx_dlssg.dll
 VENDOR_DLSSG = ../../renderfx/vendor/dlssg
 CFLAGS ?= -O2 -Wall
+NGXINC ?= ../../renderfx/vendor/ngx/include
 
 pe_probe: pe_probe.c
 	$(CC) $(CFLAGS) -o $@ $< -ldl
@@ -15,7 +16,16 @@ pe_load: pe_load.c
 	$(CC) $(CFLAGS) -o $@ $< -ldl
 
 s5_host: s5_host.c
-	$(CC) $(CFLAGS) -o $@ $< -ldl -lvulkan -lcrypto
+	$(CC) $(CFLAGS) -I$(NGXINC) -o $@ $< -ldl -lvulkan -lcrypto
+
+# Full native FG chain gate (needs single-CPU determinism for Init):
+# GFR GREEN -> Init 0x1 -> Create 0x1 -> Evaluate (S5_* env documented in s5_host.c).
+green-init: s5_host
+	S5_SDKVER=0x13 S5_ARG8INT=0x15 S5_SYNC_PHASE=post NVIDIA_WINE_DLL_DIR=/usr/lib/nvidia/wine RUN_INIT=1 taskset -c 0 ./s5_host
+green-create: s5_host
+	S5_SDKVER=0x15 S5_ARG8INT=0x15 S5_SYNC_PHASE=post NVIDIA_WINE_DLL_DIR=/usr/lib/nvidia/wine RUN_INIT=1 S5_CREATE=1 taskset -c 0 ./s5_host
+green-eval: s5_host
+	S5_SDKVER=0x15 S5_ARG8INT=0x15 S5_SYNC_PHASE=post NVIDIA_WINE_DLL_DIR=/usr/lib/nvidia/wine RUN_INIT=1 S5_CREATE=1 S5_EVAL=1 taskset -c 0 ./s5_host
 
 .PHONY: run recon clean green green-vendored
 all: pe_probe pe_load s5_host

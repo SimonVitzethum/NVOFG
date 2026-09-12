@@ -1141,12 +1141,12 @@ static void segv(int s,siginfo_t* si,void* uc){ (void)s;
     strcat(out,"]\n"); (void)write(2,out,strlen(out)); _exit(42); }
 
 // ---- Evaluate scaffolding: native test images + exact NGX resource layout --
-// ImgRes: native VkImage + memory + view. ResVK: byte-exact
-// NVSDK_NGX_Resource_VK for IMAGEVIEW (union 48B: view@0 img@8 range@16
-// fmt@36 w@40 h@44; Type@48; ReadWrite bool@52; sizeof 56).
+// Uses the real vendored NVSDK_NGX_Resource_VK (C-safe header) instead of a
+// hand-rolled struct — layout bugs here are silent InvalidParameters.
+#include "nvsdk_ngx_defs_vk.h"
 typedef struct { VkImage im; VkDeviceMemory mm; VkImageView vw; } ImgRes;
-typedef struct { void* view; void* img; VkImageSubresourceRange range;
-    VkFormat fmt; u32 w,h; u32 type; u8 rw; u8 _p[3]; } ResVK;
+_Static_assert(sizeof(NVSDK_NGX_Resource_VK)==56,"Resource_VK size");
+_Static_assert(sizeof(NVSDK_NGX_ImageViewInfo_VK)==48,"ImageViewInfo size");
 static u32 eval_memidx(u32 bits,u32 want){ VkPhysicalDeviceMemoryProperties mp;
     vkGetPhysicalDeviceMemoryProperties(g_pd,&mp);
     for(u32 i=0;i<mp.memoryTypeCount;i++)
@@ -1390,16 +1390,23 @@ int main(void){
                                 VkSubmitInfo si={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=1,.pCommandBuffers=&c2};
                                 vkQueueSubmit(g_queue,1,&si,0); vkQueueWaitIdle(g_queue);
                                 logs("[Eval] setup done\n");
-                                // --- Resource_VK structs (exact ImageViewInfo layout:
-                                // view@0 img@8 range@16 fmt@36 w@40 h@44 type@48 rw@52)
-                                ResVK rBack={(void*)col.vw,(void*)col.im,{VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1},
-                                        VK_FORMAT_R8G8B8A8_UNORM,W,H,0,0,{0}};
-                                ResVK rMv={(void*)mv.vw,(void*)mv.im,{VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1},
-                                        VK_FORMAT_R16G16_SFLOAT,W,H,0,0,{0}};
-                                ResVK rDep={(void*)dep.vw,(void*)dep.im,{VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1},
-                                        VK_FORMAT_R32_SFLOAT,W,H,0,0,{0}};
-                                ResVK rOut={(void*)out.vw,(void*)out.im,{VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1},
-                                        VK_FORMAT_R8G8B8A8_UNORM,W,H,0,1,{0}};
+                                // --- Resource_VK structs (real header type) ---
+                                NVSDK_NGX_Resource_VK rBack={.Resource.ImageViewInfo=
+                                    {(void*)col.vw,(void*)col.im,{VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1},
+                                        VK_FORMAT_R8G8B8A8_UNORM,W,H},
+                                    .Type=NVSDK_NGX_RESOURCE_VK_TYPE_VK_IMAGEVIEW,.ReadWrite=false};
+                                NVSDK_NGX_Resource_VK rMv={.Resource.ImageViewInfo=
+                                    {(void*)mv.vw,(void*)mv.im,{VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1},
+                                        VK_FORMAT_R16G16_SFLOAT,W,H},
+                                    .Type=NVSDK_NGX_RESOURCE_VK_TYPE_VK_IMAGEVIEW,.ReadWrite=false};
+                                NVSDK_NGX_Resource_VK rDep={.Resource.ImageViewInfo=
+                                    {(void*)dep.vw,(void*)dep.im,{VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1},
+                                        VK_FORMAT_R32_SFLOAT,W,H},
+                                    .Type=NVSDK_NGX_RESOURCE_VK_TYPE_VK_IMAGEVIEW,.ReadWrite=false};
+                                NVSDK_NGX_Resource_VK rOut={.Resource.ImageViewInfo=
+                                    {(void*)out.vw,(void*)out.im,{VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1},
+                                        VK_FORMAT_R8G8B8A8_UNORM,W,H},
+                                    .Type=NVSDK_NGX_RESOURCE_VK_TYPE_VK_IMAGEVIEW,.ReadWrite=true};
                                 SetV(params,"DLSSG.Backbuffer",&rBack); SetV(params,"DLSSG.MVecs",&rMv);
                                 SetV(params,"DLSSG.Depth",&rDep); SetV(params,"DLSSG.OutputInterpolated",&rOut);
                                 static float ident[16]={1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
@@ -1423,6 +1430,14 @@ int main(void){
                                 SetF(params,"DLSSG.CameraFwdX",0); SetF(params,"DLSSG.CameraFwdY",0); SetF(params,"DLSSG.CameraFwdZ",-1.0f);
                                 SetF(params,"DLSSG.CameraPinholeOffsetX",0); SetF(params,"DLSSG.CameraPinholeOffsetY",0);
                                 SetF(params,"DLSSG.MvecInvalidValue",3.4028235e38f);
+                                // H3: internal extent keys (cached-size validation).
+                                SetU2(params,"DLSSG.InternalWidth",W); SetU2(params,"DLSSG.InternalHeight",H);
+                                SetU2(params,"DLSSG.DynamicResolution",0);
+                                // H1: legacy path REQUIRES CmdQueue+CmdAlloc (silent
+                                // 0xBAD00005 at +0x76b5e/+0x76b6b otherwise).
+                                // S5_CMDALLOC=cmd -> pass cmd buffer instead of pool.
+                                SetV(params,"DLSSG.CmdQueue",(void*)g_queue);
+                                SetV(params,"DLSSG.CmdAlloc",getenv("S5_CMDALLOC")?(void*)cmd:(void*)pool);
                                 logs("[Eval] params set\n");
                                 vkResetCommandPool(g_dev,pool,0);
                                 VkCommandBufferBeginInfo ebi={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
