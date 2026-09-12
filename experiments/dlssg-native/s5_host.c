@@ -512,11 +512,17 @@ MSABI static void* s_LoadLibraryA(const char* n){ const char* s=strrchr(n,'\\');
 // (not in g_mod) — so return the host module, keeping GetFeatureRequirements' own self-lookup working.
 static int addr_is_native(void* p){ Dl_info di; return p && dladdr(p,&di)!=0; }
 MSABI static int   s_GetModuleHandleExW(u32 f,void* n,void** out){
-    // Init_ProjectID does the same FROM_ADDRESS(0x4) self-module lookup as the snippet; ignoring the
-    // flag returned the dummy module -> wrong path -> a code pointer got copied as a data struct and
-    // dereferenced (crash at _nvngx+0xceee). Honor FROM_ADDRESS like the A variant; a native (non-PE)
-    // caller address must FAIL (Init then skips its app-module path processing, as for an unknown mod).
-    if(f&4){ for(int i=0;i<g_nmod;i++) if(g_mod[i].base && (u8*)n>=g_mod[i].base && (u8*)n<g_mod[i].base+g_mod[i].size){ if(out)*out=g_mod[i].base; return 1; }
+    // Ghidra 2026-09-12 (FUN_180061950 @ _nvngx+0x61950, called from GFR): the host
+    // resolves the APP module from GFR's return address and wcsdup's its dir + file
+    // into the dir-list fed to 0xb720. For our native caller dladdr succeeds, so the
+    // generic rule below would FAIL it -> NULL wstrings -> 0xa1f3. But here a module
+    // is REQUIRED (under Proton the caller is a real EXE). Report the host module
+    // (its dir is the DLL dir) — narrowly scoped to this querier so Init's 0xceee
+    // skip-behaviour (native caller -> FAIL) is unchanged.
+    if(f&4){ void* ret=__builtin_return_address(0);
+        if(g_nmod>0 && (u8*)ret>=g_mod[0].base+0x61900 && (u8*)ret<g_mod[0].base+0x61b00){
+            if(out)*out=g_mod[0].base; return 1; }
+        for(int i=0;i<g_nmod;i++) if(g_mod[i].base && (u8*)n>=g_mod[i].base && (u8*)n<g_mod[i].base+g_mod[i].size){ if(out)*out=g_mod[i].base; return 1; }
         if(addr_is_native(n)){ if(out)*out=0; return 0; }   // native caller (Init) -> fail, skip app-path
         if(out)*out=g_mod[0].base; return 1; }              // mapped snippet PE -> host module (requirements)
     if(out)*out=g_mod[0].base; return 1; }
@@ -527,8 +533,13 @@ MSABI static int   s_GetModuleHandleExW(u32 f,void* n,void** out){
 // RTL_OSVERSIONINFOW: size@0, major@4, minor@8, build@12, platformId@16, szCSDVersion@20.
 MSABI static int s_RtlGetVersion(u8* vi){ if(vi){ *(u32*)(vi+4)=10; *(u32*)(vi+8)=0; *(u32*)(vi+12)=19041; *(u32*)(vi+16)=2; *(u16*)(vi+20)=0; } return 0; }
 MSABI static int s_GetVersionExW(u8* vi){ if(vi){ *(u32*)(vi+4)=10; *(u32*)(vi+8)=0; *(u32*)(vi+12)=19041; *(u32*)(vi+16)=2; *(u16*)(vi+20)=0; } return 1; }
-MSABI static int   s_GetModuleHandleExA(u32 f,void* n,void** out){
-    if(f&4){ for(int i=0;i<g_nmod;i++) if(g_mod[i].base && (u8*)n>=g_mod[i].base && (u8*)n<g_mod[i].base+g_mod[i].size){ if(out)*out=g_mod[i].base; return 1; }
+MSABI static int s_GetModuleHandleExA(u32 f,void* n,void** out){
+    // Same carve-out as the W variant: FUN_180061950 (GFR dir-string helper) needs a
+    // module for the native caller; Init's own lookup keeps FAIL-for-native.
+    if(f&4){ void* ret=__builtin_return_address(0);
+        if(g_nmod>0 && (u8*)ret>=g_mod[0].base+0x61900 && (u8*)ret<g_mod[0].base+0x61b00){
+            if(out)*out=g_mod[0].base; return 1; }
+        for(int i=0;i<g_nmod;i++) if(g_mod[i].base && (u8*)n>=g_mod[i].base && (u8*)n<g_mod[i].base+g_mod[i].size){ if(out)*out=g_mod[i].base; return 1; }
         if(addr_is_native(n)){ if(out)*out=0; return 0; }   // native caller (Init) -> fail, skip app-path (past 0xceee)
         if(out)*out=g_mod[0].base; return 1; }              // mapped snippet PE -> host module (requirements)
     if(out)*out=g_mod[0].base; return 1; }
@@ -727,7 +738,11 @@ int main(void){
         g_dbg_nvngx_base=h->base;  // gdb anchor (ASLR-stable read point for base+offset breakpoints)
         { char b[80]; snprintf(b,sizeof b,"[_nvngx base=%p  GFR@%p  eval_c1e0@%p  ret_e194@%p]\n",
             (void*)h->base,(void*)(h->base+0xdf80),(void*)(h->base+0xc1e0),(void*)(h->base+0xe194)); logs(b); }
-        static u16 wpath[80]; const char* dp=g_wine_dir(); int i=0; for(;dp[i]&&i<79;i++) wpath[i]=(u8)dp[i]; wpath[i]=0;  // UTF-16 (2-byte) path
+        // Report a WINDOWS-form directory to NGX (same fiction as GetModuleFileNameW
+        // and the FullPath registry value): NGX splits paths on '\\' — a Unix-form dir
+        // leaves its dir/file wstrings NULL/misaligned and crashes 0xb720. Real file
+        // access still uses g_wine_dir() (wine_has/load_module translate by basename).
+        static u16 wpath[80]; const char* dp="C:\\Windows\\System32\\"; int i=0; for(;dp[i]&&i<79;i++) wpath[i]=(u8)dp[i]; wpath[i]=0;  // UTF-16 (2-byte) path
 
         // LIGHTER query first: NVSDK_NGX_VULKAN_GetFeatureRequirements(FrameGeneration) — the
         // same call that returned GREEN under Proton. It takes only instance+pd, NOT the full
@@ -740,6 +755,18 @@ int main(void){
         if(GFR){
             struct { u32 sdkVer,featureId,idType,pad; u64 appId,u1,u2; const void* dataPath; const void* featInfo; } fdi;
             memset(&fdi,0,sizeof fdi); fdi.sdkVer=0x15; fdi.featureId=11; fdi.idType=0; fdi.appId=0x1337ULL; fdi.dataPath=wpath;
+            // Ghidra 2026-09-12: 0xc1e0 feeds 0xb720 (dir-list builder) from caller stack
+            // slots ([rbp+0x77]/[rbp+0x8f]) that stay nil when FeatureInfo is NULL — same
+            // shape as the Init §19 fix. Pass a real FeatureCommonInfo (PathListInfo ->
+            // our DLL dir, InternalData NULL) instead of NULL.
+            // Ghidra+gdb 2026-09-12: 0xb720 reads R14=[FeatureInfo] as {wchar** array,
+            // count}: RDX=array[idx] must be a wchar*. So Path must point at an ARRAY
+            // holding wpath (NOT at the chars directly — that crashes 0xa1f3 with the
+            // string bytes misread as a pointer).
+            static const void* fci_paths[1]; fci_paths[0]=wpath;
+            struct { const void* path; u32 len; u32 pad_; void* internal_; } fci;
+            memset(&fci,0,sizeof fci); fci.path=fci_paths; fci.len=1; fci.internal_=0;
+            fdi.featInfo=&fci;
             struct { u32 fsupp,minhw; char minos[256]; } frq; memset(&frq,0,sizeof frq);
             logs("\n[calling native NVSDK_NGX_VULKAN_GetFeatureRequirements(FrameGeneration=11) ...]\n");
             int rr=GFR((void*)g_inst,(void*)g_pd,&fdi,&frq);
