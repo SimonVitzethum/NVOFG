@@ -296,6 +296,10 @@ MSABI static void* s_CreateThread(void* attr,u64 stack,void* start,void* param,u
     pthread_t th; if(pthread_create(&th,0,win_thread_entry,c)!=0){ free(c); return 0; }
     int idx=__sync_fetch_and_add(&g_nwthreads,1); if(idx<256) g_wthreads[idx]=th;
     if(tid)*tid=(u32)(uintptr_t)th; logn("[CreateThread] ","spawned"); return (void*)(uintptr_t)(0x70000000u|(u32)(idx&0xFFFFFF)); }
+// ExitThread MUST terminate the calling thread (pthread_exit): the old trap
+// RETURNED, so workers ran on past their exit point into garbage (flaky SIGTRAP
+// at +0x67080 right after the ExitThread call). Never returns by design.
+MSABI static void s_ExitThread(u32 code){ char b[64]; snprintf(b,sizeof b,"[ExitThread] code=%u\n",code); logs(b); pthread_exit((void*)(uintptr_t)code); }
 // VS_FIXEDFILEINFO with a version far above any NGX minimum (the snippet-version gate).
 static u32 g_vfi[13]={0xFEEF04BD,0x00010000,(999u<<16)|99u,(9999u<<16)|9999u,(999u<<16)|99u,(9999u<<16)|9999u,0x3F,0,4/*VOS_NT*/,2/*VFT_DLL*/,0,0,0};
 MSABI static u32 s_GetFileVersionInfoSizeExW(u32 fl,const u16* n,u32* h){ (void)fl;(void)n; if(h)*h=0; return sizeof(g_vfi)+64; }
@@ -684,7 +688,7 @@ struct { const char* name; void* fn; } g_stubs[]={
  {"GetFileSize",s_GetFileSize},{"GetFileSizeEx",s_GetFileSizeEx},
  {"CreateFileMappingW",s_CreateFileMappingW},{"CreateFileMappingA",s_CreateFileMappingW},{"MapViewOfFile",s_MapViewOfFile},{"UnmapViewOfFile",s_UnmapViewOfFile},
  {"WinVerifyTrust",s_WinVerifyTrust},{"WTHelperProvDataFromStateData",s_WTHelperProvDataFromStateData},{"WTHelperGetProvSignerFromChain",s_WTHelperGetProvSignerFromChain},{"WTHelperGetProvCertFromChain",s_WTHelperGetProvCertFromChain},
- {"CreateThread",s_CreateThread},{"WriteFile",s_WriteFile},
+ {"CreateThread",s_CreateThread},{"ExitThread",s_ExitThread},{"WriteFile",s_WriteFile},
  {"GetFileVersionInfoSizeExW",s_GetFileVersionInfoSizeExW},{"GetFileVersionInfoSizeW",s_GetFileVersionInfoSizeW},{"GetFileVersionInfoExW",s_GetFileVersionInfoExW},{"GetFileVersionInfoW",s_GetFileVersionInfoW},{"VerQueryValueW",s_VerQueryValueW},
  {"GetACP",s_GetACP},{"GetStdHandle",s_GetStdHandle},{"AreFileApisANSI",s_AreFileApisANSI},{"GetEnvironmentVariableW",s_GetEnvironmentVariableW},
  {"FormatMessageA",s_FormatMessageA},{"FreeLibrary",s_FreeLibrary},{"OpenFileMappingA",s_OpenFileMappingA},
