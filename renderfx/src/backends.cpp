@@ -62,7 +62,7 @@ const RfxBackendCaps kTable[] = {
      RFX_STAGE_COUNT, RFX_FAMILY_GENERIC, "nvofg (shader)", "portable shader frame generation (Tier B)"},
     {RFX_BACKEND_DLSS_FG, RFX_STAGE_FRAME_GENERATION, RFX_FAMILY_DLSS, 1, F_HDR | F_RST | F_TENS, 0, 1, 0, 85, 35,
      RFX_INPUT_COLOR | RFX_INPUT_DEPTH | RFX_INPUT_MOTION,
-     RFX_STAGE_UPSCALING, RFX_FAMILY_DLSS, "DLSS FG", "NGX DLSS-G (Windows-gated; reserved)"},
+     RFX_STAGE_UPSCALING, RFX_FAMILY_DLSS, "DLSS FG", "native loader probes FG GREEN; needs Init/Create/Evaluate (experiments/dlssg-native)"},
     {RFX_BACKEND_FSR_FG, RFX_STAGE_FRAME_GENERATION, RFX_FAMILY_FSR, 1, F_HDR | F_RST, 0, 0, 1, 70, 30,
      RFX_INPUT_COLOR | RFX_INPUT_DEPTH | RFX_INPUT_MOTION,
      RFX_STAGE_UPSCALING, RFX_FAMILY_FSR, "FSR FG", "FSR frame generation (reserved; pairs with FSR)"},

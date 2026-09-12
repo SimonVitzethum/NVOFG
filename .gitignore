@@ -43,6 +43,9 @@ flow.png
 renderfx/vendor/ngx/
 /build-ngx/
 renderfx/vendor/xess/
+# vendored DLSS-G drop for the native loader (local only; NVIDIA-licensed,
+# never committed — see experiments/dlssg-native/RECON.md for provenance)
+renderfx/vendor/dlssg/
 
 # Path B (native DLSS-G loader) — interoperability research, TRACKED explicitly.
 # Only NVIDIA's own binaries and the private RE notebook stay out (see also

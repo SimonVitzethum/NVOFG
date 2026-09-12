@@ -13,6 +13,18 @@ API, so our independently-created library (nvofg/RenderFX) can interoperate with
 are **loaded in place from the installed driver, never copied or redistributed** (enforced by
 `.gitignore`: `*.dll`/`*.exe`).
 
+## Vendored test drop (local-only, never committed)
+
+`../../renderfx/vendor/dlssg/` (git-ignored) holds a newer DLSS-G for testing without touching
+the system driver dir — currently **Streamline SDK 2.14.1** (`bin/x64/nvngx_dlssg.dll`,
+**File Version 310.9.1.0**, Sept 2026; plus `sl.dlss_g.dll`), downloaded from
+`github.com/NVIDIA-RTX/Streamline/releases/tag/v2.14.1`. The driver's own drop
+(`/usr/lib/nvidia/wine/nvngx_dlssg.dll`, 310.2.1.0, March 2025) remains the default.
+One-command gates: `make green` (driver drop) and `make green-vendored` (vendored drop,
+via `S5_WINE`). Both report FrameGeneration GREEN natively (driver 610.57). The Vulkan-side
+integration contract for the future RenderFX backend is specified in
+`../../renderfx/docs/dlssg-vulkan-integration.md`.
+
 ## Method
 
 - A native PE loader maps + relocates the driver's PE modules, resolves their Vulkan/CUDA imports to
