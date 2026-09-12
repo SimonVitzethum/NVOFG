@@ -1183,6 +1183,10 @@ static ImgRes MkImg(u32 w,u32 hh,VkFormat f,VkImageUsageFlags u,VkImageAspectFla
         .subresourceRange={a,0,1,0,1}};
     vkCreateImageView(g_dev,&vi,0,&r.vw); return r; }
 
+// gdb hook (S5_TRAP): clean breakpoint target (unique body defeats ICF merge).
+volatile unsigned g_trap_tick=0;
+MSABI static __attribute__((noinline)) void s_trap_hook(void){ g_trap_tick++; }
+
 int main(void){
     printf("== Path B / S5(a): load Windows NGX host natively\n");
     init_env();   // populate the environment block (PATH etc.) NGX splits into its dir list
@@ -1352,6 +1356,44 @@ int main(void){
                         int rgf2=GetF2(params,"DLSSG.JitterOffsetY",&bf2);
                         { char b2[128]; snprintf(b2,sizeof b2,"[Create] vtable probe3 (swapped): GetF2(JitterY) -> 0x%X val=%f (want 0.25)\n",
                             (unsigned)rgf2,bf2); logs(b2); }
+                        // Int-pair probe: does SetI+GetI (slots 4/12) roundtrip?
+                        // (Subrect/extent reads may use the int getter.)
+                        typedef int MSABI(*geti_t)(void*,const char*,int*);
+                        typedef void MSABI(*seti_t)(void*,const char*,int);
+                        seti_t SetI0=(seti_t)vt[4];
+                        geti_t GetI=(geti_t)vt[12];
+                        SetI0(params,"Width",(int)1920);
+                        int backi=-99; int rgi=GetI(params,"Width",&backi);
+                        { char b2[128]; snprintf(b2,sizeof b2,"[Create] vtable probe6: GetI(Width) -> 0x%X val=%d (want 1/1920)\n",
+                            (unsigned)rgi,backi); logs(b2); }
+                        // Clean double roundtrip: SetD(vt[2]) + GetD(vt[10]) with a
+                        // REAL double (full XMM2) — distinguishes "float broken"
+                        // from "my float call broken".
+                        typedef void MSABI(*setd_t)(void*,const char*,double);
+                        typedef int MSABI(*getd_t)(void*,const char*,double*);
+                        setd_t SetD=(setd_t)vt[2]; getd_t GetD=(getd_t)vt[10];
+                        SetD(params,"DLSSG.DoubleProbe",0.5);
+                        double bdd=-1; int rgd=GetD(params,"DLSSG.DoubleProbe",&bdd);
+                        { char b2[128]; snprintf(b2,sizeof b2,"[Create] vtable probe8: SetD+GetD(DoubleProbe) -> 0x%X val=%f (want 1/0.5)\n",
+                            (unsigned)rgd,bdd); logs(b2); }
+                        // Float cross-product: SetF via slot 1, then Get via EVERY
+                        // slot 8..16 — which getter retrieves a float-stored key?
+                        SetF0(params,"DLSSG.FloatProbe",0.5f);
+                        for(int gi=8;gi<=16;gi++){
+                            typedef int MSABI(*getg_t)(void*,const char*,void*);
+                            getg_t Gg=(getg_t)vt[gi];
+                            unsigned long long out=0xDEADDEADDEADDEADULL;
+                            int rgg=Gg(params,"DLSSG.FloatProbe",&out);
+                            double dd=0; memcpy(&dd,&out,8);
+                            { char b2[128]; snprintf(b2,sizeof b2,"[Create] probeX: Get slot %d -> 0x%X raw=0x%llX dbl=%f\n",
+                                gi,(unsigned)rgg,out,dd); logs(b2); } }
+                        // Single-entry test: does SetULL clobber the uint entry?
+                        typedef void MSABI(*setull_t)(void*,const char*,unsigned long long);
+                        setull_t SetU64x=(setull_t)vt[0];
+                        SetU64x(params,"Width",(unsigned long long)1920);
+                        u32 back2=0xDEAD; int rg2=GetU(params,"Width",&back2);
+                        { char b2[128]; snprintf(b2,sizeof b2,"[Create] vtable probe7: after SetULL, GetUI(Width) -> 0x%X val=%u (1/1920=multi, else single)\n",
+                            (unsigned)rg2,back2); logs(b2); }
                         const char* ew=getenv("S5_FG_W"); const char* eh=getenv("S5_FG_H"); const char* ef=getenv("S5_FG_FMT");
                         u32 W=ew?(u32)strtoul(ew,0,0):1920, H=eh?(u32)strtoul(eh,0,0):1080, F=ef?(u32)strtoul(ef,0,0):4;
                         SetUI(params,"CreationNodeMask",1); SetUI(params,"VisibilityNodeMask",1);
@@ -1366,10 +1408,27 @@ int main(void){
                         SetI(params,"Width",(int)W); SetI(params,"Height",(int)H);
                         SetI(params,"DLSSG.BackbufferFormat",(int)F);
                         SetI(params,"DLSSG.Width",(int)W); SetI(params,"DLSSG.Height",(int)H);
+                        // NOTE: NO ULL for integrals! Single-entry-per-name map:
+                        // last write wins, and readers are uint/int-specific.
+                        // (ULL here broke Create with 'could not find Width'.)
+                        // ULL is ONLY for resource pointers (fetched via slot 8).
+                        // SynchronousInit: force Create to finish init inline
+                        // (async worker may leave the extent cache empty for
+                        // the first Evaluate -> (0,0) mismatches).
+                        SetUI(params,"DLSSG.SynchronousInit",1);
+                        SetI(params,"DLSSG.SynchronousInit",1);
                         // Cache primers: the handle caches extents at Create from
                         // these keys (Evaluate compares against them; unset -> (0,0)).
                         SetUI(params,"DLSSG.InternalWidth",W); SetUI(params,"DLSSG.InternalHeight",H);
                         SetI(params,"DLSSG.InternalWidth",(int)W); SetI(params,"DLSSG.InternalHeight",(int)H);
+                        // Explicit NULLs for optional resources at CREATE time:
+                        // handle fields derived from them must be deterministic
+                        // NULL (not malloc garbage) for later checks to skip.
+                        { setvoid_t SetV9=(setvoid_t)vt[7];
+                          const char* nk[]={"DLSSG.HUDLess","DLSSG.UI","DLSSG.UIAlpha",
+                              "DLSSG.OutputReal","DLSSG.OutputDisableInterpolation",
+                              "DLSSG.BidirectionalDistortionField"};
+                          for(int i=0;i<6;i++) SetV9(params,nk[i],0); }
                         { char b2[96]; snprintf(b2,sizeof b2,"[Create] params set W=%u H=%u FMT=%u\n",W,H,F); logs(b2); }
                         u64 scratch=0; int rs=Scratch(11,params,&scratch);
                         { char b2[96]; snprintf(b2,sizeof b2,"[Create] GetScratchBufferSize -> 0x%X bytes=%llu\n",(unsigned)rs,(unsigned long long)scratch); logs(b2); }
@@ -1388,9 +1447,27 @@ int main(void){
                         }
                         { char b2[64]; snprintf(b2,sizeof b2,"[Create] pool=%p cmd=%p\n",(void*)pool,(void*)cmd); logs(b2); }
                         void* handle=0; int rc=0;
-                        if(cmd) rc=Create((void*)cmd,11,params,&handle);
+                        if(cmd && getenv("S5_CREATE1")){
+                            typedef int MSABI(*create1_t)(void*,void*,u32,void*,void**);
+                            create1_t Create1=(create1_t)module_export(h,"NVSDK_NGX_VULKAN_CreateFeature1");
+                            if(Create1) rc=Create1((void*)g_dev,(void*)cmd,11,params,&handle);
+                            { char b2[96]; snprintf(b2,sizeof b2,"[Create] CreateFeature1(FG) -> 0x%X handle=%p\n",(unsigned)rc,handle); logs(b2); }
+                        }
+                        else if(cmd) rc=Create((void*)cmd,11,params,&handle);
                         { char b2[96]; snprintf(b2,sizeof b2,"[Create] CreateFeature(FG) -> 0x%X handle=%p\n",(unsigned)rc,handle); logs(b2); }
-                        // ---- EvaluateFeature(FG) smoke in the SAME process ----
+                        if(getenv("S5_TRAP")) s_trap_hook(); // gdb hook: inspect handle/state here
+                                // ---- EvaluateFeature(FG) smoke in the SAME process ----
+                                // S5_PRIME=1: NULL the handle's extent-subobject ptr
+                                // ([handle+0xd0]) so check 1092 takes its
+                                // explicit `je skip` path. Rationale (measured):
+                                // NOTHING ever writes that field (watchpoint clean);
+                                // it holds malloc garbage, and the extent cache it
+                                // should point to is never built. NULL is a valid
+                                // fresh-handle state per the check itself.
+                                if(getenv("S5_PRIME")&&handle){
+                                    void** slot=(void**)((char*)handle+0xd0);
+                                    { char b2[80]; snprintf(b2,sizeof b2,"[Eval] prime: [h+0xd0] was %p -> NULL\n",*slot); logs(b2); }
+                                    *slot=0; }
                         // Gated by S5_EVAL=1 (needs S5_CREATE=1 + RUN_INIT + taskset).
                         // Synthetic 1920x1080 inputs (must match create extent!):
                         // color (RGBA8, solid), mvecs (RG16F, zero), depth (R32F, 1.0),
@@ -1492,6 +1569,10 @@ int main(void){
                                 SetU64(params,"DLSSG.MVecs",(unsigned long long)(uintptr_t)&rMv);
                                 SetU64(params,"DLSSG.Depth",(unsigned long long)(uintptr_t)&rDep);
                                 SetU64(params,"DLSSG.OutputInterpolated",(unsigned long long)(uintptr_t)&rOut);
+                                // S5_NORESET=1: first Evaluate with Reset=0 (Reset=1
+                                // may clear the extent cache each call).
+                                if(getenv("S5_NORESET")){ SetU2(params,"DLSSG.Reset",0);
+                                    { seti_t SetI5=(seti_t)ev[4]; SetI5(params,"DLSSG.Reset",0); } }
                                 static float ident[16]={1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
                                 SetV(params,"DLSSG.ClipToPrevClip",ident); SetV(params,"DLSSG.PrevClipToClip",ident);
                                 SetV(params,"DLSSG.CameraViewToClip",ident); SetV(params,"DLSSG.ClipToCameraView",ident);
@@ -1513,10 +1594,29 @@ int main(void){
                                 SetF(params,"DLSSG.CameraFwdX",0); SetF(params,"DLSSG.CameraFwdY",0); SetF(params,"DLSSG.CameraFwdZ",-1.0f);
                                 SetF(params,"DLSSG.CameraPinholeOffsetX",0); SetF(params,"DLSSG.CameraPinholeOffsetY",0);
                                 SetF(params,"DLSSG.MvecInvalidValue",3.4028235e38f);
-                                // H3: internal extent keys (cached-size validation).
-                                SetU2(params,"DLSSG.InternalWidth",W); SetU2(params,"DLSSG.InternalHeight",H);
-                                SetU2(params,"DLSSG.DynamicResolution",0);
+                                // Subrect extent keys: S5_NOSUBRECT=1 omits them entirely
+                                // (absent keys may take a different merge path than
+                                // explicit zeros — chicken-and-egg experiment).
+                                if(!getenv("S5_NOSUBRECT")){
+                                { seti_t SetI4=(seti_t)ev[4];
+                                  const char* sk[]={"DLSSG.BackbufferSubrectWidth","DLSSG.BackbufferSubrectHeight",
+                                      "DLSSG.MVecsSubrectWidth","DLSSG.MVecsSubrectHeight",
+                                      "DLSSG.DepthSubrectWidth","DLSSG.DepthSubrectHeight",
+                                      "DLSSG.OutputInterpolatedSubrectWidth","DLSSG.OutputInterpolatedSubrectHeight"};
+                                  for(int i=0;i<8;i++){ u32 v=(i%2==0)?W:H;
+                                      SetU2(params,sk[i],v); SetI4(params,sk[i],(int)v); }
+                                  SetU2(params,"DLSSG.BackbufferSubrectBaseX",0); SetI4(params,"DLSSG.BackbufferSubrectBaseX",0);
+                                  SetU2(params,"DLSSG.BackbufferSubrectBaseY",0); SetI4(params,"DLSSG.BackbufferSubrectBaseY",0);
+                                  SetU2(params,"DLSSG.MVecsSubrectBaseX",0); SetI4(params,"DLSSG.MVecsSubrectBaseX",0);
+                                  SetU2(params,"DLSSG.MVecsSubrectBaseY",0); SetI4(params,"DLSSG.MVecsSubrectBaseY",0);
+                                  SetU2(params,"DLSSG.DepthSubrectBaseX",0); SetI4(params,"DLSSG.DepthSubrectBaseX",0);
+                                  SetU2(params,"DLSSG.DepthSubrectBaseY",0); SetI4(params,"DLSSG.DepthSubrectBaseY",0); } }
                                 { seti_t SetI2=(seti_t)ev[4];
+                                  // NO ULL for integrals (single-entry map: ULL would
+                                  // clobber uint/int the readers need). ULL only for
+                                  // the 4 resource pointers (set above).
+                                  SetU2(params,"DLSSG.InternalWidth",W); SetU2(params,"DLSSG.InternalHeight",H);
+                                  SetU2(params,"DLSSG.DynamicResolution",0);
                                   SetI2(params,"DLSSG.Reset",1); SetI2(params,"DLSSG.MultiFrameCount",1);
                                   SetI2(params,"DLSSG.MultiFrameIndex",1); SetI2(params,"DLSSG.DepthInverted",0);
                                   SetI2(params,"DLSSG.CameraMotionIncluded",1); SetI2(params,"DLSSG.ColorBuffersHDR",0);
@@ -1544,15 +1644,21 @@ int main(void){
                                 logs("[Eval] submitted+waited\n");
                                 // Second Evaluate: cache may prime on first call
                                 // (Reset=0 now). Log both results.
+                                // ... plus 3rd/4th: priming may be progressive
+                                // (call#2 lost 1074/1104; BackbufferExtent may
+                                // need one more round). S5_EVAL_N controls count.
+                                int neval=getenv("S5_EVAL_N")?atoi(getenv("S5_EVAL_N")):2;
+                                for(int ei=1;ei<neval;ei++){
                                 SetU2(params,"DLSSG.Reset",0);
                                 { seti_t SetI3=(seti_t)ev[4]; SetI3(params,"DLSSG.Reset",0); }
                                 vkResetCommandPool(g_dev,pool,0);
                                 vkBeginCommandBuffer(cmd,&ebi);
                                 int re2=Eval((void*)cmd,handle,params,0);
-                                { char b2[80]; snprintf(b2,sizeof b2,"[Eval] EvaluateFeature(FG) #2 -> 0x%X\n",(unsigned)re2); logs(b2); }
+                                { char b2[80]; snprintf(b2,sizeof b2,"[Eval] EvaluateFeature(FG) #%d -> 0x%X\n",ei+1,(unsigned)re2); logs(b2); }
                                 vkEndCommandBuffer(cmd);
                                 VkSubmitInfo si2b={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=1,.pCommandBuffers=&cmd};
                                 vkQueueSubmit(g_queue,1,&si2b,0); vkQueueWaitIdle(g_queue);
+                                if(re2==1) break; }
                                 // --- readback: out -> host buffer, checksum ---
                                 VkBuffer stg=0; VkDeviceMemory stm=0;
                                 VkBufferCreateInfo bci={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,

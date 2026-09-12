@@ -6,7 +6,7 @@
 #  3. /usr/lib/nvidia/wine/ — the driver's shipped 310.2.1.0 (fallback)
 DLLSG ?= /usr/lib/nvidia/wine/nvngx_dlssg.dll
 VENDOR_DLSSG = ../../renderfx/vendor/dlssg
-CFLAGS ?= -O2 -Wall
+CFLAGS ?= -O2 -Wall -g
 NGXINC ?= ../../renderfx/vendor/ngx/include
 
 pe_probe: pe_probe.c
