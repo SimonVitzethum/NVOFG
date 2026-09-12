@@ -1429,6 +1429,17 @@ int main(void){
                               "DLSSG.OutputReal","DLSSG.OutputDisableInterpolation",
                               "DLSSG.BidirectionalDistortionField"};
                           for(int i=0;i<6;i++) SetV9(params,nk[i],0); }
+                        // Subrect keys ALSO at Create time (CTX/SUB may be built
+                        // at Create from create-time params, never refreshed).
+                        { const char* sk[]={"DLSSG.BackbufferSubrectWidth","DLSSG.BackbufferSubrectHeight",
+                              "DLSSG.MVecsSubrectWidth","DLSSG.MVecsSubrectHeight",
+                              "DLSSG.DepthSubrectWidth","DLSSG.DepthSubrectHeight",
+                              "DLSSG.OutputInterpolatedSubrectWidth","DLSSG.OutputInterpolatedSubrectHeight",
+                              "DLSSG.BackbufferSubrectBaseX","DLSSG.BackbufferSubrectBaseY",
+                              "DLSSG.MVecsSubrectBaseX","DLSSG.MVecsSubrectBaseY",
+                              "DLSSG.DepthSubrectBaseX","DLSSG.DepthSubrectBaseY"};
+                          unsigned sv[]={W,H,W,H,W,H,W,H,0,0,0,0,0,0};
+                          for(int i=0;i<14;i++){ SetUI(params,sk[i],sv[i]); SetI(params,sk[i],(int)sv[i]); } }
                         { char b2[96]; snprintf(b2,sizeof b2,"[Create] params set W=%u H=%u FMT=%u\n",W,H,F); logs(b2); }
                         u64 scratch=0; int rs=Scratch(11,params,&scratch);
                         { char b2[96]; snprintf(b2,sizeof b2,"[Create] GetScratchBufferSize -> 0x%X bytes=%llu\n",(unsigned)rs,(unsigned long long)scratch); logs(b2); }
