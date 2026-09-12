@@ -1140,6 +1140,36 @@ static void segv(int s,siginfo_t* si,void* uc){ (void)s;
     if(rip>=(u64)g_code&&rip<(u64)g_code+(1<<20)) strcat(out," in <thunk/trap>");
     strcat(out,"]\n"); (void)write(2,out,strlen(out)); _exit(42); }
 
+// ---- Evaluate scaffolding: native test images + exact NGX resource layout --
+// ImgRes: native VkImage + memory + view. ResVK: byte-exact
+// NVSDK_NGX_Resource_VK for IMAGEVIEW (union 48B: view@0 img@8 range@16
+// fmt@36 w@40 h@44; Type@48; ReadWrite bool@52; sizeof 56).
+typedef struct { VkImage im; VkDeviceMemory mm; VkImageView vw; } ImgRes;
+typedef struct { void* view; void* img; VkImageSubresourceRange range;
+    VkFormat fmt; u32 w,h; u32 type; u8 rw; u8 _p[3]; } ResVK;
+static u32 eval_memidx(u32 bits,u32 want){ VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(g_pd,&mp);
+    for(u32 i=0;i<mp.memoryTypeCount;i++)
+        if((bits&(1u<<i))&&((mp.memoryTypes[i].propertyFlags&want)==want)) return i;
+    return 0; }
+static ImgRes MkImg(u32 w,u32 hh,VkFormat f,VkImageUsageFlags u,VkImageAspectFlags a){
+    ImgRes r={0,0,0};
+    VkImageCreateInfo ii={.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType=VK_IMAGE_TYPE_2D,.format=f,.extent={w,hh,1},
+        .mipLevels=1,.arrayLayers=1,.samples=VK_SAMPLE_COUNT_1_BIT,
+        .tiling=VK_IMAGE_TILING_OPTIMAL,.usage=u,.sharingMode=VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout=VK_IMAGE_LAYOUT_UNDEFINED};
+    if(vkCreateImage(g_dev,&ii,0,&r.im)!=VK_SUCCESS) return r;
+    VkMemoryRequirements mr; vkGetImageMemoryRequirements(g_dev,r.im,&mr);
+    VkMemoryAllocateInfo ai={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize=mr.size,.memoryTypeIndex=eval_memidx(mr.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
+    if(vkAllocateMemory(g_dev,&ai,0,&r.mm)!=VK_SUCCESS) return r;
+    vkBindImageMemory(g_dev,r.im,r.mm,0);
+    VkImageViewCreateInfo vi={.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image=r.im,.viewType=VK_IMAGE_VIEW_TYPE_2D,.format=f,
+        .subresourceRange={a,0,1,0,1}};
+    vkCreateImageView(g_dev,&vi,0,&r.vw); return r; }
+
 int main(void){
     printf("== Path B / S5(a): load Windows NGX host natively\n");
     init_env();   // populate the environment block (PATH etc.) NGX splits into its dir list
@@ -1296,6 +1326,143 @@ int main(void){
                         void* handle=0; int rc=0;
                         if(cmd) rc=Create((void*)cmd,11,params,&handle);
                         { char b2[96]; snprintf(b2,sizeof b2,"[Create] CreateFeature(FG) -> 0x%X handle=%p\n",(unsigned)rc,handle); logs(b2); }
+                        // ---- EvaluateFeature(FG) smoke in the SAME process ----
+                        // Gated by S5_EVAL=1 (needs S5_CREATE=1 + RUN_INIT + taskset).
+                        // Synthetic 1920x1080 inputs (must match create extent!):
+                        // color (RGBA8, solid), mvecs (RG16F, zero), depth (R32F, 1.0),
+                        // output (RGBA8, STORAGE). Minimal key set per strings-harvest
+                        // (ParseNGXParameters required-list) + Guide defaults.
+                        if(rc==1&&handle&&getenv("S5_EVAL")){
+                            typedef void MSABI(*setvoid_t)(void*,const char*,void*);
+                            typedef void MSABI(*setf_t)(void*,const char*,float);
+                            typedef int MSABI(*eval_t)(void*,void*,void*,void*);
+                            void** ev=*(void***)params;
+                            setvoid_t SetV=(setvoid_t)ev[7]; setui_t SetU2=(setui_t)ev[3];
+                            setf_t SetF=(setf_t)ev[1];
+                            eval_t Eval=(eval_t)module_export(h,"NVSDK_NGX_VULKAN_EvaluateFeature");
+                            if(!Eval&&snip) Eval=(eval_t)module_export(snip,"NVSDK_NGX_VULKAN_EvaluateFeature");
+                            { char b2[64]; snprintf(b2,sizeof b2,"[Eval] Evaluate=%p\n",(void*)Eval); logs(b2); }
+                            // --- image helper: create+bind+view (file-scope MkImg) ---
+                            ImgRes col=MkImg(W,H,VK_FORMAT_R8G8B8A8_UNORM,
+                                VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_STORAGE_BIT,
+                                VK_IMAGE_ASPECT_COLOR_BIT);
+                            ImgRes mv=MkImg(W,H,VK_FORMAT_R16G16_SFLOAT,
+                                VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_STORAGE_BIT,
+                                VK_IMAGE_ASPECT_COLOR_BIT);
+                            ImgRes dep=MkImg(W,H,VK_FORMAT_R32_SFLOAT,
+                                VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_STORAGE_BIT,
+                                VK_IMAGE_ASPECT_COLOR_BIT);
+                            ImgRes out=MkImg(W,H,VK_FORMAT_R8G8B8A8_UNORM,
+                                VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_SAMPLED_BIT,
+                                VK_IMAGE_ASPECT_COLOR_BIT);
+                            { char b2[128]; snprintf(b2,sizeof b2,"[Eval] imgs col=%p mv=%p dep=%p out=%p\n",
+                                (void*)col.im,(void*)mv.im,(void*)dep.im,(void*)out.im); logs(b2); }
+                            if(col.im&&mv.im&&dep.im&&out.im&&Eval){
+                                // setup cmd: clear + to GENERAL
+                                VkCommandPool p2=0; VkCommandBuffer c2=0;
+                                VkCommandPoolCreateInfo p2i={.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,.queueFamilyIndex=g_qfam};
+                                vkCreateCommandPool(g_dev,&p2i,0,&p2);
+                                VkCommandBufferAllocateInfo a2i={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                    .commandPool=p2,.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};
+                                vkAllocateCommandBuffers(g_dev,&a2i,&c2);
+                                VkCommandBufferBeginInfo b2i={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                    .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+                                vkBeginCommandBuffer(c2,&b2i);
+                                VkImageMemoryBarrier bar[4]; VkImage autos[4]={col.im,mv.im,dep.im,out.im};
+                                for(int i=0;i<4;i++){ bar[i]=(VkImageMemoryBarrier){.sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                                    .srcAccessMask=0,.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT,
+                                    .oldLayout=VK_IMAGE_LAYOUT_UNDEFINED,.newLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                    .srcQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,
+                                    .image=autos[i],.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1}}; }
+                                vkCmdPipelineBarrier(c2,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                    0,0,0,0,0,4,bar);
+                                VkClearColorValue cc[3]={{{{0.2f,0.4f,0.6f,1.0f}}},{{{0,0,0,0}}},{{{1.0f,0,0,0}}}};
+                                VkImage tos[3]={col.im,mv.im,dep.im};
+                                for(int i=0;i<3;i++){ VkImageSubresourceRange r={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+                                    vkCmdClearColorImage(c2,tos[i],VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,&cc[i],1,&r); }
+                                for(int i=0;i<4;i++){ bar[i].srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;
+                                    bar[i].dstAccessMask=VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT;
+                                    bar[i].oldLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                                    bar[i].newLayout=VK_IMAGE_LAYOUT_GENERAL; }
+                                vkCmdPipelineBarrier(c2,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                    0,0,0,0,0,4,bar);
+                                vkEndCommandBuffer(c2);
+                                VkSubmitInfo si={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=1,.pCommandBuffers=&c2};
+                                vkQueueSubmit(g_queue,1,&si,0); vkQueueWaitIdle(g_queue);
+                                logs("[Eval] setup done\n");
+                                // --- Resource_VK structs (exact ImageViewInfo layout:
+                                // view@0 img@8 range@16 fmt@36 w@40 h@44 type@48 rw@52)
+                                ResVK rBack={(void*)col.vw,(void*)col.im,{VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1},
+                                        VK_FORMAT_R8G8B8A8_UNORM,W,H,0,0,{0}};
+                                ResVK rMv={(void*)mv.vw,(void*)mv.im,{VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1},
+                                        VK_FORMAT_R16G16_SFLOAT,W,H,0,0,{0}};
+                                ResVK rDep={(void*)dep.vw,(void*)dep.im,{VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1},
+                                        VK_FORMAT_R32_SFLOAT,W,H,0,0,{0}};
+                                ResVK rOut={(void*)out.vw,(void*)out.im,{VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1},
+                                        VK_FORMAT_R8G8B8A8_UNORM,W,H,0,1,{0}};
+                                SetV(params,"DLSSG.Backbuffer",&rBack); SetV(params,"DLSSG.MVecs",&rMv);
+                                SetV(params,"DLSSG.Depth",&rDep); SetV(params,"DLSSG.OutputInterpolated",&rOut);
+                                static float ident[16]={1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+                                SetV(params,"DLSSG.ClipToPrevClip",ident); SetV(params,"DLSSG.PrevClipToClip",ident);
+                                SetV(params,"DLSSG.CameraViewToClip",ident); SetV(params,"DLSSG.ClipToCameraView",ident);
+                                SetV(params,"DLSSG.ClipToLensClip",ident);
+                                SetU2(params,"DLSSG.Reset",1); SetU2(params,"DLSSG.MultiFrameCount",1);
+                                SetU2(params,"DLSSG.MultiFrameIndex",1); SetU2(params,"DLSSG.DepthInverted",0);
+                                SetU2(params,"DLSSG.CameraMotionIncluded",1); SetU2(params,"DLSSG.ColorBuffersHDR",0);
+                                SetU2(params,"DLSSG.OrthoProjection",0); SetU2(params,"DLSSG.NotRenderingGameFrames",0);
+                                SetU2(params,"DLSSG.AutomodeOverrideReset",0); SetU2(params,"DLSSG.EvalFlags",0);
+                                SetU2(params,"DLSSG.InvertXAxis",0); SetU2(params,"DLSSG.InvertYAxis",0);
+                                SetU2(params,"DLSSG.MvecDilated",0); SetU2(params,"DLSSG.MvecJittered",0);
+                                SetF(params,"DLSSG.MvecScaleX",1.0f); SetF(params,"DLSSG.MvecScaleY",1.0f);
+                                SetF(params,"DLSSG.JitterOffsetX",0.0f); SetF(params,"DLSSG.JitterOffsetY",0.0f);
+                                SetF(params,"DLSSG.CameraNear",0.1f); SetF(params,"DLSSG.CameraFar",1000.0f);
+                                SetF(params,"DLSSG.CameraFOV",1.0472f); SetF(params,"DLSSG.CameraAspectRatio",16.0f/9.0f);
+                                SetF(params,"DLSSG.CameraPosX",0); SetF(params,"DLSSG.CameraPosY",0); SetF(params,"DLSSG.CameraPosZ",0);
+                                SetF(params,"DLSSG.CameraUpX",0); SetF(params,"DLSSG.CameraUpY",1.0f); SetF(params,"DLSSG.CameraUpZ",0);
+                                SetF(params,"DLSSG.CameraRightX",1.0f); SetF(params,"DLSSG.CameraRightY",0); SetF(params,"DLSSG.CameraRightZ",0);
+                                SetF(params,"DLSSG.CameraFwdX",0); SetF(params,"DLSSG.CameraFwdY",0); SetF(params,"DLSSG.CameraFwdZ",-1.0f);
+                                SetF(params,"DLSSG.CameraPinholeOffsetX",0); SetF(params,"DLSSG.CameraPinholeOffsetY",0);
+                                SetF(params,"DLSSG.MvecInvalidValue",3.4028235e38f);
+                                logs("[Eval] params set\n");
+                                vkResetCommandPool(g_dev,pool,0);
+                                VkCommandBufferBeginInfo ebi={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                    .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+                                vkBeginCommandBuffer(cmd,&ebi);
+                                int re=Eval((void*)cmd,handle,params,0);
+                                { char b2[80]; snprintf(b2,sizeof b2,"[Eval] EvaluateFeature(FG) -> 0x%X\n",(unsigned)re); logs(b2); }
+                                vkEndCommandBuffer(cmd);
+                                VkSubmitInfo si2={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=1,.pCommandBuffers=&cmd};
+                                vkQueueSubmit(g_queue,1,&si2,0); vkQueueWaitIdle(g_queue);
+                                logs("[Eval] submitted+waited\n");
+                                // --- readback: out -> host buffer, checksum ---
+                                VkBuffer stg=0; VkDeviceMemory stm=0;
+                                VkBufferCreateInfo bci={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                    .size=(VkDeviceSize)W*H*4,.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT,.sharingMode=VK_SHARING_MODE_EXCLUSIVE};
+                                if(vkCreateBuffer(g_dev,&bci,0,&stg)==VK_SUCCESS){
+                                    VkMemoryRequirements mr; vkGetBufferMemoryRequirements(g_dev,stg,&mr);
+                                    VkMemoryAllocateInfo mai={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                        .allocationSize=mr.size,
+                                        .memoryTypeIndex=eval_memidx(mr.memoryTypeBits,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)};
+                                    if(vkAllocateMemory(g_dev,&mai,0,&stm)==VK_SUCCESS){
+                                        vkBindBufferMemory(g_dev,stg,stm,0);
+                                        vkResetCommandPool(g_dev,p2,0); vkBeginCommandBuffer(c2,&b2i);
+                                        VkBufferImageCopy cp={.bufferOffset=0,.bufferRowLength=0,.bufferImageHeight=0,
+                                            .imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},
+                                            .imageOffset={0,0,0},.imageExtent={W,H,1}};
+                                        vkCmdCopyImageToBuffer(c2,out.im,VK_IMAGE_LAYOUT_GENERAL,stg,1,&cp);
+                                        vkEndCommandBuffer(c2);
+                                        VkSubmitInfo si3={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=1,.pCommandBuffers=&c2};
+                                        vkQueueSubmit(g_queue,1,&si3,0); vkQueueWaitIdle(g_queue);
+                                        void* mp=0; vkMapMemory(g_dev,stm,0,(VkDeviceSize)W*H*4,0,&mp);
+                                        if(mp){ u8* px=mp; unsigned long long sum=0;
+                                            for(u64 i=0;i<(u64)W*H*4;i++) sum+=px[i];
+                                            char b2[160]; snprintf(b2,sizeof b2,
+                                                "[Eval] readback sum=%llu px0=%u,%u,%u,%u\n",sum,px[0],px[1],px[2],px[3]); logs(b2);
+                                            vkUnmapMemory(g_dev,stm); }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
