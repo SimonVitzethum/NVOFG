@@ -44,5 +44,52 @@ renderfx/vendor/ngx/
 /build-ngx/
 renderfx/vendor/xess/
 
-# Path B (native DLSS-G loader) — private §69e interoperability research, NOT published
-experiments/dlssg-native/
+# Path B (native DLSS-G loader) — interoperability research, TRACKED explicitly.
+# Only NVIDIA's own binaries and the private RE notebook stay out (see also
+# experiments/dlssg-native/.gitignore). Never commit *.dll / *.exe blobs.
+
+# Plan-A OWN MODEL — private weights, checkpoints, training data, run dirs.
+# Never commit: our trained model is private IP. Code (*.py, *.cpp, *.cu) stays tracked;
+# only artefacts below are ignored.
+*.nvfgw
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+latest.pt
+best.pt
+ckpt_*.pt
+checkpoints/
+**/checkpoints/
+runs/
+training/runs/
+plana_runs/
+~/plana_runs/
+
+# Training data (A2) + golden blobs
+*.npz
+frame_*.npz
+clip_*/
+gold*.nvfgw
+gold_*.bin
+*_x.bin
+*_y.bin
+fg_v1*.nvfgw
+
+# Run control / logs
+train.log
+console.log
+PAUSE
+args
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Local user cache / probe logs (never commit)
+nvsdk_ngx.log
+renderfx/vendor/ngx/lib/Linux_x86_64/rel/nvsdk_ngx.log

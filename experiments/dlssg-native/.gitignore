@@ -1,0 +1,15 @@
+*.dll
+*.exe
+# never commit NVIDIA's DLLs
+ngxfg_result.txt
+# probe/run logs (regenerated every run, not source)
+*_output.txt
+*.log
+*.o
+pe_load
+pe_probe
+s5_host
+*.gdb
+
+# internal NVIDIA RE notes — §69e Abs.2: keep local, never publish
+INTERNALS_PRIVATE.md
