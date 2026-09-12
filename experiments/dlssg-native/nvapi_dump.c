@@ -15,6 +15,7 @@ typedef int (*GetLog_t)(void* phys, void** logical);
 typedef int (*LogInfo_t)(void* logical, unsigned char* data);
 typedef int (*PCIId_t)(void* gpu, unsigned* dev, unsigned* sub, unsigned* rev, unsigned* ext);
 typedef int (*BusId_t)(void* gpu, unsigned* busId);
+typedef int (*DrvVer_t)(unsigned* ver, char* branch);
 static FILE* g;
 static void L(const char* f,...){ va_list a; va_start(a,f); vprintf(f,a); va_end(a); if(g){ va_start(a,f); vfprintf(g,f,a); va_end(a); fflush(g);} }
 
@@ -31,6 +32,7 @@ int main(void){
     LogInfo_t LogInfo=(LogInfo_t)QI(0x842B066E);
     PCIId_t PCIId=(PCIId_t)QI(0x2DDFB66E);
     BusId_t BusId=(BusId_t)QI(0x1BE0B8E5);
+    DrvVer_t DrvVer=(DrvVer_t)QI(0x2926AAAD);
     L("QI: Init=%p Enum=%p Arch=%p GetLog=%p LogInfo=%p PCIId=%p\n",(void*)Init,(void*)Enum,(void*)Arch,(void*)GetLog,(void*)LogInfo,(void*)PCIId);
     if(Init) L("Init -> %d\n", Init());
     void* gpus[64]; unsigned n=0;
@@ -49,6 +51,9 @@ int main(void){
     }
     if(PCIId){ unsigned dev=0,sub=0,rev=0,ext=0; int r=PCIId(gpu,&dev,&sub,&rev,&ext);
         L("GPU_GetPCIIdentifiers -> %d : dev=0x%08X sub=0x%08X rev=0x%08X ext=0x%08X\n", r,dev,sub,rev,ext); }
+    if(DrvVer){ unsigned ver=0; char branch[64]; memset(branch,0,sizeof branch);
+        int r=DrvVer(&ver, branch);
+        L("SYS_GetDriverAndBranchVersion -> %d : ver=%u branch=%s\n", r, ver, branch); }
     // logical GPU + OS adapter id
     void* logical=0; int rl = GetLog? GetLog(gpu,&logical) : -999;
     L("GetLogicalGPUFromPhysicalGPU -> %d logical=%p\n", rl, logical);

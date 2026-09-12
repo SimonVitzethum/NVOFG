@@ -187,6 +187,16 @@ static int fileh_fd(void* h){ return (int)((uintptr_t)h & 0x00FFFFFFu); }
 MSABI static void* s_CreateFileW(void* name,u32 a,u32 s,void* sa,u32 cd,u32 fa,void* t){ (void)a;(void)s;(void)sa;(void)cd;(void)fa;(void)t;
     if(wine_has(name)){ char b[320]; wine_basename(name,b); char path[400]; snprintf(path,sizeof path,"%s%s",g_wine_dir(),b);
         int fd=open(path,O_RDONLY); if(fd>=0){ wlog("[CreateFileW OK] ",name); return (void*)(uintptr_t)(FILETAG|(u32)fd); } }
+    // Redirect *.log CREATES to real scratch so NGX's own logging works and we can
+    // read its reason strings (e.g. which driver check fails). Everything else keeps
+    // NOT_FOUND (model/state existence checks must not see empty phantom files).
+    { char b[320]; wine_basename(name,b); size_t n=strlen(b);
+      if(n>4 && !strcasecmp(b+n-4,".log")){
+        const char* sc=getenv("S5_SCRATCH"); if(!sc||!sc[0]) sc="/tmp/ngx-native";
+        mkdir(sc,0755);
+        char path[400]; snprintf(path,sizeof path,"%s/%s",sc,b);
+        int fd=open(path,O_RDWR|O_CREAT|O_APPEND,0644);
+        if(fd>=0){ wlog("[CreateFileW scratch-log] ",name); return (void*)(uintptr_t)(FILETAG|(u32)fd); } } }
     wlog("[CreateFileW] ",name); g_lasterr=2/*ERROR_FILE_NOT_FOUND*/; return (void*)-1; } // INVALID_HANDLE_VALUE
 MSABI static int s_ReadFile(void* h,void* buf,u32 n,u32* pread,void* ov){ (void)ov;
     if(is_fileh(h)){ ssize_t r=read(fileh_fd(h),buf,n); if(r<0){ if(pread)*pread=0; return 0;} if(pread)*pread=(u32)r; return 1; }
@@ -246,7 +256,7 @@ MSABI static u32 s_GetFileType(void* h){ (void)h; return 1; /*FILE_TYPE_DISK*/ }
 MSABI static int s_GetStringTypeW(u32 t,const u16* s,int c,u16* out){ (void)t;(void)s; if(out) for(int i=0;i<c;i++) out[i]=0; return 1; }
 MSABI static int s_IsValidCodePage(u32 c){ (void)c; return 1; }
 MSABI static void* s_OpenFileMappingA(u32 a,int inh,const char* n){ (void)a;(void)inh;(void)n; g_lasterr=2; return 0; }
-MSABI static int s_WriteFile(void* h,const void* buf,u32 n,u32* wr,void* ov){ (void)ov; if(((uintptr_t)h&0xFF000000u)==0x30000000u){ ssize_t r=write(2,buf,n); if(wr)*wr=r>0?(u32)r:0; return 1; } if(wr)*wr=n; return 1; }
+MSABI static int s_WriteFile(void* h,const void* buf,u32 n,u32* wr,void* ov){ (void)ov; if(((uintptr_t)h&0xFF000000u)==0x30000000u){ ssize_t r=write(2,buf,n); if(wr)*wr=r>0?(u32)r:0; return 1; } if(is_fileh(h)){ ssize_t r=write(fileh_fd(h),buf,n); if(wr)*wr=r>0?(u32)r:0; return r>=0; } if(wr)*wr=n; return 1; }
 MSABI static u32   s_GetFileAttributesW(void* name){ if(wine_has(name)){ wlog("[GetFileAttributesW OK] ",name); return 0x80; /*FILE_ATTRIBUTE_NORMAL*/ } wlog("[GetFileAttributesW] ",name); g_lasterr=2/*ERROR_FILE_NOT_FOUND*/; return 0xFFFFFFFF; } // INVALID_FILE_ATTRIBUTES
 MSABI static int   s_GetFileAttributesExW(void* name,u32 lvl,void* info){ (void)lvl; if(wine_has(name)){ if(info) memset(info,0,36); if(info)*(u32*)info=0x80; wlog("[GetFileAttributesExW OK] ",name); return 1; } wlog("[GetFileAttributesExW] ",name); return 0; } // FALSE
 MSABI static void* s_FindFirstFileExW(void* name,u32 a,void* d,u32 b,void* c,u32 e){ (void)a;(void)d;(void)b;(void)c;(void)e; wlog("[FindFirstFileExW] ",name); return (void*)-1; }
@@ -407,7 +417,7 @@ MSABI static int s_DRS_FindApplicationByName(void* sess,void* appName,void** phP
 // NVDRS_PROFILE = {version@0, profileName[2048]@4 (NvU16 inline), gpuSupport, isPredefined, numOfApps, numOfSettings}.
 // dxvk-nvapi zeroes profileName (=> valid empty wstring, not NULL) + the trailing fields. That's what NGX wcslen's.
 MSABI static int s_DRS_GetProfileInfo(void* sess,void* prof,u8* p){ (void)sess;(void)prof; if(!p) return -5 /*NVAPI_INVALID_ARGUMENT*/; memset(p+4,0,4096+16); return 0; }
-MSABI static int s_SYS_GetDriverAndBranchVersion(u32* pver,char* branch){ if(pver)*pver=61057; /*610.57 (nvidia-smi 610.57.04; was 61043 on the July driver) — report the real installed driver like dxvk does */ if(branch){const char* b="r610_00";int i=0;for(;b[i]&&i<63;i++)branch[i]=b[i];branch[i]=0;} return 0; }
+MSABI static int s_SYS_GetDriverAndBranchVersion(u32* pver,char* branch){ if(pver)*pver=61057; /*610.57 (nvidia-smi 610.57.04) — real version like dxvk */ if(branch){const char* e=getenv("S5_BRANCH"); const char* b=e&&e[0]?e:"r610_00";int i=0;for(;b[i]&&i<63;i++)branch[i]=b[i];branch[i]=0;} return 0; }
 // Back the fake nvapi handles with REAL zeroed memory, so if NGX dereferences a handle
 // (the Windows nvapi handles are internally pointers) it lands in valid memory, not a crash.
 static u8 g_gpubuf[8192];
