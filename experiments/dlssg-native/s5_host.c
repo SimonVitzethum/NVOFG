@@ -169,6 +169,23 @@ MSABI static void s_RaiseException(u32 code,u32 flags,u32 nargs,void* args){
       if(dec_u64((u64)(uintptr_t)&((unsigned long*)args)[1],&v)==0) obj=v;
       if(dec_u64((u64)(uintptr_t)&((unsigned long*)args)[2],&v)==0) ti=v; }
     snprintf(b,sizeof b,"[throw] magic=0x%lX obj=%p ThrowInfo=%p\n",(unsigned long)magic,(void*)obj,(void*)ti); logs(b);
+    { u64 a3=0; // x64 variant: fields may be 32-bit RVAs + module base in args[3]
+      if(nargs>=4&&dec_u64((u64)(uintptr_t)&((unsigned long*)args)[3],&a3)==0&&a3>0x10000){
+        u64 tio=a3+((u32)ti), objo=a3+((u32)obj);
+        snprintf(b,sizeof b,"[throw] rva-try base=%p obj=%p ti=%p\n",(void*)a3,(void*)objo,(void*)tio); logs(b);
+        u64 cta=0;
+        if(dec_u64(tio+24,&cta)==0&&cta){
+            u64 ctab=cta; if(ctab<0x10000) ctab=a3+((u32)cta);
+            u64 nct=0; if(dec_u64(ctab,&nct)==0){ nct&=0xFFFFFFFFu;
+                snprintf(b,sizeof b,"[throw] rvaCatchable=%llu\n",(unsigned long long)nct); logs(b);
+                for(u64 i=0;i<nct&&i<2;i++){ u64 pct=0,ptd=0;
+                    if(dec_u64(ctab+8+i*8,&pct)!=0||!pct) continue;
+                    if(pct<0x10000) pct=a3+((u32)pct);
+                    if(dec_u64(pct+8,&ptd)!=0||!ptd) continue;
+                    if(ptd<0x10000) ptd=a3+((u32)ptd);
+                    char nm[160]; memset(nm,0,sizeof nm);
+                    if(dec_bytes(ptd+16,nm,sizeof nm)!=0) continue;
+                    snprintf(b,sizeof b,"[throw] rvaType[%llu]=%s\n",(unsigned long long)i,nm); logs(b); } } } } }
     if(!ti) return;
     u64 cta=0; if(dec_u64(ti+24,&cta)!=0||!cta){ logs("[throw] ThrowInfo unreadable\n"); return; }
     u64 nct=0; { u64 v=0; if(dec_u64(cta,&v)!=0) return; nct=v&0xFFFFFFFFu; }
@@ -497,7 +514,7 @@ MSABI static int s_EnumPhysicalGPUs(void** h,u32* c){ if(h)h[0]=FAKE_GPU; if(c)*
 // rev=0xFFFFFFFF (CHIP_REVISION_UNKNOWN). Earlier impl=5/rev=0xA1 were guesses.
 MSABI static int s_GPU_GetArchInfo(void* gpu,u32* ai){ (void)gpu; if(ai){ u32 sz=ai[0]&0xFFFF; if(sz>4&&sz<=64) memset(ai+1,0,sz-4); ai[1]=0x000001B0; /*GB2xx/Blackwell*/ ai[2]=0x00000002; /*impl*/ ai[3]=0xFFFFFFFF; /*rev=UNKNOWN*/ } return 0; }
 MSABI static int s_GetLogicalGPU(void* p,void** l){ (void)p; if(l)*l=FAKE_LGPU; return 0; }
-MSABI static int s_GPU_GetPCIIdentifiers(void* g,u32* dev,u32* sub,u32* rev,u32* ext){ (void)g; u32 id=(0x2D18u<<16)|0x10DE; if(dev)*dev=id; if(sub)*sub=0; if(rev)*rev=0; if(ext)*ext=0x2D18; return 0; } // measured under Proton (was: rev=0xA1/ext=id guesses)
+MSABI static int s_GPU_GetPCIIdentifiers(void* g,u32* dev,u32* sub,u32* rev,u32* ext){ (void)g; u32 id=(0x2D18u<<16)|0x10DE; if(dev)*dev=id; if(sub)*sub=0; if(rev)*rev=0xA1; if(ext)*ext=0x2D18; return 0; } // rev back to 0xA1: arch derivation may read DeviceID+Revision (dxvk-differential covers uninit bytes only, not semantic HW fields)
 MSABI static int s_GPU_GetFullName(void* g,char* name){ (void)g; const char* s="NVIDIA GeForce RTX 5070 Laptop GPU"; if(name){ memset(name,0,64); int i=0;for(;s[i]&&i<63;i++)name[i]=s[i];name[i]=0;} return 0; }
 MSABI static int s_GPU_GetGPUType(void* g,u32* t){ (void)g; if(t)*t=2; /*DGPU*/ return 0; }
 MSABI static int s_GPU_GetBusType(void* g,u32* t){ (void)g; if(t)*t=3; /*PCI_EXPRESS*/ return 0; }
