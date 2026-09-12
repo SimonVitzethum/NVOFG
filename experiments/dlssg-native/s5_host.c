@@ -66,6 +66,10 @@ extern void ms2sysv_common(void);
 typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t u64;
 #define MSABI __attribute__((ms_abi))
 #define WINE "/usr/lib/nvidia/wine/"
+// Override the driver-DLL directory for testing newer/different drops
+// (e.g. S5_WINE=/tmp/dlls/fg310 with a trailing slash) without touching /usr.
+// The DLLs themselves stay local-only and are never committed (*.dll ignored).
+static const char* g_wine_dir(void){ const char* e=getenv("S5_WINE"); return (e&&e[0])?e:WINE; }
 static u32 rd32(const u8* p){u32 v;memcpy(&v,p,4);return v;}
 static u16 rd16(const u8* p){u16 v;memcpy(&v,p,2);return v;}
 static u64 rd64(const u8* p){u64 v;memcpy(&v,p,8);return v;}
@@ -173,7 +177,7 @@ static void wlog(const char* tag,const void* w){ char b[320]; const u16* p=w; in
 static int wine_basename(const void* w,char* out){ const u16* p=w; int i=0; char tmp[320]; if(!p){out[0]=0;return 0;}
     for(;p[i]&&i<319;i++) tmp[i]=(char)(p[i]&0xFF); tmp[i]=0;
     char* s=strrchr(tmp,'\\'); s=s?s+1:tmp; char* s2=strrchr(s,'/'); s=s2?s2+1:s; strcpy(out,s); return (int)strlen(out); }
-static int wine_has(const void* w){ char b[320]; wine_basename(w,b); if(!b[0]) return 0; char path[400]; snprintf(path,sizeof path,WINE"%s",b); return access(path,R_OK)==0; }
+static int wine_has(const void* w){ char b[320]; wine_basename(w,b); if(!b[0]) return 0; char path[400]; snprintf(path,sizeof path,"%s%s",g_wine_dir(),b); return access(path,R_OK)==0; }
 // File-backed handles for real wine-dir files (the snippet): NGX opens+reads/maps nvngx_dlssg.dll
 // itself (hash/version check + its own PE map) before it LoadLibrary's it. Serve real bytes from
 // /usr/lib/nvidia/wine/. Tag high bit so these don't collide with the event/counter handles.
@@ -181,7 +185,7 @@ static int wine_has(const void* w){ char b[320]; wine_basename(w,b); if(!b[0]) r
 static int is_fileh(void* h){ return ((uintptr_t)h & 0xFF000000u)==FILETAG && h!=(void*)-1; }
 static int fileh_fd(void* h){ return (int)((uintptr_t)h & 0x00FFFFFFu); }
 MSABI static void* s_CreateFileW(void* name,u32 a,u32 s,void* sa,u32 cd,u32 fa,void* t){ (void)a;(void)s;(void)sa;(void)cd;(void)fa;(void)t;
-    if(wine_has(name)){ char b[320]; wine_basename(name,b); char path[400]; snprintf(path,sizeof path,WINE"%s",b);
+    if(wine_has(name)){ char b[320]; wine_basename(name,b); char path[400]; snprintf(path,sizeof path,"%s%s",g_wine_dir(),b);
         int fd=open(path,O_RDONLY); if(fd>=0){ wlog("[CreateFileW OK] ",name); return (void*)(uintptr_t)(FILETAG|(u32)fd); } }
     wlog("[CreateFileW] ",name); g_lasterr=2/*ERROR_FILE_NOT_FOUND*/; return (void*)-1; } // INVALID_HANDLE_VALUE
 MSABI static int s_ReadFile(void* h,void* buf,u32 n,u32* pread,void* ov){ (void)ov;
@@ -301,7 +305,7 @@ static int authenticode_hash(const u8* d, size_t n, u8* out){
     unsigned len=0; EVP_DigestFinal_ex(c,out,&len); EVP_MD_CTX_free(c); return len==32;
 }
 static int verify_snippet_authenticode(void){
-    char path[400]; snprintf(path,sizeof path, WINE "nvngx_dlssg.dll");
+    char path[400]; snprintf(path,sizeof path, "%snvngx_dlssg.dll", g_wine_dir());
     int fd=open(path,O_RDONLY); if(fd<0) return 0;
     struct stat st; fstat(fd,&st); size_t n=st.st_size;
     u8* d=mmap(NULL,n,PROT_READ,MAP_PRIVATE,fd,0); close(fd); if(d==MAP_FAILED) return 0;
@@ -612,7 +616,7 @@ static void* module_export(Module* m,const char* fn){ if(!m->exp_rva) return 0; 
 // map + relocate + wire imports + exec-protect + run DllMain; register + parse exports.
 static Module* load_module(const char* name){
     for(int i=0;i<g_nmod;i++) if(!strcasecmp(g_mod[i].name,name)) return &g_mod[i];   // already loaded
-    char path[320]; snprintf(path,sizeof path,WINE"%s",name);
+    char path[320]; snprintf(path,sizeof path,"%s%s",g_wine_dir(),name);
     int fd=open(path,O_RDONLY); if(fd<0){ logn("[load: not found] ",name); return 0; }
     struct stat stt; fstat(fd,&stt); u8* file=mmap(NULL,stt.st_size,PROT_READ,MAP_PRIVATE,fd,0); close(fd);
     if(file==MAP_FAILED||rd16(file)!=0x5A4D) return 0;
@@ -723,7 +727,7 @@ int main(void){
         g_dbg_nvngx_base=h->base;  // gdb anchor (ASLR-stable read point for base+offset breakpoints)
         { char b[80]; snprintf(b,sizeof b,"[_nvngx base=%p  GFR@%p  eval_c1e0@%p  ret_e194@%p]\n",
             (void*)h->base,(void*)(h->base+0xdf80),(void*)(h->base+0xc1e0),(void*)(h->base+0xe194)); logs(b); }
-        static u16 wpath[80]; const char* dp=WINE; int i=0; for(;dp[i]&&i<79;i++) wpath[i]=(u8)dp[i]; wpath[i]=0;  // UTF-16 (2-byte) path
+        static u16 wpath[80]; const char* dp=g_wine_dir(); int i=0; for(;dp[i]&&i<79;i++) wpath[i]=(u8)dp[i]; wpath[i]=0;  // UTF-16 (2-byte) path
 
         // LIGHTER query first: NVSDK_NGX_VULKAN_GetFeatureRequirements(FrameGeneration) — the
         // same call that returned GREEN under Proton. It takes only instance+pd, NOT the full
