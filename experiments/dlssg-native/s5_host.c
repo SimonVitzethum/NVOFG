@@ -1396,6 +1396,26 @@ int main(void){
                             (unsigned)rg2,back2); logs(b2); }
                         const char* ew=getenv("S5_FG_W"); const char* eh=getenv("S5_FG_H"); const char* ef=getenv("S5_FG_FMT");
                         u32 W=ew?(u32)strtoul(ew,0,0):1920, H=eh?(u32)strtoul(eh,0,0):1080, F=ef?(u32)strtoul(ef,0,0):4;
+                        // Test images hoisted before Create (S5_PRECREATE sets
+                        // resources at Create time to test CTX-built-at-Create).
+                        // S5_MVEC32=1 -> RG32F; S5_DEPTH_D32=1 -> D32+DEPTH aspect.
+                        int d32=getenv("S5_DEPTH_D32")?1:0;
+                        ImgRes col=MkImg(W,H,VK_FORMAT_R8G8B8A8_UNORM,
+                            VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_STORAGE_BIT,
+                            VK_IMAGE_ASPECT_COLOR_BIT);
+                        ImgRes mv=MkImg(W,H,getenv("S5_MVEC32")?VK_FORMAT_R32G32_SFLOAT:VK_FORMAT_R16G16_SFLOAT,
+                            VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_STORAGE_BIT,
+                            VK_IMAGE_ASPECT_COLOR_BIT);
+                        ImgRes dep=MkImg(W,H,d32?VK_FORMAT_D32_SFLOAT:VK_FORMAT_R32_SFLOAT,
+                            VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_STORAGE_BIT
+                            |(d32?VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT:0),
+                            d32?VK_IMAGE_ASPECT_DEPTH_BIT:VK_IMAGE_ASPECT_COLOR_BIT);
+                        ImgRes out=MkImg(W,H,VK_FORMAT_R8G8B8A8_UNORM,
+                            VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_SAMPLED_BIT
+                            |VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                            VK_IMAGE_ASPECT_COLOR_BIT);
+                        { char b2[128]; snprintf(b2,sizeof b2,"[Create] imgs col=%p mv=%p dep=%p out=%p\n",
+                            (void*)col.im,(void*)mv.im,(void*)dep.im,(void*)out.im); logs(b2); }
                         SetUI(params,"CreationNodeMask",1); SetUI(params,"VisibilityNodeMask",1);
                         SetUI(params,"Width",W); SetUI(params,"Height",H);
                         SetUI(params,"DLSSG.BackbufferFormat",F);
@@ -1441,6 +1461,37 @@ int main(void){
                           unsigned sv[]={W,H,W,H,W,H,W,H,0,0,0,0,0,0};
                           for(int i=0;i<14;i++){ SetUI(params,sk[i],sv[i]); SetI(params,sk[i],(int)sv[i]); } }
                         { char b2[96]; snprintf(b2,sizeof b2,"[Create] params set W=%u H=%u FMT=%u\n",W,H,F); logs(b2); }
+                        // S5_PRECREATE=1: set resources (+ full ResVK) BEFORE
+                        // CreateFeature — tests whether CTX/SUB is built at
+                        // Create from create-time params (vs at Evaluate).
+                        if(getenv("S5_PRECREATE")&&col.im&&mv.im&&dep.im&&out.im){
+                            void** pv=*(void***)params;
+                            setvoid_t SetVp=(setvoid_t)pv[7];
+                            typedef void MSABI(*setull2_t)(void*,const char*,unsigned long long);
+                            setull2_t SetUp=(setull2_t)pv[0];
+                            NVSDK_NGX_Resource_VK pBack={.Resource.ImageViewInfo=
+                                {(void*)col.vw,(void*)col.im,{VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1},
+                                    VK_FORMAT_R8G8B8A8_UNORM,W,H},
+                                .Type=NVSDK_NGX_RESOURCE_VK_TYPE_VK_IMAGEVIEW,.ReadWrite=false};
+                            NVSDK_NGX_Resource_VK pMv={.Resource.ImageViewInfo=
+                                {(void*)mv.vw,(void*)mv.im,{VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1},
+                                    getenv("S5_MVEC32")?VK_FORMAT_R32G32_SFLOAT:VK_FORMAT_R16G16_SFLOAT,W,H},
+                                .Type=NVSDK_NGX_RESOURCE_VK_TYPE_VK_IMAGEVIEW,.ReadWrite=false};
+                            NVSDK_NGX_Resource_VK pDep={.Resource.ImageViewInfo=
+                                {(void*)dep.vw,(void*)dep.im,{d32?VK_IMAGE_ASPECT_DEPTH_BIT:VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1},
+                                    d32?VK_FORMAT_D32_SFLOAT:VK_FORMAT_R32_SFLOAT,W,H},
+                                .Type=NVSDK_NGX_RESOURCE_VK_TYPE_VK_IMAGEVIEW,.ReadWrite=false};
+                            NVSDK_NGX_Resource_VK pOut={.Resource.ImageViewInfo=
+                                {(void*)out.vw,(void*)out.im,{VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1},
+                                    VK_FORMAT_R8G8B8A8_UNORM,W,H},
+                                .Type=NVSDK_NGX_RESOURCE_VK_TYPE_VK_IMAGEVIEW,.ReadWrite=true};
+                            SetVp(params,"DLSSG.Backbuffer",&pBack); SetVp(params,"DLSSG.MVecs",&pMv);
+                            SetVp(params,"DLSSG.Depth",&pDep); SetVp(params,"DLSSG.OutputInterpolated",&pOut);
+                            SetUp(params,"DLSSG.Backbuffer",(unsigned long long)(uintptr_t)&pBack);
+                            SetUp(params,"DLSSG.MVecs",(unsigned long long)(uintptr_t)&pMv);
+                            SetUp(params,"DLSSG.Depth",(unsigned long long)(uintptr_t)&pDep);
+                            SetUp(params,"DLSSG.OutputInterpolated",(unsigned long long)(uintptr_t)&pOut);
+                            logs("[Create] pre-create resources set\n"); }
                         u64 scratch=0; int rs=Scratch(11,params,&scratch);
                         { char b2[96]; snprintf(b2,sizeof b2,"[Create] GetScratchBufferSize -> 0x%X bytes=%llu\n",(unsigned)rs,(unsigned long long)scratch); logs(b2); }
                         // native cmd buffer for CreateFeature
@@ -1494,24 +1545,7 @@ int main(void){
                             eval_t Eval=(eval_t)module_export(h,"NVSDK_NGX_VULKAN_EvaluateFeature");
                             if(!Eval&&snip) Eval=(eval_t)module_export(snip,"NVSDK_NGX_VULKAN_EvaluateFeature");
                             { char b2[64]; snprintf(b2,sizeof b2,"[Eval] Evaluate=%p\n",(void*)Eval); logs(b2); }
-                            // --- image helper: create+bind+view (file-scope MkImg) ---
-                            ImgRes col=MkImg(W,H,VK_FORMAT_R8G8B8A8_UNORM,
-                                VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_STORAGE_BIT,
-                                VK_IMAGE_ASPECT_COLOR_BIT);
-                            ImgRes mv=MkImg(W,H,getenv("S5_MVEC32")?VK_FORMAT_R32G32_SFLOAT:VK_FORMAT_R16G16_SFLOAT,
-                                VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_STORAGE_BIT,
-                                VK_IMAGE_ASPECT_COLOR_BIT);
-                            // S5_DEPTH_D32=1: true depth format + DEPTH aspect (vs R32F+COLOR default).
-                            int d32=getenv("S5_DEPTH_D32")?1:0;
-                            ImgRes dep=MkImg(W,H,d32?VK_FORMAT_D32_SFLOAT:VK_FORMAT_R32_SFLOAT,
-                                VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_STORAGE_BIT
-                                |(d32?VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT:0),
-                                d32?VK_IMAGE_ASPECT_DEPTH_BIT:VK_IMAGE_ASPECT_COLOR_BIT);
-                            ImgRes out=MkImg(W,H,VK_FORMAT_R8G8B8A8_UNORM,
-                                VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_SAMPLED_BIT
-                                |VK_IMAGE_USAGE_TRANSFER_DST_BIT, // setup transitions via TRANSFER_DST (VUID)
-                                VK_IMAGE_ASPECT_COLOR_BIT);
-                            { char b2[128]; snprintf(b2,sizeof b2,"[Eval] imgs col=%p mv=%p dep=%p out=%p\n",
+                            { char b2[128]; snprintf(b2,sizeof b2,"[Eval] imgs col=%p mv=%p dep=%p out=%p (hoisted pre-Create)\n",
                                 (void*)col.im,(void*)mv.im,(void*)dep.im,(void*)out.im); logs(b2); }
                             if(col.im&&mv.im&&dep.im&&out.im&&Eval){
                                 // setup cmd: clear + to GENERAL
