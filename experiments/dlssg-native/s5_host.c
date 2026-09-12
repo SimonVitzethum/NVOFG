@@ -1162,7 +1162,13 @@ static u32 eval_memidx(u32 bits,u32 want){ VkPhysicalDeviceMemoryProperties mp;
     return 0; }
 static ImgRes MkImg(u32 w,u32 hh,VkFormat f,VkImageUsageFlags u,VkImageAspectFlags a){
     ImgRes r={0,0,0};
+    // External-memory image info (OPAQUE_FD): required for valid exportable
+    // binds (VUID-vkBindImageMemory-memory-02728) — the snippet imports our
+    // images into CUDA. Needs _fd ext (enabled on our device).
+    VkExternalMemoryImageCreateInfo exi2={.sType=VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+        .handleTypes=VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT};
     VkImageCreateInfo ii={.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .pNext=&exi2,
         .imageType=VK_IMAGE_TYPE_2D,.format=f,.extent={w,hh,1},
         .mipLevels=1,.arrayLayers=1,.samples=VK_SAMPLE_COUNT_1_BIT,
         .tiling=VK_IMAGE_TILING_OPTIMAL,.usage=u,.sharingMode=VK_SHARING_MODE_EXCLUSIVE,
@@ -1400,14 +1406,16 @@ int main(void){
                         // resources at Create time to test CTX-built-at-Create).
                         // S5_MVEC32=1 -> RG32F; S5_DEPTH_D32=1 -> D32+DEPTH aspect.
                         int d32=getenv("S5_DEPTH_D32")?1:0;
+                        // NOTE: TRANSFER_SRC_BIT on ALL images (readback copies
+                        // need it; missing bit gave R-only garbage reads).
                         ImgRes col=MkImg(W,H,VK_FORMAT_R8G8B8A8_UNORM,
-                            VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_STORAGE_BIT,
+                            VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_STORAGE_BIT,
                             VK_IMAGE_ASPECT_COLOR_BIT);
                         ImgRes mv=MkImg(W,H,getenv("S5_MVEC32")?VK_FORMAT_R32G32_SFLOAT:VK_FORMAT_R16G16_SFLOAT,
-                            VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_STORAGE_BIT,
+                            VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_STORAGE_BIT,
                             VK_IMAGE_ASPECT_COLOR_BIT);
                         ImgRes dep=MkImg(W,H,d32?VK_FORMAT_D32_SFLOAT:VK_FORMAT_R32_SFLOAT,
-                            VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_STORAGE_BIT
+                            VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_STORAGE_BIT
                             |(d32?VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT:0),
                             d32?VK_IMAGE_ASPECT_DEPTH_BIT:VK_IMAGE_ASPECT_COLOR_BIT);
                         ImgRes out=MkImg(W,H,VK_FORMAT_R8G8B8A8_UNORM,
@@ -1569,13 +1577,23 @@ int main(void){
                                     .image=autos[i],.subresourceRange={barA[i],0,1,0,1}}; }
                                 vkCmdPipelineBarrier(c2,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,
                                     0,0,0,0,0,4,bar);
-                                VkClearColorValue cc[2]={{{{0.2f,0.4f,0.6f,1.0f}}},{{{0,0,0,0}}}};
+                                VkClearColorValue cc[2]; cc[0].float32[0]=0.2f; cc[0].float32[1]=0.4f; cc[0].float32[2]=0.6f; cc[0].float32[3]=1.0f;
+                                cc[1].float32[0]=0.5f; cc[1].float32[1]=0.25f; cc[1].float32[2]=0.0f; cc[1].float32[3]=0.0f;
+                                { u32* b=(u32*)&cc[0]; char b2[128];
+                                  snprintf(b2,sizeof b2,"[Eval] clearbits col=%08x,%08x,%08x,%08x (want 3e4ccccd,3ecccccd,3f19999a,3f800000)\n",
+                                      b[0],b[1],b[2],b[3]); logs(b2); }
+                                if(0){}
                                 VkImage tos[2]={col.im,mv.im};
                                 for(int i=0;i<2;i++){ VkImageSubresourceRange r={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
                                     vkCmdClearColorImage(c2,tos[i],VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,&cc[i],1,&r); }
+                                // Canary: fill OUTPUT with 0xAB so ANY snippet write
+                                // is visible in readback (vs untouched zeros).
+                                { VkClearColorValue canary={{{0.0f,0.0f,0.0f,0.0f}}}; memset(&canary,0xAB,sizeof canary);
+                                  VkImageSubresourceRange r={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+                                  vkCmdClearColorImage(c2,out.im,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,&canary,1,&r); }
                                 if(d32){ VkClearDepthStencilValue dv={1.0f,0}; VkImageSubresourceRange r={VK_IMAGE_ASPECT_DEPTH_BIT,0,1,0,1};
                                     vkCmdClearDepthStencilImage(c2,dep.im,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,&dv,1,&r); }
-                                else { VkClearColorValue dc={{{1.0f,0,0,0}}}; VkImageSubresourceRange r={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+                                else { VkClearColorValue dc; dc.float32[0]=1.0f; dc.float32[1]=0; dc.float32[2]=0; dc.float32[3]=0; VkImageSubresourceRange r={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
                                     vkCmdClearColorImage(c2,dep.im,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,&dc,1,&r); }
                                 for(int i=0;i<4;i++){ bar[i].srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;
                                     bar[i].dstAccessMask=VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT;
@@ -1585,8 +1603,32 @@ int main(void){
                                     0,0,0,0,0,4,bar);
                                 vkEndCommandBuffer(c2);
                                 VkSubmitInfo si={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=1,.pCommandBuffers=&c2};
-                                vkQueueSubmit(g_queue,1,&si,0); vkQueueWaitIdle(g_queue);
+                                VkResult sbr=vkQueueSubmit(g_queue,1,&si,0); VkResult wier=vkQueueWaitIdle(g_queue);
+                                { char b2[80]; snprintf(b2,sizeof b2,"[Eval] setup submit=%d wait=%d\n",(int)sbr,(int)wier); logs(b2); }
                                 logs("[Eval] setup done\n");
+                                // Pre-Evaluate control readback: is COLOR intact
+                                // BEFORE any snippet call? (isolates snippet writes)
+                                { VkBuffer cstg=0; VkDeviceMemory cstm=0;
+                                  VkBufferCreateInfo cbci={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                      .size=(VkDeviceSize)W*H*4,.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT,.sharingMode=VK_SHARING_MODE_EXCLUSIVE};
+                                  if(vkCreateBuffer(g_dev,&cbci,0,&cstg)==VK_SUCCESS){
+                                      VkMemoryRequirements cmr; vkGetBufferMemoryRequirements(g_dev,cstg,&cmr);
+                                      VkMemoryAllocateInfo cmai={.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,.allocationSize=cmr.size,
+                                          .memoryTypeIndex=eval_memidx(cmr.memoryTypeBits,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)};
+                                      if(vkAllocateMemory(g_dev,&cmai,0,&cstm)==VK_SUCCESS){
+                                          vkBindBufferMemory(g_dev,cstg,cstm,0);
+                                          vkResetCommandPool(g_dev,p2,0); vkBeginCommandBuffer(c2,&b2i);
+                                          VkBufferImageCopy ccp={.bufferOffset=0,.bufferRowLength=0,.bufferImageHeight=0,
+                                              .imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},
+                                              .imageOffset={0,0,0},.imageExtent={W,H,1}};
+                                          vkCmdCopyImageToBuffer(c2,col.im,VK_IMAGE_LAYOUT_GENERAL,cstg,1,&ccp);
+                                          vkEndCommandBuffer(c2);
+                                          VkSubmitInfo csi={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=1,.pCommandBuffers=&c2};
+                                          vkQueueSubmit(g_queue,1,&csi,0); vkQueueWaitIdle(g_queue);
+                                          void* mcp=0; vkMapMemory(g_dev,cstm,0,32,0,&mcp);
+                                          if(mcp){ u8* px=mcp;
+                                              char b2[128]; snprintf(b2,sizeof b2,"[Eval] pre-eval color px0=%u,%u,%u,%u\n",
+                                                  px[0],px[1],px[2],px[3]); logs(b2); vkUnmapMemory(g_dev,cstm); } } } }
                                 // --- Resource_VK structs (real header type) ---
                                 NVSDK_NGX_Resource_VK rBack={.Resource.ImageViewInfo=
                                     {(void*)col.vw,(void*)col.im,{VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1},
@@ -1704,13 +1746,43 @@ int main(void){
                                 SetU2(params,"DLSSG.Reset",0);
                                 { seti_t SetI3=(seti_t)ev[4]; SetI3(params,"DLSSG.Reset",0); }
                                 vkResetCommandPool(g_dev,pool,0);
+                                VkCommandBufferBeginInfo ebi={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                    .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
                                 vkBeginCommandBuffer(cmd,&ebi);
+                                // Vary input color per frame (frame-indexed solid):
+                                // proves whether Evaluate reacts to inputs at all.
+                                { float fr=(float)((ei*67)%256), fg2=(float)((ei*131)%256), fb=(float)((ei*197)%256);
+                                  VkImageMemoryBarrier tb[1]={{.sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                                    .srcAccessMask=VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT,
+                                    .dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT,
+                                    .oldLayout=VK_IMAGE_LAYOUT_GENERAL,.newLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                    .srcQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,
+                                    .image=col.im,.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1}}};
+                                  vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                      0,0,0,0,0,1,tb);
+                                  VkClearColorValue fcc; fcc.float32[0]=fr/255.0f; fcc.float32[1]=fg2/255.0f; fcc.float32[2]=fb/255.0f; fcc.float32[3]=1.0f;
+                                  VkImageSubresourceRange fr2={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+                                  vkCmdClearColorImage(cmd,col.im,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,&fcc,1,&fr2);
+                                  tb[0].srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;
+                                  tb[0].dstAccessMask=VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT;
+                                  tb[0].oldLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                                  tb[0].newLayout=VK_IMAGE_LAYOUT_GENERAL;
+                                  vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                      0,0,0,0,0,1,tb);
+                                  char b2[96]; snprintf(b2,sizeof b2,"[Eval] frame %d color=(%d,%d,%d)\n",ei+1,(int)fr,(int)fg2,(int)fb); logs(b2); }
                                 int re2=Eval((void*)cmd,handle,params,0);
                                 { char b2[80]; snprintf(b2,sizeof b2,"[Eval] EvaluateFeature(FG) #%d -> 0x%X\n",ei+1,(unsigned)re2); logs(b2); }
                                 vkEndCommandBuffer(cmd);
                                 VkSubmitInfo si2b={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=1,.pCommandBuffers=&cmd};
                                 vkQueueSubmit(g_queue,1,&si2b,0); vkQueueWaitIdle(g_queue);
-                                if(re2==1) break; }
+                                }
+                                // CUDA-side sync: the snippet works via CUDA (external
+                                // memory); our vkQueueWaitIdle may not cover its stream.
+                                // cuDeviceSynchronize blocks until ALL device CUDA
+                                // work completes (covers the snippet's stream too).
+                                { typedef int (*cudevsync_t)(void); cudevsync_t cdevsync=(cudevsync_t)dlsym(g_hcu,"cuDeviceSynchronize");
+                                  if(cdevsync){ int r=cdevsync(); char b2[64];
+                                      snprintf(b2,sizeof b2,"[Eval] cuDeviceSynchronize -> %d\n",r); logs(b2); } }
                                 // --- readback: out -> host buffer, checksum ---
                                 VkBuffer stg=0; VkDeviceMemory stm=0;
                                 VkBufferCreateInfo bci={.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -1731,11 +1803,49 @@ int main(void){
                                         VkSubmitInfo si3={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=1,.pCommandBuffers=&c2};
                                         vkQueueSubmit(g_queue,1,&si3,0); vkQueueWaitIdle(g_queue);
                                         void* mp=0; vkMapMemory(g_dev,stm,0,(VkDeviceSize)W*H*4,0,&mp);
+                                        if(mp){ VkMappedMemoryRange ir={.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,.memory=stm,.offset=0,.size=VK_WHOLE_SIZE};
+                                            vkInvalidateMappedMemoryRanges(g_dev,1,&ir); }
                                         if(mp){ u8* px=mp; unsigned long long sum=0;
                                             for(u64 i=0;i<(u64)W*H*4;i++) sum+=px[i];
                                             char b2[160]; snprintf(b2,sizeof b2,
                                                 "[Eval] readback sum=%llu px0=%u,%u,%u,%u\n",sum,px[0],px[1],px[2],px[3]); logs(b2);
                                             vkUnmapMemory(g_dev,stm); }
+                                        // Control: copy COLOR (cleared 0.2/0.4/0.6/1.0 in
+                                        // setup) to staging too — proves setup ran.
+                                        vkResetCommandPool(g_dev,p2,0); vkBeginCommandBuffer(c2,&b2i);
+                                        VkBufferImageCopy cp2={.bufferOffset=0,.bufferRowLength=0,.bufferImageHeight=0,
+                                            .imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},
+                                            .imageOffset={0,0,0},.imageExtent={W,H,1}};
+                                        vkCmdCopyImageToBuffer(c2,col.im,VK_IMAGE_LAYOUT_GENERAL,stg,1,&cp2);
+                                        vkEndCommandBuffer(c2);
+                                        VkSubmitInfo si4={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=1,.pCommandBuffers=&c2};
+                                        vkQueueSubmit(g_queue,1,&si4,0); vkQueueWaitIdle(g_queue);
+                                        void* mc=0; vkMapMemory(g_dev,stm,0,(VkDeviceSize)W*H*4,0,&mc);
+                                        if(mc){ VkMappedMemoryRange ir2={.sType=VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,.memory=stm,.offset=0,.size=VK_WHOLE_SIZE};
+                                            vkInvalidateMappedMemoryRanges(g_dev,1,&ir2); }
+                                        if(mc){ u8* px=mc; unsigned long long csum=0;
+                                            for(u64 i=0;i<(u64)W*H*4;i++) csum+=px[i];
+                                            char b2[192]; snprintf(b2,sizeof b2,
+                                                "[Eval] color-check sum=%llu px0=%u,%u,%u,%u px1=%u,%u,%u,%u (want 51,102,153,255)\n",
+                                                csum,px[0],px[1],px[2],px[3],px[4],px[5],px[6],px[7]); logs(b2);
+                                            vkUnmapMemory(g_dev,stm); }
+                                        // MV + depth readback: does the snippet write
+                                        // anywhere unexpected (wrong binding)?
+                                        for(int ri=0;ri<2;ri++){ VkImage rimg=ri?dep.im:mv.im;
+                                            vkResetCommandPool(g_dev,p2,0); vkBeginCommandBuffer(c2,&b2i);
+                                            VkBufferImageCopy cpr={.bufferOffset=0,.bufferRowLength=0,.bufferImageHeight=0,
+                                                .imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},
+                                                .imageOffset={0,0,0},.imageExtent={W,H,1}};
+                                            vkCmdCopyImageToBuffer(c2,rimg,VK_IMAGE_LAYOUT_GENERAL,stg,1,&cpr);
+                                            vkEndCommandBuffer(c2);
+                                            VkSubmitInfo si5={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=1,.pCommandBuffers=&c2};
+                                            vkQueueSubmit(g_queue,1,&si5,0); vkQueueWaitIdle(g_queue);
+                                            void* mr2=0; vkMapMemory(g_dev,stm,0,32,0,&mr2);
+                                            if(mr2){ u8* px=mr2; unsigned long long s2=0;
+                                                for(u64 i=0;i<(u64)W*H*4;i++) s2+=px[i];
+                                                char b2[160]; snprintf(b2,sizeof b2,"[Eval] %s-check sum=%llu px0=%u,%u,%u,%u\n",
+                                                    ri?"depth":"mv",s2,px[0],px[1],px[2],px[3]); logs(b2);
+                                                vkUnmapMemory(g_dev,stm); } }
                                     }
                                 }
                             }
