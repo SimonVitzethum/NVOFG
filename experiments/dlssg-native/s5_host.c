@@ -291,12 +291,22 @@ MSABI static int s_RegOpenKeyExW(void* hk,const u16* sub,u32 o,u32 sam,void** ph
     return 2; /*ERROR_FILE_NOT_FOUND — key doesn't exist, NGX uses defaults*/ }
 MSABI static int s_RegQueryValueExW(void* hk,const u16* val,void* res,u32* type,u8* data,u32* cb){ (void)res;
     char b[128]; int i=0; if(val) for(;val[i]&&i<127;i++) b[i]=(char)(val[i]&0xFF); b[i]=0;
+    wlog("[RegQueryValueExW] ",val);
     if(hk==FAKE_NGXKEY && val && !strcasecmp(b,"FullPath")){
         const char* p="C:\\Windows\\System32"; u32 need=(u32)(strlen(p)+1)*2;
         if(type)*type=1; /*REG_SZ*/
         if(!data){ if(cb)*cb=need; return 0; }
         if(cb&&*cb<need){ *cb=need; return 234; /*ERROR_MORE_DATA*/ }
         u16* w=(u16*)data; for(i=0;p[i];i++) w[i]=(u8)p[i]; w[i]=0; if(cb)*cb=need; logn("[RegQueryValueExW] FullPath -> ",p); return 0; }
+    // NGX diagnostics + behavior switches (all observed live via query logging):
+    // EnableConsoleLogging=1 makes NGX print its Init reasoning (incl. the
+    // "Feature %s, denial value %d for Cms ID %x" line revealing our CMS ID).
+    if(hk==FAKE_NGXKEY && val && (!strcasecmp(b,"EnableConsoleLogging"))){
+        if(type)*type=4; /*REG_DWORD*/ if(cb)*cb=4;
+        if(data) *(u32*)data=1; return 0; }
+    if(hk==FAKE_NGXKEY && val && (!strcasecmp(b,"LogLevel"))){
+        if(type)*type=4; /*REG_DWORD*/ if(cb)*cb=4;
+        if(data) *(u32*)data=1; return 0; }
     return 2; /*ERROR_FILE_NOT_FOUND*/ }
 MSABI static int s_RegCloseKey(void* hk){ (void)hk; return 0; }
 // FAITHFUL Authenticode verification (not a bypass): NGX Authenticode-verifies the snippet via
