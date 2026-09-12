@@ -57,6 +57,26 @@ integration contract for the future RenderFX backend is specified in
   then present-pacing (`VK_NV_low_latency2`, which is ordinary native Vulkan). See
   `FUNCTIONAL_PHASE_PLAN.md` for the staged plan and the Path B vs own-model decision.
 
+## Oracle scope — where Proton ground truth does and does NOT apply
+
+Valid (byte-identical native vs Proton, driver 610.57): `GetFeatureRequirements`
+for all features (FG GREEN), the nvapi surface (arch/impl/rev, LUID bytes, DRS
+NOT_FOUNDs, driver version number), registry/env/file-query sequences.
+
+Explicitly NOT covered by the Proton oracle, do not use byte-identity here:
+- Anything needing `VK_KHR_external_memory_fd` / `VK_KHR_external_semaphore_fd`:
+  present natively (vulkaninfo), hidden under Proton winevulkan. DLSS-G Evaluate
+  (CUDA↔Vulkan interop) lives exactly there — a Proton GREEN would prove nothing
+  for native Evaluate and vice versa.
+- `Init_ProjectID` with our args crashes genuinely (exit 5, winedbg bt
+  0xb7f9←0xc40e←0xc9c8←0xd0d8) — same null-deref family native. Suspect: missing
+  model tree (`ProgramData\NVIDIA\NGX\models\...`, absent everywhere), not a
+  loader bug per se. Do not chase further until models exist.
+- Thread scheduling/races (SIGTRAP vs clean return across identical runs):
+  timing differs fundamentally native vs Proton; compare outcomes statistically.
+- End-to-end indicator for later (no instrumentation needed): `ShowDlssIndicator`
+  under `HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore`.
+
 ## Compliance posture (see also the project's legal assessment)
 
 - The reverse engineering is **for interoperability** of an independently created program, which in

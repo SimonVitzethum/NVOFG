@@ -76,6 +76,15 @@ static u64 rd64(const u8* p){u64 v;memcpy(&v,p,8);return v;}
 static void logs(const char* s){ (void)write(2,s,strlen(s)); }
 static void logn(const char* a,const char* b){ logs(a); logs(b); logs("\n"); }
 
+// NGX app-log callback (NVSDK_NGX_AppLogCallback): (message, level, component) —
+// all INTEGER class, NOT variadic, so no float-ABI risk. Must be MSABI: NGX calls
+// it with MS-x64 convention from any thread; must be thread-safe (write(2) is).
+MSABI static void s_ngx_log(const char* m,int level,int comp){
+    char b[64]; int n=snprintf(b,sizeof b,"[ngxlog lv=%d comp=%d] ",level,comp);
+    if(n>0) (void)write(2,b,(size_t)n);
+    if(m){ size_t L=strlen(m); if(L>4096)L=4096; (void)write(2,m,L); }
+    (void)write(2,"\n",1); }
+
 // ---- module registry ----
 typedef struct { char name[64]; u8* base; u64 imgbase; u32 exp_rva,exp_sz; u32 size; int loaded; } Module;
 static Module g_mod[16]; static int g_nmod=0;
@@ -130,6 +139,15 @@ MSABI static u64   s_GetTickCount64(void){struct timespec t;clock_gettime(CLOCK_
 MSABI static void  s_GetStartupInfoW(void* si){if(si)memset(si,0,104);}
 MSABI static void* s_GetCommandLineW(void){static const u16 w[]={'a',0};return(void*)w;}
 MSABI static void  s_OutputDebugStringA(const char* s){logn("[dbg] ",s?s:"");}
+// RaiseException is currently swallowed (returns, no unwind): NGX uses SEH around
+// fallible probes, so a swallowed raise continues with error state instead of
+// unwinding — suspect for flaky downstream faults. Log code/args first; real SEH
+// (via .pdata unwind) is future work. NOTE: keep signature exact (4 args).
+MSABI static void s_RaiseException(u32 code,u32 flags,u32 nargs,void* args){
+    char b[128]; unsigned long a0=0,a1=0;
+    if(args){ a0=((unsigned long*)args)[0]; if(nargs>1) a1=((unsigned long*)args)[1]; }
+    snprintf(b,sizeof b,"[RaiseException] code=0x%08X flags=%u nargs=%u a0=%p a1=%p\n",
+        code,flags,nargs,(void*)a0,(void*)a1); logs(b); }
 // Windows environment BLOCK ("NAME=VAL\0NAME=VAL\0\0", UTF-16). NGX reads this (GetEnvironmentStringsW
 // / PEB RtlQueryEnvironmentVariable_U) and splits PATH into a directory list; an empty block left a
 // null wstring in that list -> crash at 0xa1f3. Populated by init_env() before the fork.
@@ -245,7 +263,7 @@ MSABI static u32 s_GetEnvironmentVariableW(const u16* n,u16* b,u32 s){
     const char* val=0;
     if(!strcasecmp(name,"PATH")) val="C:\\Windows\\System32;C:\\Windows;C:\\Windows\\System32\\wbem";
     else val=getenv(name);
-    if(!val){ g_lasterr=203; return 0; }
+    if(!val){ char lb[96]; snprintf(lb,sizeof lb,"[GetEnvW miss] %s\n",name); logs(lb); g_lasterr=203; return 0; }
     u32 need=(u32)strlen(val)+1;
     if(s<need) return need;
     for(i=0;val[i];i++) b[i]=(u16)(u8)val[i]; b[i]=0;
@@ -577,7 +595,7 @@ struct { const char* name; void* fn; } g_stubs[]={
  {"RtlGetVersion",s_RtlGetVersion},{"GetVersionExW",s_GetVersionExW},{"GetVersionExA",s_GetVersionExW},
  {"LoadLibraryW",s_LoadLibraryExW},{"LoadLibraryExW",s_LoadLibraryExW},{"LoadLibraryA",s_LoadLibraryA},{"LoadLibraryExA",s_LoadLibraryA},
  {"GetStartupInfoW",s_GetStartupInfoW},{"GetCommandLineW",s_GetCommandLineW},{"GetCommandLineA",s_GetCommandLineW},
- {"OutputDebugStringA",s_OutputDebugStringA},
+ {"OutputDebugStringA",s_OutputDebugStringA},{"RaiseException",s_RaiseException},
  {"GetEnvironmentStringsW",s_GetEnvironmentStringsW},{"FreeEnvironmentStringsW",s_FreeEnvironmentStringsW},{"GetEnvironmentVariableA",s_GetEnvironmentVariableA},
  {"WideCharToMultiByte",s_WideCharToMultiByte},{"MultiByteToWideChar",s_MultiByteToWideChar},
  {"InitOnceExecuteOnce",s_InitOnceExecuteOnce},
@@ -782,9 +800,15 @@ int main(void){
             // count}: RDX=array[idx] must be a wchar*. So Path must point at an ARRAY
             // holding wpath (NOT at the chars directly — that crashes 0xa1f3 with the
             // string bytes misread as a pointer).
+            // Full FeatureCommonInfo per SDK 310.7 (40 bytes): PathListInfo,
+            // InternalData, LoggingInfo{callback,level,disable} (0x14+). Older DLLs
+            // only read the prefix; the callback is MSABI (NGX calls MS-x64 from
+            // any thread; write(2) is thread-safe). NOT variadic: no float-ABI risk.
             static const void* fci_paths[1]; fci_paths[0]=wpath;
-            struct { const void* path; u32 len; u32 pad_; void* internal_; } fci;
+            struct { const void* path; u32 len; u32 pad_; void* internal_;
+                     void* logcb; int loglevel; int logdisable; } fci;
             memset(&fci,0,sizeof fci); fci.path=fci_paths; fci.len=1; fci.internal_=0;
+            fci.logcb=(void*)s_ngx_log; fci.loglevel=2; fci.logdisable=0;
             fdi.featInfo=&fci;
             struct { u32 fsupp,minhw; char minos[256]; } frq; memset(&frq,0,sizeof frq);
             logs("\n[calling native NVSDK_NGX_VULKAN_GetFeatureRequirements(FrameGeneration=11) ...]\n");
@@ -801,8 +825,10 @@ int main(void){
             logs("\n[calling NVSDK_NGX_VULKAN_Init_ProjectID ...]\n");
             // Same lesson as GFR: pass a real FeatureCommonInfo (arg10), not NULL.
             static const void* ici_paths[1]; ici_paths[0]=wpath;
-            struct { const void* path; u32 len; u32 pad_; void* internal_; } ici;
+            struct { const void* path; u32 len; u32 pad_; void* internal_;
+                     void* logcb; int loglevel; int logdisable; } ici;
             memset(&ici,0,sizeof ici); ici.path=ici_paths; ici.len=1; ici.internal_=0;
+            ici.logcb=(void*)s_ngx_log; ici.loglevel=2; ici.logdisable=0;
             // Ghidra 2026-09-12: Init+d5d0 passes p6=0 and reloads gipa from
             // vulkan-1.dll itself; arg9 (gdpa) is dereferenced as {qword,dword,ptr*}
             // by FUN_18000ce40 — a CODE pointer (my_gdpa) feeds it code bytes and
