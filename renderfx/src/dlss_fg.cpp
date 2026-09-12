@@ -10,18 +10,13 @@
 // lands later *behind* these same entry points (dlssFgInit/Shutdown/Record).
 //
 // WHAT IS MISSING UNTIL FUNCTIONAL (Init/Create/Evaluate sequence stands, but):
-//  TODO(wiring-1): declare dlssFgInit/dlssFgShutdown/dlssFgRecord in
-//      renderfx/src/renderfx_internal.hpp next to the ngx decls (:19-26) and add a
-//      `void* dlssFg` state slot next to `void* ngx` (:60). NOT done here — this
-//      file must not modify existing files, so it keeps its state in a file-local
-//      registry keyed by RfxContext* instead (see below); delete the registry once
-//      the slot exists.
-//  TODO(wiring-2): probe in renderfx/src/context.cpp:22 (rfx_create, next to the
-//      ngxInit call) and gate the RFX_BACKEND_DLSS_FG capability on the result;
-//      shut down in renderfx/src/context.cpp:34 (rfx_destroy, next to ngxShutdown).
-//      Coordinate the single NGX init with ngx.cpp:80 — NVSDK_NGX_VULKAN_Init may
-//      only run once per process/device; dlssFgInit must become a no-op when
-//      ctx->ngx is already initialised (or vice versa).
+//  wiring-1 DONE: dlssFgInit/dlssFgShutdown/dlssFgRecord declared in
+//      renderfx/src/renderfx_internal.hpp next to the ngx decls, `void* dlssFg`
+//      state slot next to `void* ngx`; state lives directly in the slot.
+//  wiring-2 DONE: probe in renderfx/src/context.cpp (rfx_create, next to the
+//      ngxInit call), RFX_BACKEND_DLSS_FG capability gated on the result; shut
+//      down in rfx_destroy (BEFORE ngxShutdown — the Init owner shuts down).
+//      Single NGX init coordinated via ctx->ngx (see dlssFgInit/dlssFgShutdown).
 //  TODO(wiring-3): dispatch RFX_BACKEND_DLSS_FG in
 //      renderfx/src/context.cpp:88 (rfx_record_frame_generation). Open point: that
 //      API takes no VkCommandBuffer today, but NGX FG evaluate records into one —
@@ -52,39 +47,26 @@ RfxResult dlssFgRecord(RfxContext*, VkCommandBuffer, const RfxFrameContext*,
 
 #include <cstdint>
 #include <cstring>
-#include <mutex>
-#include <unordered_map>
 #include <vector>
 
 namespace renderfx {
 namespace {
 
-// Per-context FG state. Handles are created lazily on first record (CreateFeature
-// needs a command buffer) and recreated if the frame dimensions change.
+// Per-context FG state, stored in RfxContext::dlssFg (renderfx_internal.hpp).
+// Handles are created lazily on first record (CreateFeature needs a command
+// buffer) and recreated if the frame dimensions change.
 // W/H = backbuffer (output) dims, TW/TH = render (input) dims.
 struct DlssFgState {
     NVSDK_NGX_Parameter* caps = nullptr;      // capability params (feature availability)
     NVSDK_NGX_Parameter* fgParams = nullptr;  // per-feature param block
     NVSDK_NGX_Handle* handle = nullptr;
     uint32_t W = 0, H = 0, TW = 0, TH = 0;
-    bool initialised = false;
+    bool initialised = false;   // true only if dlssFgInit owned the NGX Init
 };
 
-// TODO(wiring-1): replace with direct storage once RfxContext grows a `void* dlssFg`
-// slot (renderfx_internal.hpp:60). Until then the registry keeps this file free of
-// changes to existing files; entries are removed in dlssFgShutdown.
-std::mutex& fgRegistryMutex() {
-    static std::mutex m;
-    return m;
-}
-std::unordered_map<RfxContext*, DlssFgState*>& fgRegistry() {
-    static std::unordered_map<RfxContext*, DlssFgState*> r;
-    return r;
-}
-DlssFgState* fgState(RfxContext* ctx) {
-    std::lock_guard<std::mutex> lock(fgRegistryMutex());
-    auto it = fgRegistry().find(ctx);
-    return it != fgRegistry().end() ? it->second : nullptr;
+// wiring-1: direct storage in the RfxContext slot (no file-local registry).
+inline DlssFgState* fgState(RfxContext* ctx) {
+    return ctx ? static_cast<DlssFgState*>(ctx->dlssFg) : nullptr;
 }
 inline bool fgOk(NVSDK_NGX_Result r) { return NVSDK_NGX_SUCCEED(r); }
 
@@ -118,17 +100,32 @@ NVSDK_NGX_Resource_VK fgWrap(const RfxImageDesc& d, bool readWrite) {
 }
 
 // TODO(loader): VkFormat -> NGX backbuffer-format mapping. NativeBackbufferFormat is
-// a DXGI-style enum, NOT a VkFormat; passing it through raw would be wrong. Fill this
-// in with the Path-B loader work (experiments/dlssg-native); until then Create::_Back-
-// bufferFormat carries 0 and CreateFeature is expected to fail — pure NGX path only.
-unsigned int fgBackbufferFormat(const RfxImageDesc& /*dst*/) { return 0; }
+// a DXGI-style enum, NOT a VkFormat; passing it through raw would be wrong. The values
+// below are PLACEHOLDERS (unverified against NVIDIA's enum — e.g. R8G8B8A8_UNORM -> 4
+// is a guess, not a measured mapping). Verify/fill in with the Path-B loader work
+// (experiments/dlssg-native); until then Create carries a placeholder and CreateFeature
+// is expected to fail — pure NGX path only.
+unsigned int fgBackbufferFormat(const RfxImageDesc& dst) {
+    switch (dst.format) {
+        case VK_FORMAT_R8G8B8A8_UNORM:   return 4;
+        case VK_FORMAT_R8G8B8A8_SRGB:    return 5;
+        case VK_FORMAT_B8G8R8A8_UNORM:   return 6;
+        case VK_FORMAT_B8G8R8A8_SRGB:    return 7;
+        case VK_FORMAT_R16G16B16A16_SFLOAT: return 2;
+        case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return 8;
+        default:                         return 0;
+    }
+}
 
 }  // namespace
 
 bool dlssFgInit(RfxContext* ctx, bool* fgAvail) {
     if (fgAvail) *fgAvail = false;
     if (!ctx || !ctx->info.device || !ctx->info.instance) return false;
-    if (fgState(ctx)) return fgState(ctx)->initialised;
+    if (DlssFgState* cur = fgState(ctx)) {
+        if (fgAvail) *fgAvail = ctx->dlssFgAvail;
+        return cur->initialised || ctx->ngx != nullptr;
+    }
 
     auto gdpa = (PFN_vkGetDeviceProcAddr)ctx->info.gipa(ctx->info.instance, "vkGetDeviceProcAddr");
 
@@ -137,26 +134,30 @@ bool dlssFgInit(RfxContext* ctx, bool* fgAvail) {
     // 0xBAD00005 unless we pass a WRITABLE path in BOTH the legacy arg AND
     // FeatureCommonInfo.PathListInfo. The vendored `rel` dir is user-writable and
     // holds the DLSS-G snippets. The project id must be a valid UUID.
-    // TODO(wiring-2): single-Init coordination with ngx.cpp:80 — see file header.
-    std::vector<uint32_t> wp = fgWpath(RENDERFX_NGX_DATA_PATH);
-    const wchar_t* pathW = reinterpret_cast<const wchar_t*>(wp.data());
-    const wchar_t* paths[1] = { pathW };
-    NVSDK_NGX_FeatureCommonInfo fci; std::memset(&fci, 0, sizeof(fci));
-    fci.PathListInfo.Path = paths;
-    fci.PathListInfo.Length = 1;
+    //
+    // wiring-2: single-Init coordination with ngx.cpp:ngxInit —
+    // NVSDK_NGX_VULKAN_Init may only run once per process/device. rfx_create probes
+    // ngxInit first, so a non-null ctx->ngx means NGX is already initialised: skip
+    // the Init and only query capabilities (this state does NOT own Shutdown then).
+    const bool ngxAlreadyInit = (ctx->ngx != nullptr);
+    if (!ngxAlreadyInit) {
+        std::vector<uint32_t> wp = fgWpath(RENDERFX_NGX_DATA_PATH);
+        const wchar_t* pathW = reinterpret_cast<const wchar_t*>(wp.data());
+        const wchar_t* paths[1] = { pathW };
+        NVSDK_NGX_FeatureCommonInfo fci; std::memset(&fci, 0, sizeof(fci));
+        fci.PathListInfo.Path = paths;
+        fci.PathListInfo.Length = 1;
 
-    NVSDK_NGX_Result r = NVSDK_NGX_VULKAN_Init_with_ProjectID(
-        "b1e7fa2c-9d34-4c1a-8b77-6f0a1e2d3c4b", NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0",
-        pathW, ctx->info.instance, ctx->info.physical_device, ctx->info.device,
-        ctx->info.gipa, gdpa, &fci, NVSDK_NGX_Version_API);
-    if (!fgOk(r)) return false;
+        NVSDK_NGX_Result r = NVSDK_NGX_VULKAN_Init_with_ProjectID(
+            "b1e7fa2c-9d34-4c1a-8b77-6f0a1e2d3c4b", NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0",
+            pathW, ctx->info.instance, ctx->info.physical_device, ctx->info.device,
+            ctx->info.gipa, gdpa, &fci, NVSDK_NGX_Version_API);
+        if (!fgOk(r)) return false;
+    }
 
     auto* st = new DlssFgState();
-    st->initialised = true;
-    {
-        std::lock_guard<std::mutex> lock(fgRegistryMutex());
-        fgRegistry()[ctx] = st;
-    }
+    st->initialised = !ngxAlreadyInit;   // Shutdown1 only if WE initialised NGX
+    ctx->dlssFg = st;
 
     // Capability contract (integration doc §2.2): FrameGeneration.Available /
     // FeatureInitResult / NeedsUpdatedDriver. Native Linux reports Available = 0,
@@ -164,7 +165,8 @@ bool dlssFgInit(RfxContext* ctx, bool* fgAvail) {
     if (fgOk(NVSDK_NGX_VULKAN_GetCapabilityParameters(&st->caps)) && st->caps) {
         int fg = 0;
         NVSDK_NGX_Parameter_GetI(st->caps, NVSDK_NGX_Parameter_FrameGeneration_Available, &fg);
-        if (fgAvail) *fgAvail = fg != 0;
+        ctx->dlssFgAvail = fg != 0;
+        if (fgAvail) *fgAvail = ctx->dlssFgAvail;
     }
     return true;
 }
@@ -173,13 +175,12 @@ void dlssFgShutdown(RfxContext* ctx) {
     if (!ctx) return;
     DlssFgState* st = fgState(ctx);
     if (!st) return;
-    {
-        std::lock_guard<std::mutex> lock(fgRegistryMutex());
-        fgRegistry().erase(ctx);
-    }
+    ctx->dlssFg = nullptr;
     if (ctx->info.device) vkDeviceWaitIdle(ctx->info.device);
     if (st->handle) NVSDK_NGX_VULKAN_ReleaseFeature(st->handle);
     if (st->fgParams) NVSDK_NGX_VULKAN_DestroyParameters(st->fgParams);
+    // Single-Shutdown coordination: only the owner of NVSDK_NGX_VULKAN_Init may
+    // shut NGX down (cf. dlssFgInit). When ngx.cpp owns the Init, ngxShutdown does it.
     if (st->initialised && ctx->info.device) NVSDK_NGX_VULKAN_Shutdown1(ctx->info.device);
     delete st;
 }

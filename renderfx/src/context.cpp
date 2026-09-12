@@ -20,6 +20,11 @@ RfxResult rfx_create(const RfxCreateInfo* info, RfxContext** out) {
     // Probe the official NGX backend once (design.md §19 fix). Availability gates the
     // DLSS SR/DLAA/RR capability flags below; inert stub when built without -DRENDERFX_NGX.
     renderfx::ngxInit(ctx, &ctx->ngxSr, &ctx->ngxRr);
+    // Probe NGX Frame Generation (wiring-2). Runs AFTER ngxInit so dlssFgInit can see
+    // ctx->ngx and skip its own NVSDK_NGX_VULKAN_Init (single-Init coordination);
+    // gates RFX_BACKEND_DLSS_FG. Inert stub without -DRENDERFX_NGX; reports
+    // supported=0 until the Path-B loader lands (expected).
+    renderfx::dlssFgInit(ctx, &ctx->dlssFgAvail);
     // Probe Intel XeSS (inert stub unless built -DRENDERFX_XESS with a native runtime).
     renderfx::xessInit(ctx, &ctx->xessAvail);
     *out = ctx;
@@ -31,6 +36,11 @@ void rfx_destroy(RfxContext* ctx) {
     if (ctx->info.device) vkDeviceWaitIdle(ctx->info.device);
     renderfx::destroyUpscale(ctx);
     renderfx::destroyDebug(ctx);
+    // FG shutdown BEFORE ngxShutdown: dlssFgShutdown releases the FG feature but only
+    // calls NVSDK_NGX_VULKAN_Shutdown1 if dlssFgInit owned the Init; otherwise
+    // ngxShutdown (which runs next) owns the Shutdown. Order matters — Shutdown1 must
+    // run after all features are released.
+    renderfx::dlssFgShutdown(ctx);
     renderfx::ngxShutdown(ctx);
     renderfx::xessShutdown(ctx);
     if (ctx->nvofg) nvofg_destroy(ctx->nvofg);
@@ -48,6 +58,17 @@ RfxResult rfx_query_capabilities(RfxContext* ctx, RfxCapabilities* outCaps) {
     // at rfx_create; FSR is our own portable EASU/RCAS shader (any Vulkan GPU).
     renderfx::buildCapabilities(ofa, /*shader*/ true, outCaps, ctx->ngxSr, ctx->ngxRr,
                                 /*fsr*/ true, ctx->xessAvail);
+    // wiring-2: gate RFX_BACKEND_DLSS_FG on the dlssFgInit probe from rfx_create.
+    // (Patched here rather than inside buildCapabilities so its signature — also
+    // forward-declared by tests — stays stable.) supported=0 until the Path-B
+    // loader lands; that is expected on native Linux.
+    for (uint32_t i = 0; i < outCaps->count; ++i) {
+        if (outCaps->backends[i].id == RFX_BACKEND_DLSS_FG) {
+            outCaps->backends[i].supported = ctx->dlssFgAvail ? 1 : 0;
+            if (!ctx->dlssFgAvail) outCaps->backends[i].note = "NGX/DLSS-FG unavailable";
+            break;
+        }
+    }
     ctx->caps = *outCaps;
     return RFX_OK;
 }
@@ -92,6 +113,11 @@ RfxResult rfx_record_frame_generation(RfxContext* ctx, const RfxFrameContext* fc
                                       const RfxFrameSync* input_ready,
                                       RfxFrameSync* out_sync) {
     if (!ctx || !fc || !prev_color || !output || !out_sync) return RFX_INVALID_ARGUMENT;
+    // TODO(wiring-3): RFX_BACKEND_DLSS_FG dispatches via renderfx::dlssFgRecord, which
+    // needs the app's VkCommandBuffer (NGX FG evaluate records into it). This API
+    // carries no VkCommandBuffer today, so the public FG record path needs cmd-buffer
+    // plumbing first — the signature is intentionally NOT changed here.
+    if (ctx->fgBackend == RFX_BACKEND_DLSS_FG) return RFX_UNSUPPORTED;
     if (!ctx->nvofg) return RFX_NOT_REGISTERED;
 
     if (!ctx->registered) {

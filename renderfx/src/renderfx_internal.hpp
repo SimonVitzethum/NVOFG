@@ -25,6 +25,20 @@ RfxResult ngxRecordDLAA(RfxContext* ctx, VkCommandBuffer cmd, const RfxFrameCont
 RfxResult ngxRecordRR(RfxContext* ctx, VkCommandBuffer cmd, const RfxFrameContext* fc,
                       const RfxImageDesc* output, uint32_t reset);
 
+// --- NGX DLSS Frame Generation (DLSS-G). Real when built with -DRENDERFX_NGX +
+// the vendored SDK; otherwise inert stubs (same ADR 0006 pattern as ngx.cpp).
+// Single NGX Init is coordinated via ctx->ngx: dlssFgInit skips
+// NVSDK_NGX_VULKAN_Init when ngx.cpp already initialised NGX, and dlssFgShutdown
+// skips NVSDK_NGX_VULKAN_Shutdown1 unless dlssFgInit owned the Init. ---
+// Probe NGX FG availability on ctx's device. Returns false if unavailable (then
+// RFX_BACKEND_DLSS_FG stays unsupported — graceful degradation, like ngxInit).
+bool dlssFgInit(RfxContext* ctx, bool* fgAvail);
+void dlssFgShutdown(RfxContext* ctx);
+// Interpolate one frame (color+depth+motion -> output). Needs the app's command
+// buffer: NGX FG evaluate records into it.
+RfxResult dlssFgRecord(RfxContext* ctx, VkCommandBuffer cmd, const RfxFrameContext* fc,
+                       const RfxImageDesc* output, uint32_t reset);
+
 // --- Intel XeSS backend (temporal super-resolution). Real with -DRENDERFX_XESS + a
 // native XeSS runtime; inert stub otherwise (ADR 0007 — no Linux runtime ships today). ---
 bool xessInit(RfxContext* ctx, bool* avail);
@@ -60,6 +74,11 @@ struct RfxContext {
     void* ngx = nullptr;
     bool  ngxSr = false;   // DLSS Super Resolution + DLAA available on this device
     bool  ngxRr = false;   // DLSS Ray Reconstruction available on this device
+
+    // NGX DLSS Frame Generation state (opaque DlssFgState*, owned by dlss_fg.cpp).
+    // Availability probed once at rfx_create (wiring-2); feature created lazily.
+    void* dlssFg = nullptr;
+    bool  dlssFgAvail = false;   // DLSS-G FrameGeneration available on this device
 
     // Intel XeSS backend state (opaque renderfx::XessState*, owned by xess.cpp).
     void* xess = nullptr;

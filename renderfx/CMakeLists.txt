@@ -24,6 +24,7 @@ add_library(renderfx
   src/upscale.cpp
   src/rr_debug.cpp
   src/ngx.cpp
+  src/dlss_fg.cpp
   src/xess.cpp)
 add_dependencies(renderfx renderfx_shaders)
 target_include_directories(renderfx
