@@ -510,21 +510,20 @@ MSABI static void* s_LoadLibraryA(const char* n){ const char* s=strrchr(n,'\\');
 // (0xd659 je 0xd6ce) instead of building a struct with a null field and crashing at 0xceee. An address
 // the linker does NOT know is a manually-mapped Windows PE — the snippet that _nvngx loaded internally
 // (not in g_mod) — so return the host module, keeping GetFeatureRequirements' own self-lookup working.
-static int addr_is_native(void* p){ Dl_info di; return p && dladdr(p,&di)!=0; }
+// FROM_ADDRESS discriminator (kept for reference; currently unused — native callers
+// report the host module, see above).
+// static int addr_is_native(void* p){ Dl_info di; return p && dladdr(p,&di)!=0; }
 MSABI static int   s_GetModuleHandleExW(u32 f,void* n,void** out){
-    // Ghidra 2026-09-12 (FUN_180061950 @ _nvngx+0x61950, called from GFR): the host
-    // resolves the APP module from GFR's return address and wcsdup's its dir + file
-    // into the dir-list fed to 0xb720. For our native caller dladdr succeeds, so the
-    // generic rule below would FAIL it -> NULL wstrings -> 0xa1f3. But here a module
-    // is REQUIRED (under Proton the caller is a real EXE). Report the host module
-    // (its dir is the DLL dir) — narrowly scoped to this querier so Init's 0xceee
-    // skip-behaviour (native caller -> FAIL) is unchanged.
-    if(f&4){ void* ret=__builtin_return_address(0);
-        if(g_nmod>0 && (u8*)ret>=g_mod[0].base+0x61900 && (u8*)ret<g_mod[0].base+0x61b00){
-            if(out)*out=g_mod[0].base; return 1; }
-        for(int i=0;i<g_nmod;i++) if(g_mod[i].base && (u8*)n>=g_mod[i].base && (u8*)n<g_mod[i].base+g_mod[i].size){ if(out)*out=g_mod[i].base; return 1; }
-        if(addr_is_native(n)){ if(out)*out=0; return 0; }   // native caller (Init) -> fail, skip app-path
-        if(out)*out=g_mod[0].base; return 1; }              // mapped snippet PE -> host module (requirements)
+    // FROM_ADDRESS: resolve which loaded module CONTAINS the address. A manually-
+    // mapped Windows PE (the snippet, loaded by _nvngx internally, not in g_mod)
+    // resolves to the host module so its self-lookup keeps working (GFR GREEN).
+    // A native (non-PE) caller address ALSO reports the host module now: Init's
+    // downstream (c8b0->c1e0->b720) needs pwVar6/pwVar4 dir strings non-NULL, and
+    // the old reason for FAIL (0xceee via arg9=codepointer) is gone since Init gets
+    // gdpa=NULL (guarded skip). The GFR-helper carve-out below is subsumed by this.
+    if(f&4){ for(int i=0;i<g_nmod;i++) if(g_mod[i].base && (u8*)n>=g_mod[i].base && (u8*)n<g_mod[i].base+g_mod[i].size){ if(out)*out=g_mod[i].base; return 1; }
+        if(g_nmod>0){ if(out)*out=g_mod[0].base; return 1; }
+        if(out)*out=0; return 0; }
     if(out)*out=g_mod[0].base; return 1; }
 // GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS (0x4): resolve which loaded module CONTAINS the address.
 // The snippet uses this to find its own module (then its path). Returning the dummy module broke it.
@@ -534,14 +533,11 @@ MSABI static int   s_GetModuleHandleExW(u32 f,void* n,void** out){
 MSABI static int s_RtlGetVersion(u8* vi){ if(vi){ *(u32*)(vi+4)=10; *(u32*)(vi+8)=0; *(u32*)(vi+12)=19041; *(u32*)(vi+16)=2; *(u16*)(vi+20)=0; } return 0; }
 MSABI static int s_GetVersionExW(u8* vi){ if(vi){ *(u32*)(vi+4)=10; *(u32*)(vi+8)=0; *(u32*)(vi+12)=19041; *(u32*)(vi+16)=2; *(u16*)(vi+20)=0; } return 1; }
 MSABI static int s_GetModuleHandleExA(u32 f,void* n,void** out){
-    // Same carve-out as the W variant: FUN_180061950 (GFR dir-string helper) needs a
-    // module for the native caller; Init's own lookup keeps FAIL-for-native.
-    if(f&4){ void* ret=__builtin_return_address(0);
-        if(g_nmod>0 && (u8*)ret>=g_mod[0].base+0x61900 && (u8*)ret<g_mod[0].base+0x61b00){
-            if(out)*out=g_mod[0].base; return 1; }
-        for(int i=0;i<g_nmod;i++) if(g_mod[i].base && (u8*)n>=g_mod[i].base && (u8*)n<g_mod[i].base+g_mod[i].size){ if(out)*out=g_mod[i].base; return 1; }
-        if(addr_is_native(n)){ if(out)*out=0; return 0; }   // native caller (Init) -> fail, skip app-path (past 0xceee)
-        if(out)*out=g_mod[0].base; return 1; }              // mapped snippet PE -> host module (requirements)
+    // Same rule as the W variant (see above): native callers report the host
+    // module so downstream dir-string building never sees NULL.
+    if(f&4){ for(int i=0;i<g_nmod;i++) if(g_mod[i].base && (u8*)n>=g_mod[i].base && (u8*)n<g_mod[i].base+g_mod[i].size){ if(out)*out=g_mod[i].base; return 1; }
+        if(g_nmod>0){ if(out)*out=g_mod[0].base; return 1; }
+        if(out)*out=0; return 0; }
     if(out)*out=g_mod[0].base; return 1; }
 
 struct { const char* name; void* fn; } g_stubs[]={
@@ -752,9 +748,12 @@ int main(void){
         // MinHWArch@4(u32), MinOS[255]}; FeatureDiscoveryInfo = {SDKVer,FeatureID,Ident(32),path,info}.
         typedef int MSABI(*gfr_t)(void*,void*,const void*,void*);
         gfr_t GFR=(gfr_t)module_export(h,"NVSDK_NGX_VULKAN_GetFeatureRequirements");
+        // S5_SDKVER overrides the NGX SDK version (hex, default 0x15 = SDK 310.7
+        // macro). The 310.2-era driver DLL may want an older one (OutOfDate check).
+        const char* se=getenv("S5_SDKVER"); unsigned sdkv=se?(unsigned)strtoul(se,0,0):0x15;
         if(GFR){
             struct { u32 sdkVer,featureId,idType,pad; u64 appId,u1,u2; const void* dataPath; const void* featInfo; } fdi;
-            memset(&fdi,0,sizeof fdi); fdi.sdkVer=0x15; fdi.featureId=11; fdi.idType=0; fdi.appId=0x1337ULL; fdi.dataPath=wpath;
+            memset(&fdi,0,sizeof fdi); fdi.sdkVer=sdkv; fdi.featureId=11; fdi.idType=0; fdi.appId=0x1337ULL; fdi.dataPath=wpath;
             // Ghidra 2026-09-12: 0xc1e0 feeds 0xb720 (dir-list builder) from caller stack
             // slots ([rbp+0x77]/[rbp+0x8f]) that stay nil when FeatureInfo is NULL — same
             // shape as the Init §19 fix. Pass a real FeatureCommonInfo (PathListInfo ->
@@ -789,7 +788,7 @@ int main(void){
             // by FUN_18000ce40 — a CODE pointer (my_gdpa) feeds it code bytes and
             // faults at +0xceee, while NULL takes the guarded skip. Pass NULL.
             int r=Init("a0b1c2d3-1234-5678-9abc-def012345678",0,"1.0",wpath,
-                       (void*)g_inst,(void*)g_pd,(void*)g_dev,(void*)my_gipa,0,&ici,0x15);
+                       (void*)g_inst,(void*)g_pd,(void*)g_dev,(void*)my_gipa,0,&ici,sdkv);
             char b[80]; snprintf(b,sizeof b,"[NGX Init returned 0x%08X]\n",(unsigned)r); logs(b);
         }
         _exit(0);
