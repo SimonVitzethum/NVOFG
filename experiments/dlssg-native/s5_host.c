@@ -1213,6 +1213,58 @@ int main(void){
             int r=Init("a0b1c2d3-1234-5678-9abc-def012345678",0,"1.0",wpath,
                        (void*)g_inst,(void*)g_pd,(void*)g_dev,a8,0,&ici,sdkv);
             char b[80]; snprintf(b,sizeof b,"[NGX Init returned 0x%08X]\n",(unsigned)r); logs(b);
+            // ---- CreateFeature(FG) in the SAME process after Init==0x1 ----
+            // Gated by S5_CREATE=1 (needs taskset -c 0 for deterministic Init).
+            // Params per NGX_VK_CREATE_DLSSG (+ DLSSG.Width/Height for 310.9):
+            // CreationNodeMask, VisibilityNodeMask, Width, Height,
+            // DLSSG.BackbufferFormat (+ DLSSG.Width/Height). Format uint is
+            // UNPROVEN (Agent C): S5_FG_FMT raster {4,37,44,109,5}, S5_FG_W/H size.
+            if(r==1 && getenv("S5_CREATE")){
+                typedef int MSABI(*allocparams_t)(void**);
+                typedef void MSABI(*setui_t)(void*,const char*,u32);
+                typedef int MSABI(*scratch_t)(u32,void*,u64*);
+                typedef int MSABI(*create_t)(void*,u32,void*,void**);
+                allocparams_t Alloc=(allocparams_t)module_export(h,"NVSDK_NGX_VULKAN_AllocateParameters");
+                Module* snip=0;
+                for(int i=0;i<g_nmod;i++) if(!strcasecmp(g_mod[i].name,"nvngx_dlssg.dll")) snip=&g_mod[i];
+                scratch_t Scratch=snip?(scratch_t)module_export(snip,"NVSDK_NGX_VULKAN_GetScratchBufferSize"):0;
+                create_t Create=snip?(create_t)module_export(snip,"NVSDK_NGX_VULKAN_CreateFeature"):0;
+                { char b2[128]; snprintf(b2,sizeof b2,"[Create] Alloc=%p snip=%p Scratch=%p Create=%p\n",
+                    (void*)Alloc,(void*)snip,(void*)Scratch,(void*)Create); logs(b2); }
+                if(Alloc&&Scratch&&Create){
+                    void* params=0; int ra=Alloc(&params);
+                    { char b2[80]; snprintf(b2,sizeof b2,"[Create] AllocateParameters -> 0x%X params=%p\n",(unsigned)ra,params); logs(b2); }
+                    if(ra==1&&params){
+                        void** vt=*(void***)params; setui_t SetUI=(setui_t)vt[3]; // vtable[3] = Set(uint)
+                        const char* ew=getenv("S5_FG_W"); const char* eh=getenv("S5_FG_H"); const char* ef=getenv("S5_FG_FMT");
+                        u32 W=ew?(u32)strtoul(ew,0,0):1920, H=eh?(u32)strtoul(eh,0,0):1080, F=ef?(u32)strtoul(ef,0,0):4;
+                        SetUI(params,"CreationNodeMask",1); SetUI(params,"VisibilityNodeMask",1);
+                        SetUI(params,"Width",W); SetUI(params,"Height",H);
+                        SetUI(params,"DLSSG.BackbufferFormat",F);
+                        SetUI(params,"DLSSG.Width",W); SetUI(params,"DLSSG.Height",H);
+                        { char b2[96]; snprintf(b2,sizeof b2,"[Create] params set W=%u H=%u FMT=%u\n",W,H,F); logs(b2); }
+                        u64 scratch=0; int rs=Scratch(11,params,&scratch);
+                        { char b2[96]; snprintf(b2,sizeof b2,"[Create] GetScratchBufferSize -> 0x%X bytes=%llu\n",(unsigned)rs,(unsigned long long)scratch); logs(b2); }
+                        // native cmd buffer for CreateFeature
+                        VkCommandPool pool=0; VkCommandBuffer cmd=0;
+                        VkCommandPoolCreateInfo pci={.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                            .queueFamilyIndex=g_qfam,.flags=VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT};
+                        if(vkCreateCommandPool(g_dev,&pci,0,&pool)==VK_SUCCESS){
+                            VkCommandBufferAllocateInfo ai={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                .commandPool=pool,.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};
+                            if(vkAllocateCommandBuffers(g_dev,&ai,&cmd)==VK_SUCCESS){
+                                VkCommandBufferBeginInfo bi={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                    .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+                                vkBeginCommandBuffer(cmd,&bi);
+                            }
+                        }
+                        { char b2[64]; snprintf(b2,sizeof b2,"[Create] pool=%p cmd=%p\n",(void*)pool,(void*)cmd); logs(b2); }
+                        void* handle=0; int rc=0;
+                        if(cmd) rc=Create((void*)cmd,11,params,&handle);
+                        { char b2[96]; snprintf(b2,sizeof b2,"[Create] CreateFeature(FG) -> 0x%X handle=%p\n",(unsigned)rc,handle); logs(b2); }
+                    }
+                }
+            }
         }
         _exit(0);
     }
