@@ -133,8 +133,266 @@ MSABI static void  s_noop(void){}
 MSABI static u32   s_GetLastError(void){return(u32)g_lasterr;}
 MSABI static void  s_SetLastError(u32 e){g_lasterr=(int)e;}
 MSABI static void* s_CreateHandle(void){return(void*)__sync_fetch_and_add(&g_hcount,1);}
-MSABI static int   s_CloseHandle(void* h){ if(((uintptr_t)h & 0xFF000000u)==0x50000000u && h!=(void*)-1) close((int)((uintptr_t)h & 0x00FFFFFFu)); return 1;}
-MSABI static u32   s_WaitForSingleObject(void* h,u32 m){(void)m; if(((uintptr_t)h&0xFF000000u)==0x70000000u){ int idx=(int)((uintptr_t)h&0xFFFFFF); if(idx<256&&g_wthreads[idx]) pthread_join(g_wthreads[idx],0); } return 0;}
+// ---- guarded pointer access for Win32 structs --------------------------------
+// (needs sigjmp/dec_segv from the RaiseException decoder below; declared here,
+// defined there — single definition to avoid duplicates)
+#include <setjmp.h>
+static sigjmp_buf g_decjmp;
+static void dec_segv(int s);
+// NGX sometimes passes never-initialized (garbage, not zero) sync structs.
+// Blindly writing/reading them corrupts memory (flaky DllMain->0 / exit-42).
+// Guard every access: unreadable -> skip; NULL -> lazy-init; live-table miss
+// (garbage nonzero) -> re-init + log. Matches Wine's tolerance, never crashes.
+static pthread_mutex_t g_liveguard=PTHREAD_MUTEX_INITIALIZER;
+#define MAXLIVE 256
+static void* g_live[MAXLIVE]; static int g_nlive;
+static int live_has(void* p){ int f=0; pthread_mutex_lock(&g_liveguard);
+    for(int i=0;i<g_nlive;i++) if(g_live[i]==p){ f=1; break; }
+    pthread_mutex_unlock(&g_liveguard); return f; }
+static void live_add(void* p){ pthread_mutex_lock(&g_liveguard);
+    for(int i=0;i<g_nlive;i++) if(g_live[i]==p){ pthread_mutex_unlock(&g_liveguard); return; }
+    if(g_nlive<MAXLIVE) g_live[g_nlive++]=p; pthread_mutex_unlock(&g_liveguard); }
+static void live_del(void* p){ pthread_mutex_lock(&g_liveguard);
+    for(int i=0;i<g_nlive;i++) if(g_live[i]==p){ g_live[i]=g_live[--g_nlive]; break; }
+    pthread_mutex_unlock(&g_liveguard); }
+static int guarded_read_ptr(void* addr,void** out){ struct sigaction na,oa;
+    memset(&na,0,sizeof na); na.sa_handler=dec_segv; sigemptyset(&na.sa_mask);
+    if(sigaction(SIGSEGV,&na,&oa)!=0) return -1;
+    int r=0; if(sigsetjmp(g_decjmp,1)==0){ *out=*(void**)addr; } else r=-1;
+    sigaction(SIGSEGV,&oa,0); return r; }
+static int guarded_write_ptr(void* addr,void* v){ struct sigaction na,oa;
+    memset(&na,0,sizeof na); na.sa_handler=dec_segv; sigemptyset(&na.sa_mask);
+    if(sigaction(SIGSEGV,&na,&oa)!=0) return -1;
+    int r=0; if(sigsetjmp(g_decjmp,1)==0){ *(void**)addr=v; } else r=-1;
+    sigaction(SIGSEGV,&oa,0); return r; }
+// Init is multithreaded (workers + main share NGX state). The old no-op stubs
+// (EnterCriticalSection=noop, WaitForSingleObject=immediate-0, SleepCV=instant)
+// made every wait a no-wait: workers read incomplete state -> errno-thrower
+// (EAGAIN/EDEADLK sites) or null-deref, purely scheduling-dependent (OutOfDate
+// vs SIGTRAP across identical runs). Real semantics below; DebugInfo/slot tricks
+// store native objects inside caller-owned Win32 structs.
+#define SYNC_MAGIC 0x53494e43u
+typedef struct { u32 magic; int kind; pthread_mutex_t m; pthread_cond_t c;
+                 int state; int manual; long count; long max; } syncobj_t; // 0=event 1=mutex 2=sem
+static syncobj_t* sync_new(int kind){ syncobj_t* s=calloc(1,sizeof* s); if(!s) return 0;
+    s->magic=SYNC_MAGIC; s->kind=kind; pthread_mutex_init(&s->m,0); pthread_cond_init(&s->c,0); return s; }
+static syncobj_t* sync_of(void* h){ uintptr_t a=(uintptr_t)h;
+    if(a<0x10000) return 0; /* NULL/small-int handles: never deref */
+    if(((a&0xFF000000u)==0x70000000u)||((a&0xFF000000u)==0x50000000u)||
+       ((a&0xFF000000u)==0x30000000u)) return 0; /* thread/file/console tags */
+    syncobj_t* s=(syncobj_t*)h;
+    if(s->magic!=SYNC_MAGIC) return 0; return s; }
+static void abstime(struct timespec* ts,u32 ms){ clock_gettime(CLOCK_REALTIME,ts);
+    ts->tv_sec+=ms/1000; ts->tv_nsec+=(ms%1000)*1000000LL;
+    if(ts->tv_nsec>=1000000000LL){ ts->tv_sec++; ts->tv_nsec-=1000000000LL; } }
+// CRITICAL_SECTION: caller-owned 48B; stash recursive-mutex ptr in DebugInfo @0.
+// Wine-tolerant lazy init: a zeroed (never explicitly initialized) CS gets its
+// mutex on first use under a global guard (TryEnter on such a CS must succeed,
+// not return 0 — DllMain-class code branches on it).
+static pthread_mutex_t g_csinit=PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t* cs_alloc(void){ pthread_mutex_t* m=malloc(sizeof*m); if(!m) return 0;
+    pthread_mutexattr_t a; pthread_mutexattr_init(&a);
+    pthread_mutexattr_settype(&a,PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(m,&a); pthread_mutexattr_destroy(&a); live_add(m); return m; }
+static pthread_mutex_t* cs_get(void* cs){ void* cur=0;
+    if(!cs||guarded_read_ptr(cs,&cur)!=0) return 0; // unreadable struct: skip
+    if(cur){ if(live_has(cur)) return cur;
+        // nonzero but not ours (uninit garbage): re-init safely, log it
+        if(getenv("S5_SYNCTRACE")){ char b[64]; snprintf(b,sizeof b,"[sync] CS re-init garbage %p\n",cur); logs(b); } }
+    pthread_mutex_lock(&g_csinit);
+    if(guarded_read_ptr(cs,&cur)!=0){ pthread_mutex_unlock(&g_csinit); return 0; }
+    if(cur&&live_has(cur)){ pthread_mutex_unlock(&g_csinit); return cur; }
+    pthread_mutex_t* m=cs_alloc();
+    if(m&&guarded_write_ptr(cs,m)!=0){ pthread_mutex_destroy(m); free(m); m=0; }
+    pthread_mutex_unlock(&g_csinit); return m; }
+MSABI static void s_InitializeCriticalSection(void* cs){ if(!cs) return;
+    if(getenv("S5_SYNCTRACE")){ char b[64]; snprintf(b,sizeof b,"[sync] InitCS %p\n",cs); logs(b); }
+    // Only init into a writable slot holding NULL or garbage; never corrupt.
+    void* cur=0; if(guarded_read_ptr(cs,&cur)!=0) return;
+    if(cur&&live_has(cur)) return; // already ours
+    pthread_mutex_lock(&g_csinit);
+    if(guarded_read_ptr(cs,&cur)==0&&(!cur||!live_has(cur))){
+        pthread_mutex_t* m=cs_alloc();
+        if(m&&guarded_write_ptr(cs,m)!=0){ pthread_mutex_destroy(m); free(m); } }
+    pthread_mutex_unlock(&g_csinit); }
+MSABI static void s_EnterCriticalSection(void* cs){ if(!cs) return;
+    pthread_mutex_t* m=cs_get(cs);
+    if(getenv("S5_SYNCTRACE")){ char b[64]; snprintf(b,sizeof b,"[sync] EnterCS %p m=%p\n",cs,m); logs(b); }
+    if(m) pthread_mutex_lock(m); }
+MSABI static void s_LeaveCriticalSection(void* cs){ if(!cs) return;
+    void* cur=0; if(guarded_read_ptr(cs,&cur)!=0||!cur||!live_has(cur)) return;
+    pthread_mutex_unlock((pthread_mutex_t*)cur); }
+#define SYNCTRACE(fmt, ...) do{ if(getenv("S5_SYNCTRACE")){ char _b[128]; snprintf(_b,sizeof _b,fmt,__VA_ARGS__); logs(_b); } }while(0)
+MSABI static int s_TryEnterCriticalSection(void* cs){ if(!cs) return 0;
+    pthread_mutex_t* m=cs_get(cs); int r=(m&&pthread_mutex_trylock(m)==0);
+    SYNCTRACE("[sync] TryEnterCS %p -> %d\n",cs,r); return r; }
+MSABI static void s_DeleteCriticalSection(void* cs){ void* cur=0; if(!cs) return;
+    if(guarded_read_ptr(cs,&cur)!=0) return; if(!cur||!live_has(cur)) return;
+    pthread_mutex_t* m=cur; live_del(m); pthread_mutex_destroy(m); free(m);
+    guarded_write_ptr(cs,0); }
+// SRWLOCK/CONDITION_VARIABLE: caller-owned 8B pointer slots.
+MSABI static void s_InitializeSRWLock(void* l){ if(l)*(void**)l=0; } // lazy rwlock below
+static pthread_rwlock_t* srw_get(void** l){ void* cur=0;
+    if(!l||guarded_read_ptr(l,&cur)!=0) return 0;
+    if(cur){ if(live_has(cur)) return cur; }
+    pthread_rwlock_t* r=malloc(sizeof*r); if(!r) return 0;
+    pthread_rwlock_init(r,0); live_add(r);
+    if(guarded_write_ptr(l,r)!=0){ pthread_rwlock_destroy(r); free(r); return 0; } return r; }
+MSABI static void s_AcquireSRWLockExclusive(void* l){ if(!l) return; pthread_rwlock_wrlock(srw_get((void**)l)); }
+MSABI static void s_ReleaseSRWLockExclusive(void* l){ void* cur=0; if(!l) return;
+    if(guarded_read_ptr(l,&cur)!=0||!cur||!live_has(cur)) return;
+    pthread_rwlock_unlock((pthread_rwlock_t*)cur); }
+MSABI static void s_AcquireSRWLockShared(void* l){ if(!l) return; pthread_rwlock_rdlock(srw_get((void**)l)); }
+MSABI static void s_ReleaseSRWLockShared(void* l){ void* cur=0; if(!l) return;
+    if(guarded_read_ptr(l,&cur)!=0||!cur||!live_has(cur)) return;
+    pthread_rwlock_unlock((pthread_rwlock_t*)cur); }
+MSABI static int s_TryAcquireSRWLockExclusive(void* l){ if(!l) return 0; return pthread_rwlock_trywrlock(srw_get((void**)l))==0; }
+typedef struct { pthread_cond_t c; pthread_mutex_t m; } condwrap_t;
+static condwrap_t* cond_get(void** l){ void* cur=0;
+    if(!l||guarded_read_ptr(l,&cur)!=0) return 0;
+    if(cur){ if(live_has(cur)) return cur; }
+    condwrap_t* w=calloc(1,sizeof*w); if(!w) return 0;
+    pthread_cond_init(&w->c,0); pthread_mutex_init(&w->m,0); live_add(w);
+    if(guarded_write_ptr(l,w)!=0){ pthread_cond_destroy(&w->c); pthread_mutex_destroy(&w->m); free(w); return 0; } return w; }
+static int cond_wait_ms(condwrap_t* w,pthread_mutex_t* ext,u32 ms){
+    // Wait on our own mutex (SRW can't back a pthread_cond); ext lock released
+    // across the wait to preserve mutual exclusion approximately.
+    if(ext) pthread_mutex_unlock(ext);
+    pthread_mutex_lock(&w->m); int r=0;
+    if(ms==0xFFFFFFFFu) r=pthread_cond_wait(&w->c,&w->m);
+    else { struct timespec ts; abstime(&ts,ms); r=pthread_cond_timedwait(&w->c,&w->m,&ts); }
+    pthread_mutex_unlock(&w->m);
+    if(ext) pthread_mutex_lock(ext); return r==0; }
+MSABI static int s_SleepConditionVariableCS(void* c,void* cs,u32 ms){ if(!c||!cs) return 0;
+    condwrap_t* w=cond_get((void**)c); pthread_mutex_t* m=*(void**)cs;
+    int r=cond_wait_ms(w,m,ms); SYNCTRACE("[sync] SleepCVCS %p ms=%u -> %d\n",c,ms,r); return r; }
+MSABI static int s_SleepConditionVariableSRW(void* c,void* l,u32 ms){ if(!c||!l) return 0;
+    (void)l; condwrap_t* w=cond_get((void**)c); int r=cond_wait_ms(w,0,ms);
+    SYNCTRACE("[sync] SleepCVSRW %p ms=%u -> %d\n",c,ms,r); return r; }
+MSABI static void s_WakeConditionVariable(void* c){ void* cur=0; if(!c) return;
+    if(guarded_read_ptr(c,&cur)!=0||!cur||!live_has(cur)) return;
+    condwrap_t* w=cur; pthread_mutex_lock(&w->m);
+    pthread_cond_signal(&w->c); pthread_mutex_unlock(&w->m); }
+MSABI static void s_WakeAllConditionVariable(void* c){ void* cur=0; if(!c) return;
+    if(guarded_read_ptr(c,&cur)!=0||!cur||!live_has(cur)) return;
+    condwrap_t* w=cur; pthread_mutex_lock(&w->m);
+    pthread_cond_broadcast(&w->c); pthread_mutex_unlock(&w->m); }
+// ---- Win32 threadpool via pthreads (NGX runs workers through it) ------------
+typedef void (MSABI *win_workcb_t)(void* inst,void* ctx,void* work);
+typedef struct { win_workcb_t fn; void* ctx; pthread_t th; int running; } tpwork_t;
+static void* tp_entry(void* p){ tpwork_t* w=p; w->fn(0,w->ctx,w);
+    return 0; } // joinable; CloseThreadpoolWork joins (correct lifetime)
+MSABI static void* s_CreateThreadpoolWork(win_workcb_t fn,void* ctx,void* env){ (void)env;
+    if(getenv("S5_SYNCTRACE")) logs("[tp] CreateWork\n");
+    if(!fn) return 0; tpwork_t* w=calloc(1,sizeof*w); if(!w) return 0;
+    w->fn=fn; w->ctx=ctx; return w; }
+MSABI static void s_SubmitThreadpoolWork(void* w0){ tpwork_t* w=w0; if(!w) return;
+    if(getenv("S5_SYNCTRACE")) logs("[tp] SubmitWork\n");
+    w->running=1; pthread_create(&w->th,0,tp_entry,w); }
+MSABI static void s_CloseThreadpoolWork(void* w0){ tpwork_t* w=w0; if(!w) return;
+    if(w->running) pthread_join(w->th,0); free(w); }
+// Named-event table so OpenEventA finds events we created (else NULL=not found).
+#define MAXNAMED 32
+static struct { char name[96]; syncobj_t* ev; } g_named[MAXNAMED];
+static pthread_mutex_t g_namedm=PTHREAD_MUTEX_INITIALIZER;
+static void named_reg(const char* n,syncobj_t* ev){ if(!n||!n[0]||!ev) return;
+    pthread_mutex_lock(&g_namedm);
+    for(int i=0;i<MAXNAMED;i++) if(!g_named[i].ev){
+        snprintf(g_named[i].name,sizeof g_named[i].name,"%s",n); g_named[i].ev=ev; break; }
+    pthread_mutex_unlock(&g_namedm); }
+MSABI static void* s_OpenEventA(u32 acc,int inh,const char* n){ (void)acc;(void)inh;
+    if(getenv("S5_SYNCTRACE")){ char b[128]; snprintf(b,sizeof b,"[OpenEventA] %s\n",n?n:"(null)"); logs(b); }
+    if(!n) return 0; void* r=0; pthread_mutex_lock(&g_namedm);
+    for(int i=0;i<MAXNAMED;i++) if(g_named[i].ev&&!strcmp(g_named[i].name,n)){ r=g_named[i].ev; break; }
+    pthread_mutex_unlock(&g_namedm); return r; }
+// FreeLibraryAndExitThread: unload (noop here) then terminate calling thread.
+MSABI static void s_FreeLibraryAndExitThread(void* h,u32 code){ (void)h;
+    char b[64]; snprintf(b,sizeof b,"[FreeLibraryAndExitThread] code=%u\n",code); logs(b);
+    pthread_exit((void*)(uintptr_t)code); }
+MSABI static void* s_CreateEventExW(void* sa,const u16* n,u32 fl,u32 acc){ (void)sa;(void)n;(void)acc;
+    syncobj_t* s=sync_new(0); if(!s) return 0; s->manual=(fl&1)?1:0; s->state=0; return s; }
+MSABI static void* s_CreateEventW(void* sa,int man,int init,const u16* n){ (void)sa;(void)n;
+    syncobj_t* s=sync_new(0); if(!s) return 0; s->manual=man?1:0; s->state=init?1:0; return s; }
+MSABI static void* s_CreateEventA(void* sa,int man,int init,const char* n){ (void)sa;
+    syncobj_t* s=sync_new(0); if(!s) return 0; s->manual=man?1:0; s->state=init?1:0;
+    named_reg(n,s); return s; }
+MSABI static int s_SetEvent(void* h){ syncobj_t* s=sync_of(h);
+    if(!s) return 1; /* unknown/static handle: pretend success (old behavior) */
+    if(s->kind!=0) return 0;
+    pthread_mutex_lock(&s->m); s->state=1;
+    if(s->manual) pthread_cond_broadcast(&s->c); else pthread_cond_signal(&s->c);
+    pthread_mutex_unlock(&s->m); return 1; }
+MSABI static int s_ResetEvent(void* h){ syncobj_t* s=sync_of(h);
+    if(!s) return 1; /* unknown/static handle: pretend success (old behavior) */
+    if(s->kind!=0) return 0;
+    pthread_mutex_lock(&s->m); s->state=0; pthread_mutex_unlock(&s->m); return 1; }
+MSABI static void* s_CreateMutexExW(void* sa,const u16* n,u32 fl,u32 acc){ (void)sa;(void)n;(void)fl;(void)acc;
+    syncobj_t* s=sync_new(1); return s; }
+MSABI static void* s_CreateMutexW(void* sa,int own,const u16* n){ (void)sa;(void)n;
+    syncobj_t* s=sync_new(1); if(s&&own) pthread_mutex_lock(&s->m); return s; }
+MSABI static void* s_CreateMutexA(void* sa,int own,const char* n){ (void)sa;(void)n;
+    syncobj_t* s=sync_new(1); if(s&&own) pthread_mutex_lock(&s->m); return s; }
+MSABI static int s_ReleaseMutex(void* h){ syncobj_t* s=sync_of(h);
+    if(!s) return 1; /* unknown handle: pretend success (old trap returned 0; success is safer) */
+    if(s->kind!=1) return 0;
+    pthread_mutex_unlock(&s->m); return 1; }
+MSABI static void* s_CreateSemaphoreExW(void* sa,long init,long max,const u16* n,u32 r,u32 acc){ (void)sa;(void)n;(void)r;(void)acc;
+    syncobj_t* s=sync_new(2); if(s){ s->count=init; s->max=max; } return s; }
+MSABI static void* s_CreateSemaphoreW(void* sa,long init,long max,const u16* n){ (void)sa;(void)n;
+    syncobj_t* s=sync_new(2); if(s){ s->count=init; s->max=max; } return s; }
+MSABI static int s_ReleaseSemaphore(void* h,long rel,long* prev){ syncobj_t* s=sync_of(h);
+    if(!s||s->kind!=2) return 0; pthread_mutex_lock(&s->m);
+    if(prev)*prev=s->count; s->count+=rel; pthread_cond_broadcast(&s->c);
+    pthread_mutex_unlock(&s->m); return 1; }
+static int sync_wait(syncobj_t* s,u32 ms){
+    // Returns 1 on acquire (WAIT_OBJECT_0), 0 on timeout. INFINITE=0xFFFFFFFF.
+    struct timespec dl; int inf=(ms==0xFFFFFFFFu); if(!inf) abstime(&dl,ms);
+    if(s->kind==1){ // mutex: blocking lock, or trylock slices for finite waits
+        if(inf){ pthread_mutex_lock(&s->m); return 1; }
+        for(;;){ if(pthread_mutex_trylock(&s->m)==0) return 1;
+            struct timespec now; clock_gettime(CLOCK_REALTIME,&now);
+            if(now.tv_sec>dl.tv_sec||(now.tv_sec==dl.tv_sec&&now.tv_nsec>=dl.tv_nsec)) return 0;
+            struct timespec sl={0,1000000}; nanosleep(&sl,0); }
+    }
+    pthread_mutex_lock(&s->m);
+    for(;;){
+        if(s->kind==0&&s->state){ if(!s->manual) s->state=0;
+            pthread_mutex_unlock(&s->m); return 1; }
+        if(s->kind==2&&s->count>0){ s->count--;
+            pthread_mutex_unlock(&s->m); return 1; }
+        int r;
+        if(inf) r=pthread_cond_wait(&s->c,&s->m);
+        else r=pthread_cond_timedwait(&s->c,&s->m,&dl);
+        if(r!=0){ pthread_mutex_unlock(&s->m); return 0; } } }
+MSABI static int   s_CloseHandle(void* h){ syncobj_t* s=sync_of(h);
+    if(s){ pthread_mutex_destroy(&s->m); pthread_cond_destroy(&s->c); s->magic=0; free(s); return 1; }
+    if(((uintptr_t)h & 0xFF000000u)==0x50000000u && h!=(void*)-1) close((int)((uintptr_t)h & 0x00FFFFFFu)); return 1;}
+MSABI static u32   s_WaitForSingleObject(void* h,u32 m){ syncobj_t* s=sync_of(h);
+    u32 r;
+    if(s) r=sync_wait(s,m)?0:258/*WAIT_TIMEOUT*/;
+    else if(((uintptr_t)h&0xFF000000u)==0x70000000u){ int idx=(int)((uintptr_t)h&0xFFFFFF); if(idx<256&&g_wthreads[idx]) pthread_join(g_wthreads[idx],0); r=0; }
+    else r=0;
+    SYNCTRACE("[sync] WaitForSingle %p ms=%u -> %u\n",h,m,r); return r;}
+MSABI static u32   s_WaitForMultipleObjects(u32 n,void** hs,int all,u32 ms){
+    // wait-any (bWaitAll=0); approximate wait-all by looping. Slice-based poll.
+    if(!hs||!n) return 0xFFFFFFFFu;
+    struct timespec dl; int inf=(ms==0xFFFFFFFFu); if(!inf) abstime(&dl,ms);
+    u32 got=0;
+    for(;;){ int done=1;
+        for(u32 i=0;i<n;i++){ syncobj_t* s=sync_of(hs[i]); int sig=1;
+            if(s){ if(s->kind==1){ sig=(pthread_mutex_trylock(&s->m)==0);
+                    if(sig&&!all) return i; /* keep ownership on wait-any hit */
+                    if(sig) pthread_mutex_unlock(&s->m); }
+                else { pthread_mutex_lock(&s->m);
+                    sig=(s->kind==0)?(s->state!=0):(s->count>0);
+                    if(sig&&!all){ if(s->kind==0&&!s->manual) s->state=0;
+                        if(s->kind==2) s->count--; }
+                    pthread_mutex_unlock(&s->m); } }
+            if(sig){ if(!all) return i; got|=1u<<i; } else if(all) done=0; }
+        if(!all){ /*none signaled*/ } else if(done) return 0;
+        if(!inf){ struct timespec now; clock_gettime(CLOCK_REALTIME,&now);
+            if(now.tv_sec>dl.tv_sec||(now.tv_sec==dl.tv_sec&&now.tv_nsec>=dl.tv_nsec)) return 258; }
+        struct timespec sl={0,1000000}; nanosleep(&sl,0); } }
 MSABI static u64   s_GetTickCount64(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return(u64)t.tv_sec*1000+t.tv_nsec/1000000;}
 MSABI static void  s_GetStartupInfoW(void* si){if(si)memset(si,0,104);}
 MSABI static void* s_GetCommandLineW(void){static const u16 w[]={'a',0};return(void*)w;}
@@ -145,8 +403,7 @@ MSABI static void  s_OutputDebugStringA(const char* s){logn("[dbg] ",s?s:"");}
 // info[2]=ThrowInfo -> pCatchableTypeArray -> TypeDescriptor.name (mangled type),
 // plus a best-effort std::runtime_error message. All reads fault-guarded: PE
 // structures are valid by construction, but a corrupt throw must not kill us.
-#include <setjmp.h>
-static sigjmp_buf g_decjmp;
+// (setjmp/g_decjmp/dec_segv declared near the top for the sync guards above)
 static void dec_segv(int s){ (void)s; siglongjmp(g_decjmp,1); }
 static int dec_u64(u64 addr,u64* out){ struct sigaction na,oa; memset(&na,0,sizeof na);
     na.sa_handler=dec_segv; sigemptyset(&na.sa_mask); na.sa_flags=0;
@@ -164,6 +421,10 @@ MSABI static void s_RaiseException(u32 code,u32 flags,u32 nargs,void* args){
     if(args){ unsigned long* ai=args; a0=ai[0]; if(nargs>1)a1=ai[1]; if(nargs>2)a2=ai[2]; }
     snprintf(b,sizeof b,"[RaiseException] code=0x%08X flags=%u nargs=%u\n",code,flags,nargs); logs(b);
     if(code!=0xE06D7363||nargs<3||!args) return;
+    // Deep decode is OFF by default: it swaps the process SIGSEGV disposition
+    // (sigaction+siglongjmp), which is thread-unsafe with NGX workers alive.
+    // Enable per-run with S5_DECODE=1 for throw hunts only.
+    if(!getenv("S5_DECODE")) return;
     u64 magic=0,obj=0,ti=0;
     { u64 v=0; if(dec_u64((u64)(uintptr_t)&((unsigned long*)args)[0],&v)==0) magic=v;
       if(dec_u64((u64)(uintptr_t)&((unsigned long*)args)[1],&v)==0) obj=v;
@@ -617,15 +878,21 @@ MSABI static void* s_LoadLibraryA(const char* n){ const char* s=strrchr(n,'\\');
 // report the host module, see above).
 // static int addr_is_native(void* p){ Dl_info di; return p && dladdr(p,&di)!=0; }
 MSABI static int   s_GetModuleHandleExW(u32 f,void* n,void** out){
-    // FROM_ADDRESS: resolve which loaded module CONTAINS the address. A manually-
-    // mapped Windows PE (the snippet, loaded by _nvngx internally, not in g_mod)
-    // resolves to the host module so its self-lookup keeps working (GFR GREEN).
-    // A native (non-PE) caller address ALSO reports the host module now: Init's
-    // downstream (c8b0->c1e0->b720) needs pwVar6/pwVar4 dir strings non-NULL, and
-    // the old reason for FAIL (0xceee via arg9=codepointer) is gone since Init gets
-    // gdpa=NULL (guarded skip). The GFR-helper carve-out below is subsumed by this.
-    if(f&4){ for(int i=0;i<g_nmod;i++) if(g_mod[i].base && (u8*)n>=g_mod[i].base && (u8*)n<g_mod[i].base+g_mod[i].size){ if(out)*out=g_mod[i].base; return 1; }
-        if(g_nmod>0){ if(out)*out=g_mod[0].base; return 1; }
+    // FROM_ADDRESS rules (all measured):
+    // - n inside a loaded PE -> that module (snippet self-lookup -> host).
+    // - querier in FUN_180061950 (GFR dir-string helper, _nvngx+0x61900..0x61b00)
+    //   or in Init d5d0 (+0xd640..+0xd690, needs pwVar6/pwVar4 dir strings):
+    //   report host module even for native caller addrs (else NULL wstrings
+    //   crash 0xb720/0xa1f3 downstream).
+    // - otherwise native caller -> FAIL (old behavior): DllMain/CRT startup
+    //   branches on FAIL vs SUCCESS, and blanket SUCCESS regressed it to 0.
+    if(f&4){ void* ret=__builtin_return_address(0);
+        for(int i=0;i<g_nmod;i++) if(g_mod[i].base && (u8*)n>=g_mod[i].base && (u8*)n<g_mod[i].base+g_mod[i].size){ if(out)*out=g_mod[i].base; return 1; }
+        if(g_nmod>0){ u8* b=g_mod[0].base;
+            if(((u8*)ret>=b+0x61900&&(u8*)ret<b+0x61b00)||
+               ((u8*)ret>=b+0xd640&&(u8*)ret<b+0xd690)){
+                if(getenv("S5_SYNCTRACE")) logs("[ExW carve-out hit]\n");
+                if(out)*out=b; return 1; } }
         if(out)*out=0; return 0; }
     if(out)*out=g_mod[0].base; return 1; }
 // GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS (0x4): resolve which loaded module CONTAINS the address.
@@ -636,10 +903,17 @@ MSABI static int   s_GetModuleHandleExW(u32 f,void* n,void** out){
 MSABI static int s_RtlGetVersion(u8* vi){ if(vi){ *(u32*)(vi+4)=10; *(u32*)(vi+8)=0; *(u32*)(vi+12)=19041; *(u32*)(vi+16)=2; *(u16*)(vi+20)=0; } return 0; }
 MSABI static int s_GetVersionExW(u8* vi){ if(vi){ *(u32*)(vi+4)=10; *(u32*)(vi+8)=0; *(u32*)(vi+12)=19041; *(u32*)(vi+16)=2; *(u16*)(vi+20)=0; } return 1; }
 MSABI static int s_GetModuleHandleExA(u32 f,void* n,void** out){
-    // Same rule as the W variant (see above): native callers report the host
-    // module so downstream dir-string building never sees NULL.
-    if(f&4){ for(int i=0;i<g_nmod;i++) if(g_mod[i].base && (u8*)n>=g_mod[i].base && (u8*)n<g_mod[i].base+g_mod[i].size){ if(out)*out=g_mod[i].base; return 1; }
-        if(g_nmod>0){ if(out)*out=g_mod[0].base; return 1; }
+    if(getenv("S5_SYNCTRACE")&&g_nmod>0){ void* ret=__builtin_return_address(0);
+        char b[96]; const char* wh="native"; static char w2[32];
+        if((u8*)ret>=g_mod[0].base&&(u8*)ret<g_mod[0].base+g_mod[0].size){ snprintf(w2,sizeof w2,"nvngx+0x%x",(unsigned)((u8*)ret-g_mod[0].base)); wh=w2; }
+        snprintf(b,sizeof b,"[ExA f=%u n=%p ret=%s]\n",f,n,wh); logs(b); }
+    // Same per-querier rule as the W variant (see above).
+    if(f&4){ void* ret=__builtin_return_address(0);
+        for(int i=0;i<g_nmod;i++) if(g_mod[i].base && (u8*)n>=g_mod[i].base && (u8*)n<g_mod[i].base+g_mod[i].size){ if(out)*out=g_mod[i].base; return 1; }
+        if(g_nmod>0){ u8* b=g_mod[0].base;
+            if(((u8*)ret>=b+0x61900&&(u8*)ret<b+0x61b00)||
+               ((u8*)ret>=b+0xd640&&(u8*)ret<b+0xd690)){
+                if(out)*out=b; return 1; } }
         if(out)*out=0; return 0; }
     if(out)*out=g_mod[0].base; return 1; }
 
@@ -668,7 +942,7 @@ struct { const char* name; void* fn; } g_stubs[]={
  {"EnterCriticalSection",s_noop},{"LeaveCriticalSection",s_noop},{"DeleteCriticalSection",s_noop},{"TryEnterCriticalSection",s_ret1},
  {"InitializeSRWLock",s_noop},{"AcquireSRWLockExclusive",s_noop},{"ReleaseSRWLockExclusive",s_noop},{"TryAcquireSRWLockExclusive",s_ret1},
  {"AcquireSRWLockShared",s_noop},{"ReleaseSRWLockShared",s_noop},
- {"InitializeConditionVariable",s_noop},{"WakeConditionVariable",s_noop},{"WakeAllConditionVariable",s_noop},
+ {"InitializeConditionVariable",s_noop},{"WakeConditionVariable",s_WakeConditionVariable},{"WakeAllConditionVariable",s_WakeAllConditionVariable},
  {"SleepConditionVariableCS",s_ret1},{"SleepConditionVariableSRW",s_ret1},
  {"CreateEventW",s_CreateHandle},{"CreateEventExW",s_CreateHandle},{"CreateEventA",s_CreateHandle},
  {"CreateSemaphoreW",s_CreateHandle},{"CreateSemaphoreExW",s_CreateHandle},{"CreateMutexW",s_CreateHandle},{"CreateMutexExW",s_CreateHandle},
@@ -688,7 +962,8 @@ struct { const char* name; void* fn; } g_stubs[]={
  {"GetFileSize",s_GetFileSize},{"GetFileSizeEx",s_GetFileSizeEx},
  {"CreateFileMappingW",s_CreateFileMappingW},{"CreateFileMappingA",s_CreateFileMappingW},{"MapViewOfFile",s_MapViewOfFile},{"UnmapViewOfFile",s_UnmapViewOfFile},
  {"WinVerifyTrust",s_WinVerifyTrust},{"WTHelperProvDataFromStateData",s_WTHelperProvDataFromStateData},{"WTHelperGetProvSignerFromChain",s_WTHelperGetProvSignerFromChain},{"WTHelperGetProvCertFromChain",s_WTHelperGetProvCertFromChain},
- {"CreateThread",s_CreateThread},{"ExitThread",s_ExitThread},{"WriteFile",s_WriteFile},
+ {"CreateThread",s_CreateThread},{"ExitThread",s_ExitThread},{"FreeLibraryAndExitThread",s_FreeLibraryAndExitThread},{"WriteFile",s_WriteFile},
+ {"CreateThreadpoolWork",s_CreateThreadpoolWork},{"SubmitThreadpoolWork",s_SubmitThreadpoolWork},{"CloseThreadpoolWork",s_CloseThreadpoolWork},{"OpenEventA",s_OpenEventA},
  {"GetFileVersionInfoSizeExW",s_GetFileVersionInfoSizeExW},{"GetFileVersionInfoSizeW",s_GetFileVersionInfoSizeW},{"GetFileVersionInfoExW",s_GetFileVersionInfoExW},{"GetFileVersionInfoW",s_GetFileVersionInfoW},{"VerQueryValueW",s_VerQueryValueW},
  {"GetACP",s_GetACP},{"GetStdHandle",s_GetStdHandle},{"AreFileApisANSI",s_AreFileApisANSI},{"GetEnvironmentVariableW",s_GetEnvironmentVariableW},
  {"FormatMessageA",s_FormatMessageA},{"FreeLibrary",s_FreeLibrary},{"OpenFileMappingA",s_OpenFileMappingA},
@@ -898,8 +1173,16 @@ int main(void){
             // vulkan-1.dll itself; arg9 (gdpa) is dereferenced as {qword,dword,ptr*}
             // by FUN_18000ce40 — a CODE pointer (my_gdpa) feeds it code bytes and
             // faults at +0xceee, while NULL takes the guarded skip. Pass NULL.
+            // SPIKE 2026-09-12: arg8 semantic probe. d5d0 forwards low32(arg8) as
+            // ce40.param_8 (0x13-gate) and down the c8b0->c1e0 chain into an
+            // sdkVer<=0x15 wrapper check. A gipa CODE pointer puts random bits
+            // there (OutOfDate or worse). S5_ARG8INT forces an int instead
+            // (e.g. 0x14) to test whether the slot is version-semantic.
+            // Default (unset) keeps the documented gipa pointer.
+            const char* ge8=getenv("S5_ARG8INT");
+            void* a8=ge8?(void*)(uintptr_t)strtoul(ge8,0,0):(void*)my_gipa;
             int r=Init("a0b1c2d3-1234-5678-9abc-def012345678",0,"1.0",wpath,
-                       (void*)g_inst,(void*)g_pd,(void*)g_dev,(void*)my_gipa,0,&ici,sdkv);
+                       (void*)g_inst,(void*)g_pd,(void*)g_dev,a8,0,&ici,sdkv);
             char b[80]; snprintf(b,sizeof b,"[NGX Init returned 0x%08X]\n",(unsigned)r); logs(b);
         }
         _exit(0);
