@@ -263,6 +263,17 @@ static int cond_wait_ms(condwrap_t* w,pthread_mutex_t* ext,u32 ms){
     else { struct timespec ts; abstime(&ts,ms); r=pthread_cond_timedwait(&w->c,&w->m,&ts); }
     pthread_mutex_unlock(&w->m);
     if(ext) pthread_mutex_lock(ext); return r==0; }
+// Phase gate (Agent B plan): DllMain runs with stub sync (GREEN baseline);
+// real blocking/writing sync only when S5_SYNC_PHASE=post (Init and later).
+// In dllmain phase the table below keeps noop/ret1/CreateHandle behavior.
+static int sync_post(void){ const char* e=getenv("S5_SYNC_PHASE");
+    return (e&&(!strcmp(e,"post")||!strcmp(e,"init")||!strcmp(e,"create"))); }
+MSABI static int s_SleepConditionVariableCS(void*,void*,u32);   // fwd, defined below
+MSABI static int s_SleepConditionVariableSRW(void*,void*,u32);  // fwd, defined below
+MSABI static int s_SleepConditionVariableCS_gated(void* c,void* cs,u32 ms){
+    if(!sync_post()) return 1; return s_SleepConditionVariableCS(c,cs,ms); }
+MSABI static int s_SleepConditionVariableSRW_gated(void* c,void* l,u32 ms){
+    if(!sync_post()) return 1; return s_SleepConditionVariableSRW(c,l,ms); }
 MSABI static int s_SleepConditionVariableCS(void* c,void* cs,u32 ms){ if(!c||!cs) return 0;
     condwrap_t* w=cond_get((void**)c); pthread_mutex_t* m=*(void**)cs;
     int r=cond_wait_ms(w,m,ms); SYNCTRACE("[sync] SleepCVCS %p ms=%u -> %d\n",c,ms,r); return r; }
@@ -394,6 +405,21 @@ MSABI static u32   s_WaitForMultipleObjects(u32 n,void** hs,int all,u32 ms){
             if(now.tv_sec>dl.tv_sec||(now.tv_sec==dl.tv_sec&&now.tv_nsec>=dl.tv_nsec)) return 258; }
         struct timespec sl={0,1000000}; nanosleep(&sl,0); } }
 MSABI static u64   s_GetTickCount64(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return(u64)t.tv_sec*1000+t.tv_nsec/1000000;}
+// ---- trap-bound wait/sleep/init primitives (returned 0 instantly — broke ordering)
+// Sleep/SleepEx: real nanosleep (no state, zero risk). WaitForMultipleObjects and
+// ReleaseMutex were implemented but unwired (dead code) — wire them here.
+MSABI static void  s_Sleep(u32 ms){ struct timespec ts={ms/1000,(ms%1000)*1000000LL}; nanosleep(&ts,0); }
+MSABI static u32   s_SleepEx(u32 ms,int alert){ (void)alert; s_Sleep(ms); return 0; }
+// ThreadErrorMode: thread-local roundtrip (c8b0 does Get/Set save/restore).
+static __thread u32 g_temode=0;
+MSABI static u32   s_GetThreadErrorMode(void){ return g_temode; }
+MSABI static int   s_SetThreadErrorMode(u32 m,void* old){ if(old)*(u32*)old=g_temode; g_temode=m; return 1; }
+// InitOnce: run-once flag (trap-0 meant "already done" with nothing run).
+MSABI static int   s_InitOnceBeginInitialize(void* once,u32 fl,int* pend,void** c){ (void)fl;(void)c;
+    if(!once) return 0; long v=__sync_fetch_and_or((long*)once,0);
+    if(v){ if(pend)*pend=0; return 1; } if(pend)*pend=1; return 1; }
+MSABI static int   s_InitOnceComplete(void* once,u32 fl,void* c){ (void)fl;(void)c;
+    if(!once) return 0; __sync_fetch_and_or((long*)once,1); return 1; }
 MSABI static void  s_GetStartupInfoW(void* si){if(si)memset(si,0,104);}
 MSABI static void* s_GetCommandLineW(void){static const u16 w[]={'a',0};return(void*)w;}
 MSABI static void  s_OutputDebugStringA(const char* s){logn("[dbg] ",s?s:"");}
@@ -943,11 +969,14 @@ struct { const char* name; void* fn; } g_stubs[]={
  {"InitializeSRWLock",s_noop},{"AcquireSRWLockExclusive",s_noop},{"ReleaseSRWLockExclusive",s_noop},{"TryAcquireSRWLockExclusive",s_ret1},
  {"AcquireSRWLockShared",s_noop},{"ReleaseSRWLockShared",s_noop},
  {"InitializeConditionVariable",s_noop},{"WakeConditionVariable",s_WakeConditionVariable},{"WakeAllConditionVariable",s_WakeAllConditionVariable},
- {"SleepConditionVariableCS",s_ret1},{"SleepConditionVariableSRW",s_ret1},
+ {"SleepConditionVariableCS",s_SleepConditionVariableCS_gated},{"SleepConditionVariableSRW",s_SleepConditionVariableSRW_gated},
  {"CreateEventW",s_CreateHandle},{"CreateEventExW",s_CreateHandle},{"CreateEventA",s_CreateHandle},
  {"CreateSemaphoreW",s_CreateHandle},{"CreateSemaphoreExW",s_CreateHandle},{"CreateMutexW",s_CreateHandle},{"CreateMutexExW",s_CreateHandle},
  {"CloseHandle",s_CloseHandle},{"WaitForSingleObject",s_WaitForSingleObject},{"WaitForSingleObjectEx",s_WaitForSingleObject},
- {"SetEvent",s_ret1},{"ResetEvent",s_ret1},{"GetTickCount64",s_GetTickCount64},
+ {"SetEvent",s_ret1},{"ResetEvent",s_ret1},{"ReleaseMutex",s_ReleaseMutex},{"WaitForMultipleObjects",s_WaitForMultipleObjects},{"GetTickCount64",s_GetTickCount64},
+ {"Sleep",s_Sleep},{"SleepEx",s_SleepEx},{"GetThreadErrorMode",s_GetThreadErrorMode},{"SetThreadErrorMode",s_SetThreadErrorMode},
+ {"InitOnceBeginInitialize",s_InitOnceBeginInitialize},{"InitOnceComplete",s_InitOnceComplete},
+ {"OutputDebugStringW",s_OutputDebugStringA},
  {"SetUnhandledExceptionFilter",s_ret0p},{"UnhandledExceptionFilter",s_ret1},{"RtlLookupFunctionEntry",s_ret0p},{"RtlPcToFileHeader",s_ret0p},
  {"GetModuleFileNameW",s_GetModuleFileNameW},{"GetModuleFileNameA",s_GetModuleFileNameA},
  {"GetSystemDirectoryW",s_GetSystemDirectoryW},{"GetWindowsDirectoryW",s_GetWindowsDirectoryW},
